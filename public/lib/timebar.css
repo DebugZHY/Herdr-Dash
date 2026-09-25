@@ -1,0 +1,102 @@
+/* herdr-dash — timebar.css · status timeline strip (owner: W3).
+   Reuses the palette + variables declared in public/style.css; no second palette. */
+
+.hd-timebar {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 12px 5px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+  overflow: hidden;
+  max-height: 34vh;
+}
+
+.hd-tb-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  white-space: nowrap;
+}
+.hd-tb-title { flex: 0 0 auto; }
+.hd-tb-axis { flex: 0 0 auto; }
+.hd-tb-note { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--st-blocked); }
+.hd-tb-only {
+  flex: 0 0 auto;
+  color: var(--fg-dim);
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  padding: 0 6px;
+  cursor: help;
+}
+
+.hd-tb-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow: auto;
+  min-height: 0;
+}
+
+.hd-tb-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  min-width: 0;
+}
+.hd-tb-row:hover { background: #1c2430; }
+
+.hd-tb-pane {
+  flex: 0 0 auto;
+  width: 62px;
+  color: var(--fg-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hd-tb-row:hover .hd-tb-pane { color: var(--fg); }
+
+.hd-tb-strip {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 60px;
+  height: 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--line-soft);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.hd-tb-strip.empty::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+}
+.hd-tb-seg {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  min-width: 1px;
+  background: var(--st-unknown);
+}
+.hd-tb-seg.st-working { background: var(--st-working); }
+.hd-tb-seg.st-blocked { background: var(--st-blocked); }
+.hd-tb-seg.st-idle    { background: var(--st-idle); }
+.hd-tb-seg.st-done    { background: var(--st-done); }
+.hd-tb-seg.st-unknown { background: var(--st-unknown); }
+/* a status we only observed at mount is a lower bound, not a measured transition */
+.hd-tb-seg[title*='observed from here'] { opacity: 0.55; }
+
+.hd-tb-dur {
+  flex: 0 0 auto;
+  width: 58px;
+  text-align: right;
+  color: var(--fg-dim);
+  font-family: var(--mono);
+}
+.hd-tb-trim { flex: 0 0 auto; color: var(--st-unknown); cursor: help; }
+
+.hd-tb-empty { padding: 2px 0 1px; }
+.hd-tb-empty[hidden] { display: none !important; }

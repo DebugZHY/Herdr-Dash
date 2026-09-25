@@ -1,0 +1,618 @@
+/* herdr-dash — chatview.css · the structured conversation view (§8.3, owner: W3).
+   Reuses the palette + variables declared in public/style.css; no second palette.
+   The renderer that produces these classes is public/lib/chat-render.js; the panel
+   itself belongs to W2's chatview.js, which may hook .hd-cv-scroll / .hd-cv-list /
+   .hd-cv-jump / .hd-cv-empty, and which builds the §10 attachment markup this sheet
+   styles: .hd-cv-attach-list / .hd-cv-attach / .hd-cv-attach-meta / .hd-cv-attach-remove
+   and the .hd-cv-drop-active state on the composer container. */
+
+/* ---------------- the scroll container (W2 renders) ---------------- */
+
+.hd-cv-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;          /* the pane never scrolls sideways; the width below is what makes that safe */
+  box-sizing: border-box;      /* the padding is inside the width, never added to it */
+  padding: 10px 12px;
+  background: var(--bg);
+}
+/* DEFECT-14: this column was laid out at its fit-content width — `max-width: 980px` is a CEILING,
+   not a constraint, and it does nothing to keep a box inside a 913px container. With W2's fallback
+   making the scroller a column flex box, `margin: 0 auto` (auto cross-axis margins) also suspends
+   `align-items: stretch`, so anything inside with a wide min-content (a 160-char nowrap summary, a
+   1200-char unbroken token) pushed the whole column to 980px and hung the user's own right-aligned
+   bubble off the clipped right edge. A DEFINITE width is what bounds it: 100% of the scroller's
+   content box, whichever way the container is displayed (block or flex), and no min-width floor. */
+.hd-cv-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: 980px;
+  margin: 0 auto;
+}
+/* "N new ↓": sticks to the foot of the scroll box until the user follows the tail again.
+   Text is the page's own dark on the accent fill: #0d1117 on #4aa3ff is ~7.2:1 (WCAG relative
+   luminance), well clear of the 4.5:1 bar — and the pill's own fill is ~7:1 against the panel
+   background, so it stays visible as a control as well as readable. */
+.hd-cv-jump {
+  position: sticky;
+  bottom: 12px;                  /* clear of the scroll box's own edge */
+  align-self: center;
+  z-index: 3;                    /* over bubbles and cards, which are z-index: auto */
+  max-width: calc(100% - 24px);  /* a 4-digit count in a narrow pane must not overflow the panel */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  background: var(--accent);
+  color: var(--bg);
+  border: 1px solid var(--bg);    /* reads as a chip over whatever bubble is behind it */
+  border-radius: 15px;
+  padding: 4px 13px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.5;
+  cursor: pointer;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.55);
+}
+.hd-cv-jump:hover { filter: brightness(1.08); }
+.hd-cv-jump:focus-visible { outline: 2px solid var(--fg); outline-offset: 1px; }
+/* W2 renders this one, so it does not inherit from .hd-cv-msg: a long error string from the server
+   has to break here too rather than push the scroller's scrollWidth past its clientWidth. */
+.hd-cv-empty { padding: 16px 12px; text-align: center; color: var(--fg-dim); overflow-wrap: anywhere; }
+
+/* ---------------- one message ---------------- */
+
+/* `overflow-wrap: anywhere` here is inherited by every text node in a message: a token the log
+   itself contains (a base64 blob, a minified line, a 1200-char word) must break rather than push the
+   layout wider than the pane. `anywhere` and not `break-word` because only `anywhere` also shrinks
+   the element's min-content size, which is what stops a column from being sized by its longest word.
+   DEFECT-14's other half: a system note and an unknown-kind record drew their text in a plain
+   .hd-cv-body, outside any bubble, so the bubble's own `anywhere` never reached them. */
+.hd-cv-msg { display: flex; flex-direction: column; gap: 3px; min-width: 0; box-sizing: border-box; overflow-wrap: anywhere; }
+.hd-cv-row { display: flex; min-width: 0; box-sizing: border-box; }
+.hd-cv-row > * { min-width: 0; }   /* a flex item may shrink; it may not push the row wider */
+.hd-cv-role-user .hd-cv-row { justify-content: flex-end; }
+.hd-cv-role-user .hd-cv-meta { justify-content: flex-end; }
+.hd-cv-role-tool .hd-cv-row,
+.hd-cv-role-system .hd-cv-row { justify-content: flex-start; }
+
+.hd-cv-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--fg-dim);
+  min-width: 0;
+}
+.hd-cv-who { text-transform: lowercase; }
+.hd-cv-time { font-family: var(--mono); color: var(--fg-dim); }
+.hd-cv-side {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0 6px;
+  background: var(--bg-input);
+  color: var(--fg-dim);
+  font-size: 10.5px;
+}
+/* a subagent's messages are nested under the turn they belong to */
+.hd-cv-sidechain {
+  margin-left: 18px;
+  padding-left: 9px;
+  border-left: 2px solid var(--line-soft);
+  opacity: 0.92;
+}
+
+/* ---------------- bubbles ---------------- */
+
+.hd-cv-bubble {
+  max-width: min(780px, 88%);
+  padding: 7px 11px;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: var(--bg-panel2);
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+/* the user's own prompts sit to the right, in the accent's surface tint */
+.hd-cv-bubble.hd-cv-mine {
+  background: #152438;
+  border-color: #24486f;
+  border-bottom-right-radius: 4px;
+}
+.hd-cv-role-assistant .hd-cv-bubble { border-bottom-left-radius: 4px; }
+
+.hd-cv-body { display: flex; flex-direction: column; gap: 6px; }
+.hd-cv-p { margin: 0; white-space: pre-wrap; }   /* the log's own line breaks are kept verbatim */
+/* .hd-cv-open marks a block the reader expanded from "show all". A deliberately expanded 20,000
+   char block is still a scroll region, not a page-length wall: it scrolls inside itself and does not
+   chain its scroll to the panel when it reaches the end. */
+.hd-cv-body.hd-cv-open,
+.hd-cv-resbox.hd-cv-open {
+  border-left: 2px solid var(--line-soft);
+  padding-left: 8px;
+  max-height: 70vh;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+/* A3: hd-cv-open also marks the two bodies a reader expands by hand (a thinking record, a tool
+   card). Both already carry a spine when closed, so the mark cannot be "a spine appears" — it is
+   that spine gaining contrast, which is the same "this is open" reading the rule above gives a
+   body that had none. Nothing here animates: an open block is a state, not a running one, and a
+   CLOSED block is hidden outright (no pulse, no shimmer — see the [hidden] rules below). */
+.hd-cv-think-body.hd-cv-open { border-left-color: var(--fg-dim); }
+.hd-cv-card-body.hd-cv-open { border-top-color: var(--fg-dim); }
+
+/* kind hooks: every message carries its role AND its kind, so W2 can target a kind (a filter
+   that hides tool chatter, say) without touching the renderer. The role owns the alignment. */
+.hd-cv-kind-thinking .hd-cv-meta,
+.hd-cv-kind-system .hd-cv-meta,
+.hd-cv-kind-tool_call .hd-cv-meta,
+.hd-cv-kind-tool_result .hd-cv-meta { opacity: 0.9; }
+.hd-cv-kind-unknown .hd-cv-note { color: var(--st-unknown); }
+
+/* ---------------- markdown-lite ---------------- */
+
+.hd-cv-icode {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  background: var(--bg-input);
+  border: 1px solid var(--line-soft);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+.hd-cv-codewrap { position: relative; }
+.hd-cv-lang {
+  position: absolute;
+  top: 3px;
+  right: 6px;
+  font-size: 10px;
+  color: var(--fg-dim);
+  pointer-events: none;
+}
+.hd-cv-code, .hd-cv-json, .hd-cv-res {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+  background: var(--bg-input);
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  padding: 6px 8px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.hd-cv-resbox { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+/* A long result is a scroll region inside the card. `overscroll-behavior: contain` stops the page
+   from scrolling on after the result end (which reads as the whole panel jumping), and the thin
+   scrollbar keeps a dark-theme result from growing a light OS stripe. */
+.hd-cv-res {
+  max-height: 340px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+.hd-cv-json {
+  max-height: 340px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+.hd-cv-link { color: var(--accent); text-decoration: none; word-break: break-all; }
+.hd-cv-link:hover { text-decoration: underline; }
+
+/* ---------------- thinking ---------------- */
+
+.hd-cv-think { max-width: min(780px, 88%); display: flex; flex-direction: column; gap: 4px; }
+.hd-cv-think-head {
+  /* §13.1.1 put the copy button in a row beside this control, so the label is now one flex item of
+     two: it may shrink (and wrap its label) rather than push the row past the pane the way an
+     unshrinkable flex item does. The 20x20 copy button beside it keeps its own box. */
+  flex: 0 1 auto;
+  min-width: 0;
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--fg-dim);
+  background: transparent;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.hd-cv-think-head:hover { color: var(--fg); border-color: var(--fg-dim); }
+.hd-cv-think-body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border-left: 2px solid var(--line);
+  padding: 4px 0 4px 9px;
+  color: var(--fg);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  /* a thinking record can be as long as any other text (the server caps it at 20,000 chars) */
+  max-height: 340px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+.hd-cv-think-body[hidden] { display: none !important; }
+
+/* ---------------- tool cards ---------------- */
+
+.hd-cv-card {
+  max-width: min(880px, 94%);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-panel);
+  overflow: hidden;
+}
+.hd-cv-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  background: var(--bg-panel2);
+  min-width: 0;
+}
+.hd-cv-name {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--accent);
+  background: var(--bg-input);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0 6px;
+  flex: 0 0 auto;
+}
+.hd-cv-sum {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--fg);
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hd-cv-toggle {
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 10.5px;
+  color: var(--fg-dim);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0 6px;
+  cursor: pointer;
+}
+.hd-cv-toggle:hover { color: var(--fg); border-color: var(--fg-dim); }
+.hd-cv-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 9px;
+  border-top: 1px solid var(--line-soft);
+}
+.hd-cv-card-body[hidden] { display: none !important; }
+.hd-cv-sec {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+}
+
+/* ---------------- state: error, pending, notes ---------------- */
+
+.hd-cv-card.hd-cv-err { border-color: var(--st-blocked); }
+.hd-cv-card.hd-cv-err .hd-cv-card-head { background: #2a1416; }
+.hd-cv-card.hd-cv-err .hd-cv-res { border-left: 2px solid var(--st-blocked); }
+.hd-cv-errword { color: var(--st-blocked); font-weight: 600; font-size: 11px; flex: 0 0 auto; }
+.hd-cv-pending {
+  color: var(--st-working);
+  font-size: 11px;
+  flex: 0 0 auto;
+  animation: hd-cv-wait 1.6s ease-in-out infinite;
+}
+.hd-cv-pendingcard { border-style: dashed; }
+.hd-cv-pendingmsg { opacity: 0.72; }
+@keyframes hd-cv-wait { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+@media (prefers-reduced-motion: reduce) { .hd-cv-pending { animation: none; } }
+
+.hd-cv-note { font-size: 11px; color: var(--fg-dim); }
+.hd-cv-note.hd-cv-warn { color: var(--st-working); }
+
+/* round 7.3 — the sibling of .hd-cv-pending: a call whose result is NOT in the loaded window.
+   Measured on a real tail window: 201 cards, 37 of them `pending: true`, those calls 21,484–32,502 s
+   old (6–9 hours). "waiting for result…" in the amber working accent with a pulse claims something is
+   happening now; for those it is not, and the animation is a claim the reader can only disprove by
+   scrolling back. So this state is stated, not animated: the card keeps the quiet hairline border
+   (not the dashed "in flight" edge) and the sentence sits in the card's own dim note language.
+   No animation is declared here at all, so the prefers-reduced-motion rule above has nothing to
+   switch off. */
+.hd-cv-stalecard { border-color: var(--line-soft); }
+.hd-cv-stale {
+  flex: 1 1 auto;       /* it shares the head's free space … */
+  min-width: 0;         /* … and may shrink below its own sentence … */
+  white-space: normal;  /* … by wrapping. Both halves are needed: without the wrap, min-width:0 would
+                           let the sentence run under the toggle; without min-width:0 the sentence
+                           could widen the card past the pane — the DEFECT-14 shape. */
+  overflow-wrap: anywhere;
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+.hd-cv-sys {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: min(880px, 94%);
+  font-size: 11.5px;
+  color: var(--fg-dim);
+  padding: 2px 8px;
+  border-left: 2px solid var(--line);
+}
+
+/* ---------------- A1: one turn as one group ---------------- */
+/* The group is read as a unit by a spine, not by a box: the prompt bubble sits at the top, the
+   agent's segments hang off a hairline, and the reply closes the group. Nesting is visible because
+   a sidechain segment brings its own border (see .hd-cv-sidechain) inside this one. */
+.hd-cv-turn { display: flex; flex-direction: column; gap: 8px; min-width: 0; box-sizing: border-box; }
+.hd-cv-turn-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  box-sizing: border-box;
+  border-left: 2px solid var(--line-soft);
+  padding-left: 12px;
+  margin-left: 6px;
+}
+.hd-cv-turn-pending { opacity: 0.8; }
+
+/* an interim text segment: part of the process, not the answer. Dashed = "not final", the same
+   visual language as a pending call card. */
+.hd-cv-interim .hd-cv-bubble { border-style: dashed; opacity: 0.92; }
+
+/* the closing reply: the one thing the reader came for, so it is marked — a small label above it
+   and the accent on the bubble that carries the answer. */
+.hd-cv-replytag {
+  align-self: flex-start;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
+  padding-left: 2px;
+}
+.hd-cv-reply .hd-cv-bubble { border-color: var(--accent); }
+
+/* the live tail of a running turn: not a bubble, not a reply, and visibly alive. */
+.hd-cv-working {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  align-self: flex-start;
+  padding: 3px 10px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  font-size: 11.5px;
+  color: var(--st-working);
+}
+.hd-cv-working-text { font-family: var(--mono); }
+.hd-cv-dot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--st-working);
+  animation: hd-cv-pulse 1.2s ease-in-out infinite;
+}
+@keyframes hd-cv-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.72); }
+}
+@media (prefers-reduced-motion: reduce) { .hd-cv-dot { animation: none; } }
+
+/* the folded-call note: an anomaly in the log, stated with its count */
+.hd-cv-dupes { font-size: 10.5px; flex: 0 0 auto; white-space: nowrap; }
+
+/* "show all · N lines" */
+.hd-cv-more {
+  align-self: flex-start;
+  font: inherit;
+  font-size: 11px;
+  color: var(--fg-dim);
+  background: var(--bg-input);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 1px 7px;
+  cursor: pointer;
+}
+.hd-cv-more:hover { color: var(--fg); border-color: var(--accent); }
+
+/* ---------------- A2: folding a bubble (the reader's own action) ---------------- */
+/* The control sits in the message head, in the same chip language as the tool card's
+   expand/collapse: quiet by default, accent on hover, keyboard-reachable. The head is the other half
+   of the target, so it says so too — cursor and a lift of the `who · time` pair, never a box of its
+   own (the head is a label, not a button). A folded row declares NO animation anywhere: a fold is a
+   state the reader chose, so it must not borrow the working pulse (A2, A1 rule 5). */
+.hd-cv-foldbtn {
+  font: inherit;
+  font-size: 10.5px;
+  color: var(--fg-dim);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0 6px;
+  cursor: pointer;
+}
+.hd-cv-foldbtn:hover { color: var(--fg); border-color: var(--accent); }
+.hd-cv-foldbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.hd-cv-meta[data-hd-foldhead] { cursor: pointer; }
+.hd-cv-meta[data-hd-foldhead]:hover .hd-cv-who,
+.hd-cv-meta[data-hd-foldhead]:hover .hd-cv-time { color: var(--fg); }
+
+/* A folded bubble is a preview of the message, so it keeps the bubble's own frame and gains the same
+   hairline spine the expanded-body idiom uses — a mark that there is more here, in the direction the
+   bubble hangs from. The counts inside spell out how much; nothing else changes colour. */
+.hd-cv-folded .hd-cv-bubble { border-left: 2px solid var(--line-soft); }
+.hd-cv-folded .hd-cv-bubble.hd-cv-mine { border-left-width: 1px; border-right: 2px solid var(--line-soft); }
+.hd-cv-foldstat { font-size: 10.5px; color: var(--fg-dim); }
+
+/* ---------------- §13.1: the copy button (the renderer draws it, W2's copy.js reads it) -------- */
+/* Markup-only on this side of the wire: chat-render.js emits §13.1.1's button in every message head
+   and every thinking/tool block head, and W2's copy.js turns a click into a clipboard write. It is a
+   fixed 20x20 hit area whatever glyph is in it (§10.9's convention, the shape the attachment remove
+   button already takes), the accessible name is §13.1.1's aria-label rather than the glyph, and the
+   ring is drawn with `outline` so focus can never resize the head row. Nothing here overlaps the
+   controls it follows: §13.1.1 puts it LAST in the row for exactly that reason. */
+.hd-cv-copy {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  min-width: 20px;
+  min-height: 20px;
+  padding: 0;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--fg-dim);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.hd-cv-copy:hover { color: var(--fg); border-color: var(--accent); }
+.hd-cv-copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* A thinking block's head IS its open/collapse control, so it cannot contain the copy button (a
+   button may not contain a button): the row is the wrapper that places the two side by side, and the
+   head keeps the whole of its own hit area. The row adds no colour and no weight of its own. */
+.hd-cv-think-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+
+/* ---------------- §10 attachments — the composer's chip row (W2 builds, W3 draws) ---------------- */
+/* The markup names are frozen in §10.9 so the composer, these styles and the tests cannot invent
+   three shapes: the row is .hd-cv-attach-list, a chip is .hd-cv-attach with data-state =
+   uploading|ready|failed, its name+size text is .hd-cv-attach-meta, its remove control is
+   button.hd-cv-attach-remove, and the drop state is .hd-cv-drop-active on the composer container.
+   The row lives with the composer (W2's #promptBox / .prompt-line), and the composer is the one part
+   of the panel that must not move: every state below therefore changes a colour, a border STYLE or an
+   inset shadow, never a box. The suite measures that (test/chat-render.mjs, "§10"), rather than
+   trusting these words. */
+
+/* The row sits above the input in the composer's own flow and is bounded in BOTH directions: eight
+   chips (§10.3's cap) wrap, and a row of them scrolls itself instead of growing the composer — which
+   is what keeps the input on screen. */
+.hd-cv-attach-list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 4px;
+  min-width: 0;
+  max-width: 100%;
+  max-height: 92px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  margin: 0 0 6px;
+  overscroll-behavior: contain;
+  scrollbar-color: var(--line) transparent;
+}
+
+/* A chip is a box until its name is long: max-width + a meta that may shrink below its own text
+   (DEFECT-14's shape, the same two declarations the stale sentence uses) mean a 200-character file
+   name ellipsises inside the chip instead of widening the row. */
+.hd-cv-attach {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 1px 4px 1px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-panel2);
+  font-size: 11px;
+  color: var(--fg);
+}
+.hd-cv-attach-meta {
+  flex: 0 1 auto;
+  min-width: 0;            /* shrink below its own text … */
+  overflow: hidden;        /* … clip it … */
+  text-overflow: ellipsis; /* … and say so, instead of pushing the composer wider */
+  white-space: nowrap;
+  max-width: 42ch;
+  font-family: var(--mono);
+  color: var(--fg-dim);
+}
+
+/* The remove control is a real button in the chip's own chip language: a fixed 20x20 hit area
+   whatever glyph W2 puts in it (the accessible name is §10.9's aria-label), a hover that borrows the
+   blocked red — it is the destructive one — and a ring drawn with `outline`, so focus can never
+   resize the chip. */
+.hd-cv-attach-remove {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  min-width: 20px;
+  min-height: 20px;
+  padding: 0;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--fg-dim);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.hd-cv-attach-remove:hover { color: var(--fg); border-color: var(--st-blocked); }
+.hd-cv-attach-remove:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* The three states of §10.5. Each is stated, and two of them are stated by SHAPE as well as by
+   colour, so they do not depend on the reader telling two reds apart:
+     uploading — the dashed edge a pending call already carries, in the working amber. Nothing here
+                 declares `animation`, so understanding it never requires seeing a pulse; the state is
+                 a word in .hd-cv-attach-meta plus this mark.
+     ready     — the plain hairline a chip normally carries.
+     failed    — the blocked red on the edge, the same red on the chip's name, and the error card's
+                 own background tint. The third mark is an inset bar drawn as a SHADOW: a wider border
+                 would resize the chip and shift every chip after it in the row (.hd-cv-err's cards can
+                 afford a real left border; a chip in a wrapping row cannot).
+   No state pulses — the amber is A1's "this is happening now" and an upload in flight is not a
+   running agent — and none of them animates, so there is no reduced-motion opt-out to forget. */
+.hd-cv-attach[data-state="uploading"] { border-style: dashed; border-color: var(--st-working); }
+.hd-cv-attach[data-state="uploading"] .hd-cv-attach-meta { color: var(--st-working); }
+.hd-cv-attach[data-state="ready"] { border-color: var(--line); }
+.hd-cv-attach[data-state="failed"] {
+  border-color: var(--st-blocked);
+  background: #2a1416;
+  box-shadow: inset 3px 0 0 var(--st-blocked);
+}
+.hd-cv-attach[data-state="failed"] .hd-cv-attach-meta { color: var(--st-blocked); font-weight: 600; }
+
+/* §10.9's drop state lands on the composer container itself. `outline` is drawn outside the box model
+   and the tint is a background, so the affordance is loud and the composer cannot resize or shift —
+   a border-width or a padding change would have done both. The inset ring carries the accent the way
+   the dashed edge does, from the inside, so the mark survives whatever the container's own rule says:
+   W2's `#promptBox { background: var(--bg-panel) }` outranks a class selector for background-color,
+   which is why the fill below is an addition for plain containers and not the affordance itself.
+   Both marks are measured in the engine in test/chat-render.mjs (§10). */
+.hd-cv-drop-active {
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+  box-shadow: inset 0 0 0 2px var(--accent);
+  background-color: #10202f;
+}

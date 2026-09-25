@@ -1,0 +1,71 @@
+<!doctype html>
+<!-- herdr-dash — test/fixtures/pathlink-live/pathlink-live.html (W3, CONTRACT-v2 §13.1/§13.2)
+     A STANDALONE fixture, served from the repository (the suite serves this directory under /fx/) so it
+     travels with the suite: it loads the SHIPPED public/lib files by the very URLs public/index.html
+     loads them by (/lib/chat-render.js, /lib/copy.js, /lib/pathlink.js, /style.css, /lib/chatview.css,
+     /lib/pathlink.css), so everything measured here is the delivered file and the delivered sheet —
+     including HD.pathlink's own ensureCss(), which looks for href="/lib/pathlink.css" and must find it.
+
+     It is deliberately NOT the app: index.html, app.js, chatview.js and style.css are W2's and are not
+     edited; style.css and chatview.css are linked only for the palette and the chat-view rules the
+     path links and the copy button are written against. There is no chatview.js here, so the fold
+     handler is this fixture's own naive stand-in — the shape W2's delegation has, installed ABOVE the
+     copy mount host so the ordering question (§13.1.4) can be measured.
+
+     Driven by test/pathlink-live.mjs over CDP (real layout, real mouse and key events). The page half
+     is the pathlink-live.js beside this file, loaded from here; nothing in either file asserts
+     anything, and neither writes anything to disk. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>W3 · pathlink live fixture</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/lib/chatview.css">
+<link rel="stylesheet" href="/lib/pathlink.css">
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font-family: var(--sans); font-size: 12.5px; }
+  #fxRoot { display: flex; flex-direction: column; height: 100vh; }
+  #fxBar { flex: 0 0 auto; padding: 6px 10px; border-bottom: 1px solid var(--line);
+    font-family: var(--mono); font-size: 11.5px; color: var(--fg-dim); }
+  #fxMain { flex: 1 1 auto; min-height: 0; display: flex; }
+  #fxPane { flex: 1 1 auto; min-width: 0; padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+  /* The scrolled pane: the path links and their menu live INSIDE a scrolling, overflow:auto box,
+     which is where the real chat list keeps them. */
+  #fxScroller { height: 320px; overflow-y: auto; overflow-x: hidden; border: 1px solid var(--line);
+    border-radius: 8px; background: var(--bg-panel2); padding: 6px 8px; }
+  #fxList { display: flex; flex-direction: column; gap: 6px; }
+  #fxCopyPane { flex: 0 0 auto; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--bg-panel2); padding: 6px 8px; }
+  #fxAside { flex: 0 0 300px; border-left: 1px solid var(--line); padding: 8px;
+    font-family: var(--mono); font-size: 11px; color: var(--fg-dim); }
+  /* The edge hosts are the placement extremes: a fixed box glued to the viewport's right edge (and,
+     for #fxEdge, its bottom edge too), so the link inside is as far right and as far down as a link
+     can be. display:none until a scenario asks for it, so they never cover the pane's own links. */
+  #fxCorner, #fxEdge { position: fixed; right: 0; display: none; padding: 5px 6px;
+    border: 1px dashed var(--line); background: var(--bg-panel2); }
+  #fxCorner { bottom: 96px; width: 280px; }
+  #fxEdge { bottom: 0; width: 340px; }
+  .fx-note { color: var(--fg-dim); font-family: var(--mono); font-size: 10.5px; }
+</style>
+</head>
+<body>
+<div id="fxRoot">
+  <div id="fxBar">W3 pathlink live fixture — shipped chat-render.js + copy.js + pathlink.js, local stub API</div>
+  <div id="fxMain">
+    <div id="fxPane">
+      <div id="fxScroller"><div id="fxList"></div></div>
+      <div id="fxCopyPane"><div id="fxCopy"></div></div>
+      <div class="fx-note">#fxScroller is a real scroll container; #fxCopyPane holds the §13.1 copy-button fixtures.</div>
+    </div>
+    <div id="fxAside">stub API: /api/pathinfo · /api/open<br>stated by the fixture server, not by W1</div>
+  </div>
+</div>
+<div id="fxCorner"></div>
+<div id="fxEdge"></div>
+<script src="/lib/chat-render.js" defer></script>
+<script src="/lib/copy.js" defer></script>
+<script src="/lib/pathlink.js" defer></script>
+<script src="/fx/pathlink-live.js" defer></script>
+</body>
+</html>

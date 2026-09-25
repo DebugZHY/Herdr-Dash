@@ -1,0 +1,12 @@
+# The app's own cache (CONTRACT-v2 §13.4 item 1): the attachment store lives in
+# _cache/attachments, inside the app so it is easy to find and easy to clean, so it
+# must never be published with the repo.
+_cache/
+
+# Ad-hoc worker scratch: harnesses, one-off probes and captured logs. Anything a
+# published test suite needs lives under test/ (e.g. test/fixtures/), never here.
+_scratch/
+
+# Node (the app itself has zero dependencies; this is for anyone who installs tooling).
+node_modules/
+*.log

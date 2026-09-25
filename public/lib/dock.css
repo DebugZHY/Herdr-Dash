@@ -1,0 +1,363 @@
+/* herdr-dash — lib/dock.css (W3, CONTRACT-v2 §12.2 / §12.2.4) — the side dock's look.
+ *
+ * FROZEN MARKUP NAMES. dock.js (W3) renders exactly this tree inside #dockHost (the shell element W2
+ * adds to index.html, §12.2.1). A later round must reuse these names instead of inventing a second
+ * shape, and `.hd-dock-*` is the only prefix this module owns:
+ *
+ *   .hd-dock[data-family][data-state="reading|live|failed"]   the panel root
+ *     .hd-dock-head
+ *       .hd-dock-pane                        the pane id, from the response
+ *       .hd-dock-family[data-family]         hermes | claude | other | none
+ *       .hd-dock-when[data-state]            "read 2s ago …" / the failure age (1 s label tick)
+ *     .hd-dock-msg                           the sentence of a reading panel
+ *     .hd-dock-body                          the live answer
+ *       .hd-dock-sec[data-sec="usage|processes|source"]
+ *         .hd-dock-sec-head
+ *         .hd-dock-usage[data-shape="hermes|claude"]
+ *           .hd-dock-hermes                    hermes only: ONE row — model · used/limit · bar ·
+ *             .hd-dock-model                   pct · elapsed. No shared node names with claude.
+ *             .hd-dock-fig[data-fig=…][data-missing]
+ *             .hd-dock-approx                  the agent's own `~`, shown as a badge
+ *             .hd-dock-bar[data-pct="none"] > .hd-dock-bar-fill[data-fill]
+ *           .hd-dock-claude                    claude only: stacked lines, NO bar (there is no limit
+ *             .hd-dock-model                   anywhere for claude — §12.0), breakdown below.
+ *             .hd-dock-fig[data-fig="context|until|model|…"]
+ *             .hd-dock-breakdown[data-missing]
+ *           .hd-dock-note[data-note]           where the numbers came from / what is NOT printed
+ *         .hd-dock-procs-head / .hd-dock-hint[data-from="agent"]
+ *         ul.hd-dock-proc-list > li.hd-dock-proc[data-idx]
+ *           .hd-dock-proc-cmd[data-elided] / .hd-dock-proc-age / .hd-dock-proc-last[data-elided]
+ *         button.hd-dock-src-head[aria-expanded][data-open]   "show source · N lines"
+ *         .hd-dock-src[hidden] > .hd-dock-src-line[data-from][data-elided]   verbatim, `…` intact
+ *         .hd-dock-elide[data-elide]           "the agent elided this with …"
+ *         .hd-dock-empty[data-why]             the explicit sentence of an empty section
+ *     .hd-dock-stale                           the failure state (replaces .hd-dock-body)
+ *       .hd-dock-stale-msg[data-code]
+ *       .hd-dock-stale-note                    "last successful read …" / "no successful read …"
+ *       .hd-dock-stale-last[data-stale="1"]    the last good answer, LABELLED not current:
+ *         .hd-dock-stale-note[data-stale-label]  "last good answer · 12s ago · pane w6:p2 — not current"
+ *         …the same sections, dimmed…
+ *
+ * Rules this file keeps on purpose:
+ *   - the two families are drawn differently, not tinted differently: hermes gets a single mono row
+ *     with a bar, claude gets a stacked block with no bar and a breakdown. §12.0/§12.2.4: the two
+ *     metrics must never be one shape.
+ *   - a failed read is unmistakable (--st-blocked, an inset bar and a red sentence), and the stale
+ *     numbers under it are dimmed AND carry their own "not current" label. A stale value never looks
+ *     current.
+ *   - the source button is a real focusable control with a visible :focus-visible ring and a hit area
+ *     of at least 20x20 (the §10.9 rule for the attachment remove button).
+ *   - nothing animates and nothing pulses: no `animation`, no `transition`, no `@keyframes` in this
+ *     file, so `prefers-reduced-motion: reduce` needs no separate block — there is no motion to
+ *     reduce. A failed read is stated in words and colour, never a flashing mark.
+ *   - plain text only: no `content:` generated text anywhere. Every sentence is a real text node the
+ *     module wrote, and every agent string keeps the agent's own characters (including `…`).
+ *   - nothing here forces a width: long lines wrap (`overflow-wrap: anywhere`), the panel never
+ *     scrolls sideways, and the dock's own track (260..640, W2's #dockResize) stays in charge of the
+ *     width it was given.
+ * Palette variables are style.css's (CONTRACT-v2 §3): --bg-panel, --bg-panel2, --line, --line-soft,
+ * --fg, --fg-dim, --accent, --st-working, --st-blocked, --st-done, --mono.
+ */
+
+.hd-dock {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px 10px 12px;
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-x: hidden;
+}
+
+/* ── the head: pane id, family, age ─────────────────────────────────────── */
+
+.hd-dock-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line-soft);
+  min-width: 0;
+}
+.hd-dock-pane {
+  font-family: var(--mono);
+  font-weight: 600;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+.hd-dock-family {
+  font-size: 11px;
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--fg-dim);
+  text-transform: lowercase;
+}
+.hd-dock-family[data-family="hermes"] { color: var(--st-working); border-color: var(--st-working); }
+.hd-dock-family[data-family="claude"] { color: var(--accent); border-color: var(--accent); }
+.hd-dock-family[data-family="none"],
+.hd-dock-family[data-family="other"] { color: var(--fg-dim); }
+.hd-dock-when {
+  margin-left: auto;
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+.hd-dock-when[data-state="failed"] { color: var(--st-blocked); }
+
+.hd-dock-msg {
+  color: var(--fg-dim);
+  padding: 4px 0;
+}
+
+/* ── the sections ───────────────────────────────────────────────────────── */
+
+.hd-dock-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+.hd-dock-sec {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.hd-dock-sec-head {
+  color: var(--fg-dim);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--line-soft);
+  padding-bottom: 2px;
+}
+
+/* ── usage: hermes (row + bar) and claude (stacked, no bar) — different shapes ── */
+
+.hd-dock-usage {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.hd-dock-hermes {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.hd-dock-claude {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  padding: 4px 6px;
+  border-left: 2px solid var(--accent);
+  background: var(--bg-panel2);
+  border-radius: 0 4px 4px 0;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.hd-dock-model { color: var(--fg); font-weight: 600; }
+.hd-dock-fig { color: var(--fg); overflow-wrap: anywhere; }
+.hd-dock-fig[data-missing="1"] { color: var(--fg-dim); font-style: italic; }
+.hd-dock-approx {
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 0 4px;
+  border: 1px solid var(--st-working);
+  border-radius: 4px;
+  color: var(--st-working);
+}
+/* the bar: a track with a fill whose width the module sets from the response's own percentage */
+.hd-dock-bar {
+  flex: 0 0 auto;
+  display: inline-block;
+  width: 80px;
+  height: 8px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--bg-panel);
+  overflow: hidden;
+}
+.hd-dock-bar[data-pct="none"] {
+  border-style: dashed;
+  background: transparent;
+}
+.hd-dock-bar-fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+.hd-dock-breakdown {
+  color: var(--fg-dim);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.hd-dock-breakdown[data-missing="1"] { font-style: italic; }
+.hd-dock-note {
+  color: var(--fg-dim);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+/* ── processes ──────────────────────────────────────────────────────────── */
+
+.hd-dock-procs-head {
+  font-family: var(--mono);
+  color: var(--fg);
+  font-size: 11px;
+}
+.hd-dock-procs-head[data-missing="1"] { color: var(--fg-dim); font-style: italic; }
+.hd-dock-hint {
+  color: var(--fg-dim);
+  font-size: 10px;
+  font-family: var(--mono);
+  overflow-wrap: anywhere;
+}
+.hd-dock-proc-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.hd-dock-proc {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  padding: 3px 0 3px 6px;
+  border-left: 2px solid var(--line);
+}
+.hd-dock-proc-cmd {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+.hd-dock-proc-cmd[data-missing="1"] { color: var(--fg-dim); font-style: italic; }
+.hd-dock-proc-age {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--fg-dim);
+}
+.hd-dock-proc-age[data-missing="1"] { font-style: italic; }
+.hd-dock-proc-last {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--fg-dim);
+  overflow-wrap: anywhere;
+}
+.hd-dock-proc-last[data-missing="1"] { font-style: italic; }
+/* the agent's own `…` is left in the text; this is the visible label that says who cut it */
+.hd-dock-elide {
+  display: block;
+  color: var(--st-working);
+  font-size: 10px;
+  font-family: var(--mono);
+}
+
+/* ── source: verbatim lines, collapsible ────────────────────────────────── */
+
+.hd-dock-src-head {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  min-width: 20px;
+  padding: 2px 8px;
+  font: inherit;
+  font-size: 11px;
+  color: var(--fg);
+  background: var(--bg-panel2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.hd-dock-src-head:hover { border-color: var(--accent); }
+.hd-dock-src-head:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.hd-dock-src {
+  display: block;
+  margin: 0;
+  padding: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--bg-input);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg);
+  overscroll-behavior: contain;
+}
+.hd-dock-src[hidden] { display: none; }
+/* the verbatim line: the agent's own characters, wrapped, never truncated by us */
+.hd-dock-src-line {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.hd-dock-src-line[data-elided="1"] { color: var(--fg-dim); }
+
+/* ── the explicit empty sentences ───────────────────────────────────────── */
+
+.hd-dock-empty {
+  color: var(--fg-dim);
+  font-size: 11px;
+  font-style: italic;
+  padding: 2px 0;
+  overflow-wrap: anywhere;
+}
+
+/* ── the failure state: unmistakable, and the stale answer labelled ─────── */
+
+.hd-dock[data-state="failed"] .hd-dock-head { border-bottom-color: var(--st-blocked); }
+.hd-dock-stale {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--st-blocked);
+  border-left-width: 3px;
+  border-radius: 4px;
+  background: #2a1416;                  /* the error tint style.css already uses */
+}
+.hd-dock-stale-msg {
+  color: var(--st-blocked);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.hd-dock-stale-note {
+  color: var(--fg-dim);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+/* the last good answer, kept but never disguised as the current one */
+.hd-dock-stale-last {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  margin-top: 2px;
+  padding: 6px;
+  border: 1px dashed var(--line);
+  border-radius: 4px;
+  opacity: 0.72;
+}
+.hd-dock-stale-last .hd-dock-fig,
+.hd-dock-stale-last .hd-dock-hermes,
+.hd-dock-stale-last .hd-dock-claude,
+.hd-dock-stale-last .hd-dock-procs-head { color: var(--fg-dim); }
+.hd-dock-stale-last .hd-dock-bar { border-style: dashed; opacity: 0.6; }
+.hd-dock-stale-last [data-stale-label="1"] { color: var(--st-working); font-weight: 600; font-size: 10px; }

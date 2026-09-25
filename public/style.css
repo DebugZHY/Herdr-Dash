@@ -1,0 +1,535 @@
+/* herdr-dash — dark theme. No frameworks, no imports, offline. */
+
+:root {
+  --bg:        #0d1117;
+  --bg-panel:  #141a22;
+  --bg-panel2: #1a2029;
+  --bg-input:  #0b0f14;
+  --line:      #263040;
+  --line-soft: #1e2632;
+  --fg:        #d6dee8;
+  --fg-dim:    #8b97a6;
+  --accent:    #4aa3ff;
+
+  --st-working: #e0a02a;  /* amber  */
+  --st-blocked: #e5484d;  /* red    */
+  --st-idle:    #8a93a0;  /* grey   */
+  --st-done:    #3fb950;  /* green  */
+  --st-unknown: #a371f7;  /* purple */
+
+  --mono: ui-monospace, "Cascadia Mono", "JetBrains Mono", Consolas, "Courier New", monospace;
+  --sidebar-w: 300px;
+  --dock-w: 320px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0; padding: 0; height: 100%;
+  background: var(--bg); color: var(--fg);
+  font: 13px/1.45 system-ui, "Segoe UI", Roboto, sans-serif;
+}
+
+.mono { font-family: var(--mono); }
+.strong { font-weight: 600; }
+.dim { color: var(--fg-dim); }
+.small { font-size: 11.5px; }
+.muted { color: var(--fg-dim); }
+.pad { padding: 10px 12px; }
+.grow { flex: 1 1 auto; min-width: 0; }
+.hidden { display: none !important; }
+
+#app {
+  display: grid;
+  grid-template-columns: auto 6px 1fr 6px auto;   /* §12.2.1: the fourth track is the dock's */
+  height: 100vh; width: 100vw;
+  overflow: hidden;
+}
+
+/* DEFECT-16 — place the five tracks explicitly. With auto-placement, `.hidden` on a resize handle
+   (display:none) removed that grid item, so #main slid into the 6px track: collapsing the sidebar
+   left a 6px-wide main area (a blank page) whose own restore button could not be clicked, and the
+   state persisted in localStorage, so a reload came back broken too. The rule is unchanged by the
+   dock's arrival — it is what makes a collapsed dock a 0-width track instead of a moved #main. */
+#sidebar { grid-column: 1; }
+#sidebarResize { grid-column: 2; }
+#main { grid-column: 3; }
+#dockResize { grid-column: 4; }
+#dock { grid-column: 5; }
+
+/* ---------------- sidebar ---------------- */
+
+#sidebar {
+  width: var(--sidebar-w);
+  min-width: 240px;
+  background: var(--bg-panel);
+  border-right: 1px solid var(--line);
+  display: flex; flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+#sidebar.collapsed { width: 0 !important; min-width: 0; border-right: none; }
+#sidebar.collapsed .side-head,
+#sidebar.collapsed .side-body { display: none; }
+
+#sidebarResize { background: transparent; cursor: col-resize; }
+#sidebarResize:hover { background: var(--accent); opacity: .35; }
+#sidebarResize.hidden { display: none !important; }
+
+/* ---------------- side dock (CONTRACT-v2 §12.2) ---------------- */
+
+#dockResize { background: transparent; cursor: col-resize; }   /* mirror of #sidebarResize */
+#dockResize:hover { background: var(--accent); opacity: .35; }
+#dockResize.hidden { display: none !important; }
+
+#dock {
+  width: var(--dock-w);
+  min-width: 260px;                        /* §12.2.1's clamp floor, applied by CSS and by the drag */
+  background: var(--bg-panel);
+  border-left: 1px solid var(--line);
+  display: flex; flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+#dock.collapsed { width: 0 !important; min-width: 0; border-left: none; }
+#dock.collapsed .dock-head,
+#dock.collapsed .dock-host { display: none; }
+
+.dock-head {
+  flex: 0 0 auto;
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 10px;
+  background: var(--bg-panel2);
+  border-bottom: 1px solid var(--line);
+}
+.dock-host { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 6px 10px 8px; }
+
+/* the §12.2.2 usage chip: an em dash (never a zero, never a guess) when there is no current value */
+#hUsage { flex: 0 0 auto; max-width: 340px; }
+
+/* the dock's toggle is a real target, not a 17.6x19 px dot: the same >=20x20 the source/attachment
+   buttons already meet (§10.9). Only the box grows — the glyph, the click and `d` are unchanged. */
+#dockToggle {
+  flex: 0 0 auto;
+  min-width: 20px; min-height: 20px;
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 0;
+}
+
+.side-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 8px 6px 12px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--bg-panel2);
+  flex: 0 0 auto;
+}
+.brand { font-family: var(--mono); font-weight: 700; letter-spacing: .3px; }
+.brand-dim { color: var(--fg-dim); font-weight: 400; }
+
+.side-body { flex: 1 1 auto; overflow: auto; padding: 6px 0 20px; min-height: 0; }
+
+.ws-row, .tab-row, .pane-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 3px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ws-row  { padding-left: 8px;  font-weight: 600; }
+.tab-row { padding-left: 22px; color: var(--fg); }
+.pane-row{ padding-left: 38px; color: var(--fg-dim); }
+.ws-row:hover, .tab-row:hover, .pane-row:hover { background: #1c2430; }
+.pane-row.selected { background: #14304d; color: var(--fg); box-shadow: inset 2px 0 0 var(--accent); }
+.pane-row .n { overflow: hidden; text-overflow: ellipsis; }
+
+.caret { width: 10px; color: var(--fg-dim); font-size: 10px; flex: 0 0 auto; }
+.caret.open { color: var(--fg); }
+.focus-mark { color: var(--accent); font-size: 10px; }
+
+.badge {
+  margin-left: auto; font-size: 10.5px; padding: 0 6px;
+  border-radius: 8px; border: 1px solid var(--line);
+  color: var(--fg-dim); background: #0f141b;
+  font-family: var(--mono);
+}
+
+/* ---------------- status dots ---------------- */
+
+.dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--st-idle); flex: 0 0 auto;
+}
+.dot.working { background: var(--st-working); }
+.dot.blocked { background: var(--st-blocked); box-shadow: 0 0 0 3px rgba(229,72,77,.20); }
+.dot.idle    { background: var(--st-idle); }
+.dot.done    { background: var(--st-done); }
+.dot.unknown { background: var(--st-unknown); }
+
+/* ---------------- main column ---------------- */
+
+#main {
+  display: flex; flex-direction: column;
+  min-width: 0; min-height: 0; height: 100vh;
+  /* DEFECT-21's backstop. The composer's cap now leaves room for the console (app.js promptFitCap), so
+     in any normal window this column does not overflow. It can still overflow when the window is too
+     short for the composer's own content floor plus everything else — §12.1.3 makes the floor win, and
+     a floor that wins must not brick the console. `auto` is `hidden` until that happens: no scrollbar,
+     no layout change, and then a way down to the console. */
+  overflow-x: hidden; overflow-y: auto;
+}
+
+#header {
+  flex: 0 0 auto;
+  display: flex; align-items: center; gap: 12px;
+  padding: 6px 12px;
+  background: var(--bg-panel2);
+  border-bottom: 1px solid var(--line);
+}
+.hdr-main { flex: 1 1 auto; min-width: 0; }
+.hdr-row { display: flex; align-items: center; gap: 10px; min-width: 0; flex-wrap: nowrap; }
+/* The header's height is part of the layout everything below it is measured against (§12.1: the
+   composer's bottom edge is the drag's datum), so its rows must never re-flow when a field's text
+   gets longer — a wrapped "495 ms ago" pushed the whole page down 16px mid-drag. Fields keep their
+   own line (nowrap, unsquashed); the hint is the one item allowed to shrink, and it ellipsizes. */
+.hdr-row > * { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 0 0 auto; }
+#hHint { flex: 0 1 auto; min-width: 0; }
+.hdr-status { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; }
+.full { overflow: hidden; text-overflow: ellipsis; }
+
+.live { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.dot.live-on  { background: var(--st-done); box-shadow: 0 0 6px rgba(63,185,80,.8); }
+.dot.live-off { background: var(--st-blocked); }
+
+/* ---------------- transcript ---------------- */
+
+#transcriptWrap {
+  position: relative;
+  /* §12.1 item 6: the composer may take up to 60% of the main area, so the transcript is what gives
+     the last px — its floor is the smallest sliver of chat that still reads as one, not 120 */
+  flex: 1 1 auto; min-height: 96px;
+  display: flex;
+  background: var(--bg-input);
+  border-bottom: 1px solid var(--line);
+  overflow: hidden;
+}
+#transcript {
+  flex: 1 1 auto;
+  margin: 0; padding: 8px 12px;
+  overflow: auto;
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.4;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  color: #cfd8e3;
+  min-height: 0;
+}
+#transcript:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
+
+/* §13.2.1: HD.pathlink's mount host, declared inside #chatHost (index.html). The module puts exactly
+   one thing in here — the in-page file menu, which pathlink.css positions FIXED at the link — so the
+   host must not take a row in the chat host's column, and `display: contents` is the way to say that:
+   the host has no box of its own, its children belong to the chat host's formatting context, and the
+   fixed menu is out of flow in either case. (`position:absolute` + `pointer-events:none` would also
+   leave the column alone, but it would need a second rule to re-enable the menu's own buttons.) */
+#hdPathHost { display: contents; }
+
+.jump {
+  position: absolute; right: 18px; bottom: 12px;
+  background: var(--accent); color: #06101c; border: none;
+  padding: 4px 10px; border-radius: 12px; cursor: pointer;
+  font-size: 11.5px; font-weight: 600;
+}
+
+.sep { color: var(--st-unknown); }
+
+/* ---------------- prompt box ---------------- */
+
+#promptBox {
+  flex: 0 0 auto;
+  display: flex; flex-direction: column;      /* §12.1.2: the panel is sized from its top edge */
+  height: var(--prompt-h, auto);
+  min-height: 120px;                          /* §12.1.2's floor — the JS clamp can never go below it */
+  padding: 6px 10px 8px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--line);
+  overflow: hidden;                           /* capped: at --prompt-h the content never spills */
+}
+
+/* §12.1.2 — the composer's own top edge. One mechanism only: the textarea's native corner grip is
+   gone (below). It mirrors #sidebarResize (same hover, same body cursor while dragging). */
+#promptResize {
+  flex: 0 0 auto;
+  width: 100%; height: 6px;
+  background: transparent;
+  cursor: row-resize;
+  border-radius: 3px;
+  /* no bottom margin: the handle is 6px of the vertical budget the transcript and the chat view own
+     (§12.1.1 fixes the height). Four pixels more was enough to leave the chat scroller 1px into its
+     own scroll, where A3 (g2)'s "a toggle must not move the view" caught it — the frozen 6px does not
+     tip it, but there is no reason to spend more than the contract asks for. */
+  margin: 0;
+}
+#promptResize:hover, #promptResize:focus { background: var(--accent); opacity: .35; outline: none; }
+#promptResize:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+
+.prompt-line { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 6px; }
+.prompt-line.wrap { flex-wrap: wrap; align-items: center; }
+/* the row that carries the textarea takes the panel's spare height, so dragging the top edge up
+   gives the space to the composer itself (and stops at #promptText's own min-height) */
+#promptTextRow { flex: 1 1 auto; min-height: 0; align-items: stretch; }
+#promptText {
+  flex: 1 1 auto; resize: none; min-height: 34px;
+  background: var(--bg-input); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 4px;
+  padding: 6px 8px; font-family: var(--mono); font-size: 12.5px;
+}
+#promptText:focus { outline: none; border-color: var(--accent); }
+.prompt-side { display: flex; flex-direction: column; gap: 4px; align-items: stretch; flex: 0 0 auto; }
+
+.chk { display: flex; align-items: center; gap: 4px; color: var(--fg-dim); font-size: 11.5px; white-space: nowrap; }
+
+.btn {
+  background: #202a37; color: var(--fg);
+  border: 1px solid var(--line); border-radius: 4px;
+  padding: 4px 10px; cursor: pointer; font-size: 12px;
+}
+.btn:hover { background: #27323f; }
+.btn.primary { background: #1d4e7d; border-color: #2b6ba8; }
+.btn.primary:hover { background: #235c93; }
+.btn:disabled { opacity: .5; cursor: default; }
+
+.icon-btn {
+  background: transparent; color: var(--fg-dim); border: 1px solid transparent;
+  cursor: pointer; font-size: 11px; border-radius: 3px; padding: 1px 5px;
+}
+.icon-btn:hover { color: var(--fg); border-color: var(--line); }
+
+.keys { display: flex; gap: 4px; flex-wrap: wrap; }
+.key {
+  background: #1b2330; color: var(--fg); border: 1px solid var(--line);
+  border-radius: 3px; padding: 2px 7px; cursor: pointer;
+  font-family: var(--mono); font-size: 11px;
+}
+.key:hover { background: #26313f; border-color: var(--accent); }
+
+/* DEFECT-3(b): the esc→pane arming toggle. A live toggle, not a key send: it has no
+   data-key, and when armed it turns red because Esc then interrupts the agent's turn. */
+.key.arm-toggle { color: var(--fg-dim); }
+.key.arm-toggle.arm-on {
+  color: var(--st-blocked); border-color: var(--st-blocked); background: #2a1618;
+}
+.key.arm-toggle.arm-on:hover { background: #3a1b1e; border-color: var(--st-blocked); }
+
+input[type=text], .sel {
+  background: var(--bg-input); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 4px;
+  padding: 4px 6px; font-size: 12px;
+}
+input[type=text]:focus, .sel:focus { outline: none; border-color: var(--accent); }
+.sel { cursor: pointer; }
+
+.result { font-family: var(--mono); font-size: 11.5px; padding: 4px 8px; border-radius: 4px; margin-top: 2px; }
+.result.ok  { color: #9fd6a8; background: #10231a; border: 1px solid #1e4630; }
+.result.err { color: #ffb4b4; background: #2a1416; border: 1px solid #5c2326; }
+
+/* ---------------- console ---------------- */
+
+#consolePanel {
+  flex: 0 0 auto;
+  display: flex; flex-direction: column;
+  /* §12.1 item 6: the console keeps a strip — its header plus at least one line — and its own content
+     (`#consoleBody .out`, which already scrolls) takes the loss, rather than being pushed off screen by
+     a tall composer. `flex-shrink: 1` is what lets the column take the strip down to that floor
+     instead of overflowing; in a roomy window nothing shrinks and the console stays at its 30%. */
+  height: 30%; min-height: 64px; flex-shrink: 1;
+  background: var(--bg-panel);
+  overflow: hidden;
+}
+#consolePanel.collapsed { height: auto; min-height: 0; }
+#consolePanel.collapsed #consoleBody { display: none; }
+
+/* §12.1 item 6 — the strip, measured and marked by syncConsoleStrip() in app.js. The console is at the
+   height where its command row and a line of output cannot both fit, so the strip promises the line:
+   the body scrolls its own content (`overflow: auto`), the output is ordered above the command row, and
+   its own padding gives way to the line it has to show. Nothing here is a state the user has to leave
+   by hand — the class follows the console's measured height, so the ordinary console is one drag away. */
+#consolePanel.strip #consoleBody { padding: 0 6px 2px; gap: 4px; overflow: auto; }
+#consolePanel.strip .out { order: -1; padding: 1px 6px; min-height: 24px; }
+
+.console-head {
+  flex: 0 0 auto;
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 10px; cursor: pointer;
+  background: var(--bg-panel2);
+  border-top: 1px solid var(--line);
+  user-select: none;
+}
+.console-head .caret { transition: transform .12s ease; }
+#consolePanel.collapsed .console-head .caret { transform: rotate(-90deg); }
+
+#consoleBody {
+  flex: 1 1 auto; min-height: 0;
+  display: flex; flex-direction: column;
+  padding: 6px 10px 8px;
+  gap: 6px;
+}
+.cmd-row { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.prompt-caret { color: var(--st-done); }
+
+.history { display: flex; gap: 4px; flex-wrap: wrap; flex: 0 0 auto; max-height: 44px; overflow: auto; }
+.hist {
+  font-family: var(--mono); font-size: 10.5px;
+  color: var(--fg-dim); background: #171e27;
+  border: 1px solid var(--line-soft); border-radius: 3px;
+  padding: 1px 6px; cursor: pointer;
+}
+.hist:hover { color: var(--fg); border-color: var(--accent); }
+
+.out {
+  flex: 1 1 auto; min-height: 0; overflow: auto;
+  background: var(--bg-input); border: 1px solid var(--line-soft);
+  border-radius: 4px; padding: 6px 8px;
+  font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.blk { margin-bottom: 8px; }
+.blk-cmd { color: var(--accent); }
+.blk-meta { color: var(--fg-dim); }
+.blk-exit-bad { color: var(--st-blocked); }
+.blk-exit-ok { color: var(--st-done); }
+.blk-err { color: #ffb4b4; }
+
+/* ---------------- errors ---------------- */
+
+.err {
+  color: #ffb4b4; background: #2a1416; border: 1px solid #5c2326;
+  border-radius: 4px; padding: 5px 8px;
+  font-family: var(--mono); font-size: 11.5px;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+#treeError { margin: 6px 8px 0; flex: 0 0 auto; }
+.overlay {
+  position: absolute; left: 12px; right: 12px; bottom: 12px;
+  box-shadow: 0 4px 14px rgba(0,0,0,.5);
+}
+
+/* ================= integration (W2, round 2) =================
+   Styles for the W2 modules (lib/palette.js, lib/search.js, lib/fanout.js, lib/keys.js)
+   and the app-level pieces they attach to. Same palette and variables as above;
+   W3's view modules carry their own lib/*.css. */
+
+/* ---------------- hint line + toast ---------------- */
+.hint { color: var(--fg-dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.toast {
+  position: fixed; right: 16px; bottom: 16px; z-index: 60;
+  max-width: 46vw; padding: 8px 12px; border-radius: 6px;
+  font-family: var(--mono); font-size: 12px;
+  background: var(--bg-panel2); border: 1px solid var(--line);
+  box-shadow: 0 6px 22px rgba(0,0,0,.55);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.toast.ok   { border-color: #1e4630; color: #9fd6a8; background: #10231a; }
+.toast.err  { border-color: #5c2326; color: #ffb4b4; background: #2a1416; }
+.toast.info { border-color: #2b6ba8; color: #cfe4ff; background: #0f1c2b; }
+
+/* ---------------- transcript highlight (search jump) ---------------- */
+#transcriptWrap.hl-flash { box-shadow: inset 0 0 0 2px var(--accent); }
+#transcriptWrap.selftest #transcript { color: #cfe4ff; }
+
+/* a module that failed to mount leaves a visible note */
+.mod-err {
+  margin: 8px; padding: 6px 9px; border-radius: 4px;
+  color: #ffb4b4; background: #2a1416; border: 1px solid #5c2326;
+  font-family: var(--mono); font-size: 11.5px;
+}
+
+/* ---------------- palette + help overlay ---------------- */
+.pal-root {
+  position: fixed; inset: 0; z-index: 50;
+  background: rgba(3,6,10,.55);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding-top: 8vh;
+}
+.pal-box {
+  width: min(760px, 92vw); max-height: 76vh; display: flex; flex-direction: column;
+  background: var(--bg-panel); border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: 0 18px 50px rgba(0,0,0,.6); overflow: hidden;
+}
+.pal-head { padding: 9px 12px; border-bottom: 1px solid var(--line); font-weight: 600; }
+.pal-input {
+  flex: 0 0 auto; margin: 0; padding: 11px 13px; border: none; border-bottom: 1px solid var(--line);
+  background: var(--bg-input); color: var(--fg); font-family: var(--mono); font-size: 13.5px;
+}
+.pal-input:focus { outline: none; }
+.pal-list { flex: 1 1 auto; overflow: auto; padding: 4px 0; min-height: 0; }
+.pal-row { display: flex; align-items: baseline; gap: 8px; padding: 5px 12px; cursor: default; }
+.pal-row.sel { background: #14304d; box-shadow: inset 2px 0 0 var(--accent); }
+.pal-row.empty { color: var(--fg-dim); font-style: italic; }
+.pal-kind {
+  flex: 0 0 auto; font-family: var(--mono); font-size: 10.5px; text-transform: uppercase;
+  color: var(--fg-dim); border: 1px solid var(--line); border-radius: 3px; padding: 0 4px;
+}
+.pal-kind.pane { color: var(--accent); border-color: #2b6ba8; }
+.pal-kind.kbd  { color: #ffd479; border-color: #6b5620; text-transform: none; }
+.pal-label { flex: 0 0 auto; font-family: var(--mono); }
+.pal-sub { flex: 1 1 auto; color: var(--fg-dim); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pal-key { flex: 0 0 auto; color: var(--fg-dim); font-family: var(--mono); font-size: 11px; }
+.pal-foot { flex: 0 0 auto; padding: 6px 12px; border-top: 1px solid var(--line); color: var(--fg-dim); font-size: 11px; }
+.pal-group { padding: 2px 0 6px; }
+.pal-group-head {
+  padding: 6px 12px 2px; color: var(--fg-dim); font-size: 10.5px; text-transform: uppercase; letter-spacing: .4px;
+}
+
+/* ---------------- cross-pane search + fan-out panels ---------------- */
+.srch-panel, .fan-panel {
+  position: absolute; left: 12px; right: 12px; bottom: 12px; z-index: 40;
+  max-height: 62vh; display: flex; flex-direction: column;
+  background: var(--bg-panel); border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: 0 12px 34px rgba(0,0,0,.6); overflow: hidden;
+}
+.srch-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 10px; border-bottom: 1px solid var(--line);
+}
+.srch-head .grow { flex: 1 1 auto; }
+.srch-head > .btn:first-of-type { margin-left: auto; }
+.srch-bar { display: flex; align-items: center; gap: 8px; padding: 8px 10px; flex-wrap: wrap; }
+.srch-input {
+  flex: 1 1 240px; min-width: 160px; padding: 6px 9px;
+  background: var(--bg-input); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 4px; font-family: var(--mono); font-size: 12.5px;
+}
+.srch-input:focus { outline: none; border-color: var(--accent); }
+.srch-results { overflow: auto; padding: 0 0 8px; min-height: 0; }
+.srch-group { border-top: 1px solid var(--line-soft); }
+.srch-group-head {
+  display: flex; align-items: baseline; gap: 8px; padding: 5px 10px; cursor: pointer;
+  background: var(--bg-panel2); position: sticky; top: 0;
+}
+.srch-group-head:hover { background: #1c2430; }
+.srch-group.current .srch-group-head { box-shadow: inset 2px 0 0 var(--accent); }
+.srch-row { display: flex; align-items: baseline; gap: 8px; padding: 2px 10px 2px 22px; cursor: pointer; }
+.srch-row:hover { background: #1c2430; }
+.srch-ln { flex: 0 0 46px; text-align: right; }
+.srch-snip { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #cfd8e3; }
+
+.fan-body { padding: 8px 10px; overflow: auto; min-height: 0; display: flex; flex-direction: column; gap: 6px; }
+.fan-targets { display: flex; flex-wrap: wrap; gap: 6px; max-height: 120px; overflow: auto; }
+.fan-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  border: 1px solid var(--line); border-radius: 12px; padding: 2px 8px; background: var(--bg-panel2);
+}
+.fan-chip.on { border-color: var(--accent); background: #14304d; }
+.fan-text {
+  width: 100%; padding: 7px 9px; resize: vertical;
+  background: var(--bg-input); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 4px; font-family: var(--mono); font-size: 12.5px;
+}
+.fan-text:focus { outline: none; border-color: var(--accent); }
+.fan-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.fan-templates { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.fan-tpl { display: inline-flex; align-items: center; gap: 2px; }
+.btn.tiny { padding: 1px 6px; font-size: 11px; }
+.fan-results { display: flex; flex-direction: column; gap: 2px; max-height: 180px; overflow: auto; }
+.fan-res { display: flex; gap: 8px; align-items: baseline; font-family: var(--mono); font-size: 11.5px; }
+.fan-res.ok  { color: #9fd6a8; }
+.fan-res.err { color: #ffb4b4; }
+.fan-res-detail { color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fan-selecting .pane-row { padding-left: 26px; }
+.fan-chk { margin-right: 4px; }

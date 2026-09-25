@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>herdr-dash</title>
+<!-- a data-URI icon: without one every page load fetches /favicon.ico and logs a 404 in the console -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23151d28'/%3E%3Crect x='3' y='4' width='10' height='2' rx='1' fill='%234aa3ff'/%3E%3Crect x='3' y='7' width='7' height='2' rx='1' fill='%238b97a6'/%3E%3Crect x='3' y='10' width='9' height='2' rx='1' fill='%238b97a6'/%3E%3C/svg%3E">
+
+<!-- integration (W2): style.css, then every lib/*.css (CONTRACT-v2 §3) -->
+<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/lib/board.css">
+<link rel="stylesheet" href="/lib/inbox.css">
+<link rel="stylesheet" href="/lib/grid.css">
+<link rel="stylesheet" href="/lib/timebar.css">
+<link rel="stylesheet" href="/lib/gitview.css">
+<link rel="stylesheet" href="/lib/chatview.css">
+<link rel="stylesheet" href="/lib/pathlink.css">
+<link rel="stylesheet" href="/lib/dock.css">
+
+<!-- bootstrap: CONTRACT-v2 §3 loads lib/*.js BEFORE app.js, so modules may register first.
+     This stub keeps those registrations (HD.modules) until app.js publishes the real API. -->
+<script>
+window.HD = window.HD || {};
+if (!window.HD.modules) window.HD.modules = {};
+if (!window.HD.pending) window.HD.pending = [];
+if (typeof window.HD.register !== 'function') {
+  window.HD.register = function (mod) {
+    if (mod && mod.id) window.HD.modules[mod.id] = mod;
+    return true;
+  };
+}
+</script>
+
+<!-- advanceBuffer (CONTRACT-v2 §0.1) lives in exactly one file, shared with Node's test/parity.mjs:
+     load it first so window.HD.advanceBuffer exists before app.js polls and before any module. -->
+<script src="/lib/advance-buffer.js" defer></script>
+
+<!-- module load order is frozen (CONTRACT-v2 §3). A missing file must not break the page. -->
+<script src="/lib/palette.js" defer></script>
+<script src="/lib/search.js" defer></script>
+<script src="/lib/fanout.js" defer></script>
+<script src="/lib/keys.js" defer></script>
+<script src="/lib/board.js" defer></script>
+<script src="/lib/inbox.js" defer></script>
+<script src="/lib/grid.js" defer></script>
+<script src="/lib/timebar.js" defer></script>
+<script src="/lib/gitview.js" defer></script>
+
+<!-- §8: the structured conversation view. chat-render.js is W3's renderer (ChatRender, the §8.5
+     frozen interface); chatview.js falls back to a built-in minimal renderer if it is absent. -->
+<script src="/lib/chat-render.js" defer></script>
+<!-- §13: the copy behaviour (W2) and the path links (W3). Both are plain behaviour modules with no
+     §3 registration: chatview.js mounts them when the chat view mounts, and neither is required for
+     the view to work (a missing file leaves the text exactly as the agent wrote it, §13.2.8). -->
+<script src="/lib/copy.js" defer></script>
+<script src="/lib/pathlink.js" defer></script>
+<script src="/lib/chatview.js" defer></script>
+
+<!-- §12.2.3: the side dock's content (W3). It registers itself before app.js runs, so it is then
+     mounted by mountModules() — the shell in index.html (#dockHost, #dockResize, #dockToggle) is W2's. -->
+<script src="/lib/dock.js" defer></script>
+
+<!-- app.js publishes window.HD.ctx and mounts every module present -->
+<script src="/app.js" defer></script>
+</head>
+<body>
+
+<div id="app">
+
+  <!-- ============ SIDEBAR ============ -->
+  <aside id="sidebar">
+    <div class="side-head">
+      <span class="brand">herdr<span class="brand-dim">-dash</span></span>
+      <button id="sidebarToggle" class="icon-btn" type="button" title="Collapse sidebar">&#10094;</button>
+    </div>
+    <div id="treeError" class="err hidden"></div>
+    <div id="sidebarBody" class="side-body">
+      <div class="muted pad">waiting for snapshot&hellip;</div>
+    </div>
+  </aside>
+
+  <!-- resize handle -->
+  <div id="sidebarResize" title="Drag to resize"></div>
+
+  <!-- ============ MAIN ============ -->
+  <main id="main">
+
+    <header id="header">
+      <button id="sidebarToggleOpen" class="icon-btn hidden" type="button" title="Show sidebar">&#10095;</button>
+      <div class="hdr-main">
+        <div class="hdr-row">
+          <span id="hPane" class="mono strong">no pane selected</span>
+          <span id="hLabel" class="mono dim"></span>
+          <!-- §8.3: which view the pane is showing. chatview.js owns the label; `t` and a click toggle -->
+          <button id="hViewMode" class="mode-chip mode-chat" type="button"
+                  title="t — chat view / raw terminal">view: chat</button>
+          <span class="hdr-status">
+            <span id="hStatusDot" class="dot unknown" title="agent status"></span>
+            <span id="hStatus" class="mono">unknown</span>
+          </span>
+        </div>
+        <div class="hdr-row small">
+          <span class="dim">agent</span> <span id="hAgent" class="mono">-</span>
+          <span class="dim">cwd</span> <span id="hCwd" class="mono">-</span>
+          <span class="dim">poll</span> <span id="hAge" class="mono">-</span>
+          <!-- CONTRACT-v2 §12.2.2: fed by the dock module (W3, id `dock`), filled by app.js. It shows
+               — with a title reason whenever there is no current value, and never shows a stale one. -->
+          <span class="dim">usage</span> <span id="hUsage" class="mono dim"
+                title="usage: waiting for the dock module">&#8212;</span>
+          <span id="hHint" class="dim small hint"></span>
+        </div>
+      </div>
+      <!-- §12.2.1: the dock's own toggle. It lives in the app header on purpose, so it is reachable in
+           both states — the DEFECT-16 lesson (a collapsed panel whose restore button is inside the
+           collapsed panel is a brick). `d` does the same thing. -->
+      <button id="dockToggle" class="icon-btn" type="button" aria-expanded="false"
+              title="d — open the dock (the selected pane's usage + background processes)">&#10095;</button>
+      <div class="live" title="SSE stream / herdr connection">
+        <button id="helpBtn" class="icon-btn" type="button" title="keyboard shortcuts (?)">?</button>
+        <span id="liveDot" class="dot live-off"></span>
+        <span id="liveText" class="mono small">stream: connecting&hellip;</span>
+      </div>
+    </header>
+
+    <!-- transcript: the raw terminal text (#transcript, app.js) and the structured chat view
+         (#chatHost, chatview.js). `t` switches which one is shown; both stay mounted. -->
+    <div id="transcriptWrap">
+      <pre id="transcript" tabindex="0"></pre>
+      <div id="chatHost" class="chat-host hidden">
+        <!-- CONTRACT-v2 §13.2.1: HD.pathlink's mount host (mounted by chatview.js, W2). It is
+             display:contents in style.css, so it takes no row in the chat host's own column; it
+             exists so the link module has a declared element to own — and so the fixed-position file
+             menu it appends lands inside the view the reader clicked in, not on <body>. -->
+        <div id="hdPathHost" class="hd-pl-host"></div>
+      </div>
+      <button id="jumpLatest" class="jump hidden" type="button">jump to latest &#8595;</button>
+      <div id="transcriptError" class="err overlay hidden"></div>
+    </div>
+
+    <!-- prompt box -->
+    <section id="promptBox">
+      <!-- CONTRACT-v2 §12.1: the composer resizes from its TOP edge. This handle is the first child of
+           the panel (the native textarea corner grip is gone: #promptText is resize:none), it is
+           keyboard-reachable, and it never sends anything to a pane. -->
+      <div id="promptResize" role="separator" aria-orientation="horizontal"
+           aria-label="resize the prompt panel" tabindex="0" title="Drag to resize the prompt panel"></div>
+      <!-- CONTRACT-v2 §10 attachments: the paperclip opens a file picker; a drop on the composer or a
+           paste of files lands in the same place. The chip row and its reason line are filled by
+           public/lib/chatview.js (the §10.9 names are frozen there); the input is hidden and is the
+           only way a browser lets a page open a file chooser. -->
+      <div id="promptAttachRow" class="prompt-line wrap">
+        <button id="promptAttachBtn" class="btn" type="button" aria-label="attach a file"
+                title="attach a file — or drop one on the composer, or paste one">&#128206; attach</button>
+        <span class="dim small">the file is copied to the app's own store and sent to the agent as an absolute path</span>
+        <input id="promptAttachInput" class="hidden" type="file" multiple
+               tabindex="-1" aria-hidden="true">
+      </div>
+      <div id="hdAttachList" class="hd-cv-attach-list hidden"></div>
+      <div id="hdAttachNote" class="hd-cv-attach-note hidden"></div>
+      <div class="prompt-line" id="promptTextRow">
+        <textarea id="promptText" rows="2" spellcheck="false" placeholder="prompt the selected pane&hellip;  (Enter sends, Shift+Enter newline)"></textarea>
+        <div class="prompt-side">
+          <button id="promptSend" class="btn primary" type="button">send</button>
+          <label class="chk"><input id="promptWait" type="checkbox"> wait for idle</label>
+        </div>
+      </div>
+      <div class="prompt-line wrap">
+        <span class="dim small">keys</span>
+        <div id="keysRow" class="keys">
+          <button class="key" data-key="enter" type="button">enter</button>
+          <button class="key" data-key="esc" type="button">esc</button>
+          <button class="key" data-key="ctrl+c" type="button">ctrl+c</button>
+          <button class="key" data-key="up" type="button">up</button>
+          <button class="key" data-key="down" type="button">down</button>
+          <button class="key" data-key="tab" type="button">tab</button>
+          <button class="key" data-key="shift+tab" type="button">shift+tab</button>
+          <button class="key" data-key="ctrl+o" type="button">ctrl+o</button>
+        </div>
+        <span class="dim small">text</span>
+        <input id="literalText" class="mono grow" type="text" placeholder="literal text (sent verbatim, no newline)">
+        <button id="literalSend" class="btn" type="button">send text</button>
+      </div>
+      <div id="promptResult" class="result hidden"></div>
+    </section>
+
+    <!-- console -->
+    <section id="consolePanel">
+      <div id="consoleToggle" class="console-head">
+        <span class="caret">&#9660;</span>
+        <span class="strong">console</span>
+        <span class="dim small" id="consoleHint">herdr commands run server-side with no shell</span>
+        <span class="grow"></span>
+        <span class="dim small">mode</span>
+        <select id="consoleMode" class="sel">
+          <option value="cli">cli</option>
+          <option value="rpc">raw rpc</option>
+        </select>
+      </div>
+
+      <div id="consoleBody">
+        <div id="cliRow" class="cmd-row">
+          <span class="prompt-caret mono">$</span>
+          <span class="mono dim">herdr</span>
+          <input id="cmdInput" class="mono grow" type="text" placeholder='agent list    (quotes group args: agent prompt "w6:p4" "hi there")' autocomplete="off">
+          <select id="cmdPreset" class="sel">
+            <option value="">preset&hellip;</option>
+            <option value="agent list">agent list</option>
+            <option value="pane list">pane list</option>
+            <option value="workspace list">workspace list</option>
+            <option value="tab list">tab list</option>
+            <option value="session list">session list</option>
+            <option value="status">status</option>
+          </select>
+          <button id="cmdRun" class="btn primary" type="button">run</button>
+        </div>
+
+        <div id="rpcRow" class="cmd-row hidden">
+          <span class="prompt-caret mono">{}</span>
+          <input id="rpcInput" class="mono grow" type="text" value='{"method":"ping","params":{}}' spellcheck="false">
+          <button id="rpcSend" class="btn primary" type="button">send rpc</button>
+        </div>
+
+        <div id="cmdHistoryList" class="history"></div>
+        <div id="consoleOut" class="out mono"></div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- resize handle for the dock (the fourth track of #app, CONTRACT-v2 §12.2.1) -->
+  <div id="dockResize" title="Drag to resize"></div>
+
+  <!-- ============ SIDE DOCK (§12.2) ============ -->
+  <!-- the SHELL is W2's (track, handle, collapse, width); the content is W3's module: id `dock`,
+       public/lib/dock.js, which mounts into #dockHost. Closed unless hd.dockOpen says otherwise. -->
+  <aside id="dock" class="collapsed">
+    <div class="dock-head">
+      <span class="strong">dock</span>
+      <span id="dockHint" class="dim small">the selected pane's usage + background processes</span>
+      <span class="grow"></span>
+    </div>
+    <div id="dockHost" class="dock-host"></div>
+  </aside>
+</div>
+
+<!-- integration (W2): overlay container handed to modules as ctx.ui.container(),
+     the hint line lives in the header, the toast is fixed-position -->
+<div id="hdOverlays"></div>
+<div id="hdToast" class="toast hidden"></div>
+
+</body>
+</html>

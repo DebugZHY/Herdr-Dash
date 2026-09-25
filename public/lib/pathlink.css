@@ -1,0 +1,79 @@
+/* herdr-dash — lib/pathlink.css (W3, CONTRACT-v2 §13.2)
+ *
+ * The styles for lib/pathlink.js: the link a confirmed path becomes, and the menu a FILE's link
+ * opens. Same palette as the rest of the panel (style.css's variables only — no second palette, no
+ * :root block), same chip language as the chat view's controls.
+ *
+ *   a.hd-pl-link[data-hd-kind="file"|"dir"]   the path, verbatim, underlined by a dotted rule
+ *   .hd-pl-menu                               the in-page menu (fixed, at the link)
+ *     .hd-pl-menu-path                        the path VERBATIM: it wraps, it is never ellipsised
+ *     .hd-pl-menu-btn[data-hd-act]             "Open" / "Open File Location"
+ *     .hd-pl-menu-note[.hd-pl-bad]             what the server did, or why it did not
+ *
+ * Two of these declarations are load-bearing for the round's honesty rule, so they are stated rather
+ * than styled for taste: the menu's path WRAPS (pre-wrap + anywhere, and deliberately no
+ * `text-overflow`) because §13.2.7 forbids truncating the path the reader is about to act on, and
+ * nothing here is animated past a colour change, because a click is a state, not a running thing.
+ */
+
+a.hd-pl-link {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px dotted var(--accent);
+  cursor: pointer;
+  overflow-wrap: anywhere;      /* a 200-character path in a narrow pane breaks, it does not push */
+}
+a.hd-pl-link:hover { color: var(--fg); border-bottom-color: var(--fg); }
+a.hd-pl-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+a.hd-pl-link[data-hd-kind="dir"] { border-bottom-style: dashed; }   /* a folder is not a file */
+
+.hd-pl-menu {
+  position: fixed;
+  z-index: 40;                  /* above the bubbles and cards, below nothing that matters */
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  /* max-content, and NOT `auto`: for a fixed box with only `left` set, an auto width is
+     shrink-to-fit against (window − left), so pulling the menu back inside the window would make it
+     wider and the clamp would never converge — the menu would sit flush against the right edge with
+     no gap. An explicit preferred width makes the placement one-way: position follows size. */
+  width: max-content;
+  min-width: 240px;
+  max-width: min(560px, 90vw);
+  padding: 8px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-panel2);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+.hd-pl-menu-path {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--fg);
+  white-space: pre-wrap;        /* §13.2.7: the path is shown whole — it wraps, it is not cut */
+  overflow-wrap: anywhere;
+  max-height: 30vh;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+.hd-pl-menu-btn {
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--fg-dim);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 2px 8px;
+  text-align: left;
+  cursor: pointer;
+}
+.hd-pl-menu-btn:hover { color: var(--fg); border-color: var(--accent); }
+.hd-pl-menu-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.hd-pl-menu-note {
+  font-size: 11px;
+  color: var(--fg-dim);
+  overflow-wrap: anywhere;
+}
+.hd-pl-menu-note.hd-pl-bad { color: var(--st-blocked); }

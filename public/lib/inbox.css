@@ -1,0 +1,111 @@
+/* herdr-dash — inbox.css · attention queue (owner: W3).
+   Reuses the palette + variables declared in public/style.css; no second palette. */
+
+.hd-inbox {
+  position: fixed;
+  right: 20px;
+  top: 52px;
+  bottom: 40px;
+  width: min(620px, 46vw);
+  min-width: 320px;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+.hd-inbox[hidden] { display: none !important; }
+
+.hd-inbox-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--bg-panel2);
+  border-bottom: 1px solid var(--line);
+}
+.hd-mod-title { font-weight: 600; }
+.hd-inbox-hint { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.hd-inbox-badge {
+  flex: 0 0 auto;
+  min-width: 18px;
+  padding: 0 5px;
+  text-align: center;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 16px;
+  border-radius: 9px;
+  color: #06101c;
+  background: var(--st-blocked);
+  font-weight: 700;
+}
+.hd-inbox-badge[hidden] { display: none !important; }
+
+.hd-inbox-err { margin: 6px 10px 0; flex: 0 0 auto; }
+
+.hd-inbox-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px 0 10px;
+}
+
+.hd-inbox-row {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  grid-template-areas:
+    'chip pane meta'
+    'last last last';
+  gap: 2px 8px;
+  align-items: center;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--line-soft);
+  cursor: pointer;
+}
+.hd-inbox-row:hover { background: #1c2430; }
+.hd-inbox-row.cursor { background: #14304d; box-shadow: inset 2px 0 0 var(--accent); }
+.hd-inbox-row.unread { border-left: 2px solid var(--st-blocked); }
+.hd-inbox-row.seen { opacity: 0.62; }
+.hd-inbox-row.seen .hd-inbox-pane { color: var(--fg-dim); }
+
+.hd-inbox-row > .hd-chip { grid-area: chip; }
+.hd-inbox-pane { grid-area: pane; color: var(--fg); }
+.hd-inbox-meta { grid-area: meta; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hd-inbox-last {
+  grid-area: last;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding-left: 2px;
+}
+.hd-inbox-row > .icon-btn { position: absolute; right: 16px; margin-top: 0; }
+.hd-inbox-row { position: relative; }
+.hd-inbox-row > .icon-btn:hover { color: var(--fg); border-color: var(--line); }
+
+/* status chip — same shapes as board.css, kept here so the module is self-contained */
+.hd-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 7px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: #0f141b;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+.hd-chip.blocked { color: #ffb4b4; border-color: #5c2326; background: #2a1416; }
+.hd-chip.done    { color: #9fd6a8; border-color: #1e4630; background: #10231a; }
+.hd-chip.working { color: #f0c674; border-color: #4a3a15; background: #221c0e; }
+.hd-chip.idle    { color: var(--fg-dim); }
+.hd-chip.unknown { color: #cbb6f7; border-color: #3b2a5e; background: #1b1428; }
+
+.hd-empty { padding: 16px 10px; text-align: center; }

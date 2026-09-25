@@ -1,0 +1,116 @@
+/* herdr-dash — board.css · fleet board overlay (owner: W3).
+   Reuses the palette + variables declared in public/style.css; no second palette. */
+
+.hd-board {
+  position: fixed;
+  inset: 24px 24px 24px 24px;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+.hd-board[hidden] { display: none !important; }
+
+.hd-board-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  background: var(--bg-panel2);
+  border-bottom: 1px solid var(--line);
+}
+.hd-mod-title { font-weight: 600; }
+.hd-board-hint { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hd-board-count { flex: 0 0 auto; }
+
+.hd-board-err { margin: 6px 10px 0; flex: 0 0 auto; }
+
+.hd-board-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* ---------------- table ---------------- */
+
+.hd-board-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.hd-board-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  text-align: left;
+  font-weight: 600;
+  color: var(--fg-dim);
+  background: var(--bg-panel2);
+  border-bottom: 1px solid var(--line);
+  padding: 5px 8px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.hd-board-table th:hover { color: var(--fg); }
+.hd-board-table th.sorted::after { content: ' ▲'; font-size: 9px; color: var(--accent); }
+.hd-board-table th.sorted.desc::after { content: ' ▼'; }
+
+.hd-board-table td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--line-soft);
+  vertical-align: top;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hd-board-table tbody tr.hd-row { cursor: pointer; }
+.hd-board-table tbody tr.hd-row:hover { background: #1c2430; }
+.hd-board-table tbody tr.hd-row.focused { box-shadow: inset 2px 0 0 var(--accent); }
+.hd-board-table tbody tr.hd-row.cursor { background: #14304d; }
+
+.hd-board-table td.pane { color: var(--fg); }
+.hd-board-table td.ws,
+.hd-board-table td.tab { color: var(--fg-dim); }
+.hd-board-table td.cwd,
+.hd-board-table td.last { color: var(--fg-dim); }
+.hd-board-table td.time { text-align: right; color: var(--fg); }
+.hd-empty { padding: 14px 10px; text-align: center; }
+
+/* status chip */
+.hd-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 7px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: #0f141b;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+.hd-chip.blocked { color: #ffb4b4; border-color: #5c2326; background: #2a1416; }
+.hd-chip.done    { color: #9fd6a8; border-color: #1e4630; background: #10231a; }
+.hd-chip.working { color: #f0c674; border-color: #4a3a15; background: #221c0e; }
+.hd-chip.idle    { color: var(--fg-dim); }
+.hd-chip.unknown { color: #cbb6f7; border-color: #3b2a5e; background: #1b1428; }
+
+/* a pane that is working now gets a subtle pulse (contract §4.7) */
+@keyframes hdPulse {
+  0%   { background-color: rgba(224, 160, 42, 0.00); }
+  50%  { background-color: rgba(224, 160, 42, 0.10); }
+  100% { background-color: rgba(224, 160, 42, 0.00); }
+}
+.hd-board-table tbody tr.hd-row.pulse td:first-child { animation: hdPulse 2.4s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .hd-board-table tbody tr.hd-row.pulse td:first-child { animation: none; }
+}

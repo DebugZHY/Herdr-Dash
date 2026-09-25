@@ -1,0 +1,185 @@
+/* herdr-dash — gitview.css · read-only "what did the agents change" (§7.2, owner: W3).
+   Reuses the palette + variables declared in public/style.css; no second palette. */
+
+.hd-gv {
+  position: fixed;
+  inset: 24px 24px 24px 24px;
+  z-index: 62;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+.hd-gv[hidden] { display: none !important; }
+
+/* ---------------- header ---------------- */
+
+/* the two conventions every module re-declares in its own file (board/inbox/grid do the same) */
+.hd-mod-title { font-weight: 600; }
+.hd-empty { padding: 14px 10px; text-align: center; }
+
+.hd-gv-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  background: var(--bg-panel2);
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+.hd-gv-ro {
+  flex: 0 0 auto;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  color: var(--st-done);
+  border: 1px solid var(--st-done);
+  border-radius: 8px;
+  padding: 0 6px;
+  opacity: 0.9;
+}
+.hd-gv-pane { flex: 0 0 auto; }
+.hd-gv-totals { flex: 0 0 auto; }
+.hd-gv-hint { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+.hd-gv-meta {
+  flex: 0 0 auto;
+  padding: 3px 10px 4px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--line-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------------- banner (a described state, never an empty list) ---------------- */
+
+.hd-gv-banner {
+  flex: 0 0 auto;
+  margin: 8px 10px 0;
+  padding: 7px 9px;
+  border-radius: 5px;
+  border: 1px solid var(--line);
+  background: var(--bg-panel);
+  color: var(--fg);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.hd-gv-banner.info { border-left: 3px solid var(--st-idle); }
+/* the blocked surface tint is the same one board.css uses for a blocked chip */
+.hd-gv-banner.bad  { border-left: 3px solid var(--st-blocked); color: var(--st-blocked); background: #2a1416; }
+.hd-gv-banner[hidden] { display: none !important; }
+
+/* ---------------- body: file list | diff ---------------- */
+
+.hd-gv-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  gap: 0;
+}
+
+.hd-gv-list {
+  flex: 0 0 42%;
+  min-width: 220px;
+  max-width: 60%;
+  overflow: auto;
+  border-right: 1px solid var(--line);
+  padding: 4px 0 8px;
+}
+.hd-gv-waiting { padding: 8px 10px; }
+.hd-gv-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 8px;
+  cursor: pointer;
+  border-left: 2px solid transparent;
+}
+.hd-gv-row:hover { background: var(--bg-panel); }
+.hd-gv-row.on { background: var(--bg-panel2); border-left-color: var(--accent); }
+.hd-gv-letter {
+  flex: 0 0 auto;
+  width: 1.1em;
+  text-align: center;
+  font-weight: 600;
+}
+.hd-gv-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hd-gv-counts { flex: 0 0 auto; color: var(--fg-dim); }
+
+/* one colour per kind, from the shared status palette */
+.kind-modified  { color: var(--st-working); }
+.kind-added     { color: var(--st-done); }
+.kind-deleted   { color: var(--st-blocked); }
+.kind-renamed   { color: var(--accent); }
+.kind-untracked { color: var(--st-unknown); }
+.kind-conflict  { color: var(--st-blocked); }
+.kind-unknown   { color: var(--fg-dim); }
+
+/* ---------------- the diff ---------------- */
+
+.hd-gv-diffwrap {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.hd-gv-diffhead {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--bg-panel);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hd-gv-note {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--bg-input);
+}
+.hd-gv-note.warn { color: var(--st-working); }
+.hd-gv-note.bad  { color: var(--st-blocked); }
+.hd-gv-note[hidden] { display: none !important; }
+
+.hd-gv-diff {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  padding: 6px 10px 12px;
+  overflow: auto;
+  background: var(--bg-input);
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: pre;
+  tab-size: 4;
+}
+.hd-gv-diff .hd-gv-line { display: inline; }
+.hd-gv-diff .add  { color: var(--st-done); }
+.hd-gv-diff .del  { color: var(--st-blocked); }
+.hd-gv-diff .hunk { color: var(--accent); }
+.hd-gv-diff .meta { color: var(--fg-dim); }
+
+/* ---------------- error bar (same policy as grid.js, §7.3) ---------------- */
+
+.hd-gv-err { flex: 0 0 auto; margin: 8px 10px 0; }
+.hd-gv-err[hidden] { display: none !important; }
+
+/* narrow windows: stack the two panes */
+@media (max-width: 720px) {
+  .hd-gv-body { flex-direction: column; }
+  .hd-gv-list { flex: 0 0 40%; max-width: none; border-right: none; border-bottom: 1px solid var(--line); }
+}

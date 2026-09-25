@@ -1,0 +1,10 @@
+{
+  "name": "herdr-dash",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local web GUI for the herdr terminal multiplexer",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  }
+}
