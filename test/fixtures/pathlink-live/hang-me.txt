@@ -1,1 +1,0 @@
-w3 fixture: the stub API never answers /api/pathinfo for this path, so the 8 s AbortController path can be measured.

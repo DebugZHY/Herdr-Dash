@@ -75,47 +75,6 @@ whitelisted actions `open` / `reveal`, refuses cross-origin callers, requires an
 the system with an argv array (never a shell); `POST /api/pathinfo` only stats; the attachment store only ever writes
 inside its own directory.
 
-## Tests
-
-```
-node test/acceptance.mjs       # end-to-end in a real browser (spawns its own server)
-node test/acceptance-v2.mjs    # layout/geometry acceptance, incl. real drags and clicks
-node test/chat.mjs             # chat adapters against offline log fixtures
-node test/chat-render.mjs      # the renderer's DOM fixtures (blocks, folds, copy, path links)
-node test/pathlink.mjs         # path-link decoration against a stubbed /api/pathinfo
-node test/pathlink-live.mjs    # path links in a real browser (own fixture page)
-node test/paths.mjs            # path resolution, /api/pathinfo and /api/open
-node test/status.mjs           # status-line parsing against captured fixtures
-node test/dock.mjs             # the side dock and console module
-node test/attach.mjs           # the attachment store
-node test/git-view.mjs         # the changes view
-node test/parity.mjs --base http://127.0.0.1:7433   # buffer parity against a live pane
-```
-
-In-page self-test: <http://127.0.0.1:7433/?selftest=1> (89 checks).
-
-| suite | what it covers | checks |
-|---|---|---|
-| `test/acceptance.mjs` | End-to-end acceptance, real browser | 21/21 |
-| `test/acceptance-v2.mjs` | Layout and geometry acceptance, real browser | 73/73 |
-| `test/chat.mjs` | Chat adapters, offline fixtures | 59/59 |
-| `test/chat-render.mjs` | Chat renderer (blocks, folds, copy, links) | 715/715 |
-| `test/pathlink.mjs` | Path-link decoration, stubbed `/api/pathinfo` | 133/133 |
-| `test/pathlink-live.mjs` | Path links, real browser + own fixture | 20/20 |
-| `test/paths.mjs` | Path resolution, `/api/pathinfo`, `/api/open` | 23/23 |
-| `test/status.mjs` | Status-line parsing, captured fixtures | 33/33 |
-| `test/dock.mjs` | Console dock: keyboard, layout, live data | 297/297 |
-| `test/attach.mjs` | Attachment store | 17/17 |
-| `test/git-view.mjs` | Changes view | 35/35 |
-| `test/parity.mjs` | Pane parity (w1 vs w2 read paths) | 36/36 deterministic + 8 live |
-
-The totals are the last run of each suite on the release tree. `parity` is the exception worth reading closely: its 36
-deterministic checks always pass, and its 8 live-capture checks depend on the pane the harness ends up watching — they
-report 44/44 while an agent is genuinely streaming into that pane, and less when the watched pane is idle or its
-capture window shrinks. The suite names the failing check in its output (`the capture actually moved`, `the buffer
-retains at least a whole window`, `mergeStream still reproduces DEFECT-1`), so a partial run says exactly what it could
-not exercise rather than passing quietly.
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
