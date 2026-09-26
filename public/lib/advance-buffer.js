@@ -4,7 +4,7 @@
  *   - the page loads this classic script before app.js and before every module, so
  *     `window.HD.advanceBuffer` is the implementation app.js polls with and the one
  *     public/lib/grid.js picks up through ctx.util.advanceBuffer;
- *   - test/parity.mjs can `require()` this exact file in Node and compare it with the
+ *   - the local test suite can `require()` this exact file in Node and compare it with the
  *     server twin, src/hdr.js (W1), which is why the CommonJS shim at the bottom exists.
  *
  * ---------------------------------------------------------------------------------------
@@ -186,7 +186,7 @@
     window.HD = window.HD || {};
     window.HD.advanceBuffer = advanceBuffer;
   }
-  /* CommonJS shim: test/parity.mjs requires this exact file in Node, next to src/hdr.js. */
+  /* CommonJS shim: the local test suite requires this exact file in Node, next to src/hdr.js. */
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = { advanceBuffer: advanceBuffer };
   }

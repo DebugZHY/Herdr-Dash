@@ -34,6 +34,18 @@
  * old latch had no timeout and no abort: the first response that never came froze every pane
  * selected afterwards while `polling:true` stayed true and nothing threw.)
  *
+ * §13.12 — a big session must not park a pane in "reading …". The first read of a large session can
+ * take seconds (measured on the user's machine: a 42.9 MB claude jsonl whose cold read answered in
+ * 3.79 s directly against the server, and did not answer at all within the client's 12 s while the
+ * page-load burst was running). The sentence "reading the structured session of …" is true only
+ * before the first fetch starts or while a fetch is genuinely in flight and FRESH; past FRESH_MS the
+ * panel says what is actually happening — how long it has been, the session's size when the server
+ * reports one, and whether the request is still alive — and after a timeout it says which timeout it
+ * was and retries WITH BACKOFF instead of asking the same cold question every 2 s. The reader's
+ * "retry now", a fresh pane selection and a fresh body all clear the backoff, so a stalled pane
+ * recovers by itself, without a page reload. REQ_TIMEOUT_MS stays exactly where it was: the last
+ * line of defence, not the fix.
+ *
  * Honest states: every §8.1 error code gets its own readable sentence — never a blank panel and
  * never an invented reply. `unknown_records > 0` is surfaced ("this log format may have changed")
  * so a format change is visible instead of looking like lost history. `skipped` is shown too.
@@ -87,6 +99,14 @@
   var TURN_RERENDER_MAX = 80;      // re-render the open turn while it is this small; append past it
   var REQ_TIMEOUT_MS = 12000;      // DEFECT-12/18: a request that never answers is abandoned + aborted
   var REQ_DEDUP_MS = 250;          // DEFECT-18(1): the same read asked twice in one tick is asked once
+  /* §13.12 item 2 — the difference between "still working" and "stuck", and between a retry loop and a
+     hammer. FRESH_MS is how long the bare "reading …" line stays honest; past it the reader is owed
+     the elapsed time (and the size, when it is known). The backoff after a timeout doubles from the
+     poll interval and is capped, so a pane whose read keeps failing slows down but always comes back
+     — and the reader's own "retry now" skips the wait. */
+  var FRESH_MS = 4000;             // §13.12 item 2: the bare "reading …" sentence is only true this long
+  var SLOW_TICK_MS = 1000;         // §13.12: the slow-read / next-attempt line ticks once a second
+  var STALL_BACKOFF_MAX_MS = 30000;// §13.12 item 2: retry WITH BACKOFF — capped, so never a dead end
   var PENDING_TIMEOUT_MS = 20000;  // §8.3: 20 s until the pending bubble says "not found"
   var LS_VIEW = 'herdrDash.transcriptView';   // 'chat' | 'raw'
 
@@ -128,9 +148,54 @@
      gone) and not a blank panel either — it names what happened and what happens next. DEFECT-18(2):
      the timeout is now a real timer that releases the latch on its own, and the reader is offered a
      retry instead of being told to wait for a poll tick that may not be running. */
-  var STALL_NOTE = 'the read timed out — the server did not answer within %ss and the request was aborted. nothing was lost: press "retry now", or wait for the next poll, to ask again from the same cursor.';
-  /* the short form, for the state line where the panel would otherwise still say "reading …" */
-  var STALL_STATE = 'the read timed out — the request was aborted, so this panel is not waiting on it. press "retry now" (in the strip above) to ask again from the same cursor.';
+  var STALL_NOTE = 'the read timed out — the server did not answer within %s and the request was aborted. nothing was lost: press "retry now", or wait for the next attempt, to ask again from the same cursor.';
+  /* NOTE the single '%s': the templates take the seconds WITH their unit ("12s"). Both of these used
+     to spell it '%ss' while the call appended an 's' of its own, so the strip read "within 12ss" —
+     a cosmetic defect that lived in a sentence about honesty, found by the local test suite check 2a. */
+  /* §13.12 item 2: the long form, for the state line where the panel would otherwise still say
+     "reading …". It names the timeout it was, the size when the server reports one, and the way
+     forward — and it never claims a size or an attempt time it does not have. */
+  var STALL_STATE_HEAD = 'the read timed out — the server did not answer within %s and the request was aborted, so this panel is not waiting on it.';
+  var STALL_STATE_TAIL = 'press "retry now" (in the strip above) to ask again immediately, or leave it — the panel keeps retrying by itself';
+  var STALL_RAW_HINT = 'press t for the raw terminal view if you need this pane right now.';
+  /* §13.12 item 2, the slow case: a first read that is still genuinely alive. %id / %ss are filled in. */
+  var SLOW_STATE_HEAD = 'still reading the structured session of %id — %ss so far.';
+  var SLOW_STATE_TAIL = 'the first read of a large session is slow; this request is still in flight and has not stalled. the panel shows the records the moment they arrive.';
+  var RETRY_STATE_HEAD = 'the read timed out once; the panel is asking again now — %ss into that attempt.';
+
+  /* §13.12: the size of a session is knowledge, not a guess. §8.2's key set is frozen, so this reads a
+     size only from a field that is really there (the names W1's half is asked to send, plus the
+     `source.*` spellings so either shape lights the reader's line up); an unknown size stays unknown
+     and no line ever claims one. The other source is the tail reply's own cursor, which IS the byte
+     offset at EOF — see sizeFromTail below for why that is only trusted when it can be trusted. */
+  function numOrNull(v) { var n = Number(v); return (isFinite(n) && n > 0) ? Math.round(n) : null; }
+  function bodySize(body) {
+    if (!body || typeof body !== 'object') return null;
+    var n = numOrNull(body.session_bytes);
+    if (n === null) n = numOrNull(body.session_size);
+    if (n === null && body.source && typeof body.source === 'object') {
+      n = numOrNull(body.source.bytes);
+      if (n === null) n = numOrNull(body.source.size);
+      if (n === null) n = numOrNull(body.source.size_bytes);
+    }
+    return n;
+  }
+  /* decimal MB/KB — the convention the size is quoted in (42.9 MB for 42,900,000 bytes), so the
+     number the reader sees is the number they would see in Explorer */
+  function sizeText(n) {
+    if (!n) return '';
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + ' MB';
+    if (n >= 1e3) return Math.round(n / 1e3) + ' KB';
+    return n + ' bytes';
+  }
+  function secsOf(ms) { return Math.max(1, Math.round(ms / 1000)); }
+  /* the sentence a slow read is allowed to say about the size: the server's own number is exact, a
+     tail cursor is a lower bound (a trailing partial line is not counted by it), so it says "about" */
+  function sizeClause(st) {
+    if (!st || !st.sizeBytes) return '';
+    return ' the session is ' + (st.sizeSrc === 'tail-cursor' ? 'about ' : '') + sizeText(st.sizeBytes) +
+      ' on disk, so a cold read of it is slow.';
+  }
 
   /* ────────────────────────────────────────────────────────────── small helpers */
 
@@ -805,6 +870,8 @@
     var pollTimer = null;
     var pendingTimer = null;
     var workingTimer = null;
+    var slowTimer = null;            // §13.12: ticks only while the read is slow or a retry is pending
+    var lastPolledPane = null;       // §13.12 item 2: the pane the last poll was for (see poll())
     var inflight = null;             // DEFECT-12: an OBJECT ({id, startedAt, cursor, ctrl}), never a latch
     var reqTimer = null;             // DEFECT-18(2): the request's own timeout timer (a real one)
     var reqTimeoutMs = REQ_TIMEOUT_MS;   // test-only override (window.HD.chatviewTest)
@@ -852,8 +919,15 @@
           /* §8.2 tail mode: `tailChecked` = the first (tail) response was seen; `tailMode` = the
              server really answered from the tail; `verifyTail` = one forward call is pending */
           tailChecked: false, tailMode: null, verifyTail: false,
-          /* DEFECT-12: the last request the server never answered (cleared by the next body) */
-          stall: null, stalls: 0,
+          /* §13.12 item 2: `tailCursor` is the EOF byte offset a tail REQUEST reported — a candidate
+             size, held back until tail mode is confirmed (see the ingest comment) */
+          tailCursor: 0,
+          /* DEFECT-12: the last request the server never answered (cleared by the next body).
+             §13.12 item 2: `stallRun` counts CONSECUTIVE timeouts (it is what the backoff doubles
+             from, and a body resets it — `stalls` stays the cumulative number the strip reports),
+             `nextTryAt` is when the next automatic attempt is due, and `sizeBytes`/`sizeSrc` are the
+             session's size and where it came from ('server' | 'tail-cursor') — knowledge, not a guess */
+          stall: null, stalls: 0, stallRun: 0, backoffMs: 0, nextTryAt: 0, sizeBytes: null, sizeSrc: '',
           pending: [], lastQuery: '', lastFetchAt: 0, fetches: 0, errors: 0
         };
       }
@@ -947,14 +1021,25 @@
       var st = paneState(req.id);
       if ((why || 'timeout') === 'timeout') {
         st.stalls++;
+        /* §13.12 item 2: retry WITH BACKOFF, capped. The 2 s tick is a hammer for a read that takes
+           seconds, and hammering is what starves the server's own cold scan — so a pane whose read
+           keeps timing out asks less often (2 s, 4 s, 8 s, 16 s, then every 30 s) instead of every
+           tick. The cap is what keeps it a way forward rather than a dead end, `nextTryAt` is what
+           lets the strip name the next attempt, and the reader's "retry now" skips the wait. */
+        st.stallRun = num(st.stallRun) + 1;
         st.stall = { at: Date.now(), why: 'timeout', ms: Date.now() - req.startedAt, cursor: req.cursor };
-        if (req.id === currentPaneId()) { renderState(st); renderStatus(st); }
+        st.backoffMs = Math.min(POLL_MS * Math.pow(2, Math.max(0, st.stallRun - 1)), STALL_BACKOFF_MAX_MS);
+        st.nextTryAt = Date.now() + st.backoffMs;
+        if (req.id === currentPaneId() && !frozen) { renderState(st); renderStatus(st); }   // §13.8 rule 2
       }
       return true;
     }
     function poll() {
       if (!auto || unmounted || mode !== 'chat') return;
       if (document.hidden) return;                 // the tab is not on screen; nothing to refresh
+      /* §13.8 rule 3: the tick re-derives the freeze invariant, so a mouseup that was never delivered
+         (released outside the window) cannot leave the view frozen for ever */
+      freezeSelfCheck();
       var id = currentPaneId();
       if (!id) { renderAll(); return; }
       /* a request for ANOTHER pane is of no use to the pane the user is looking at now → drop it and
@@ -964,6 +1049,25 @@
       if (d === 'abandon') abandonInflight(inflight.id === id ? 'timeout' : 'pane-switch');
       else if (d === 'wait') return;
       var st = paneState(id);
+      /* §13.12 item 2, the way forward that always works: ARRIVING at a pane asks it again at once.
+         The reader's own act of looking at the pane — selecting it, or coming back to it — skips the
+         backoff it was waiting out, so no reload is ever needed to un-stick one. This lives in poll()
+         rather than in the select handler because poll() is the only place that knows which pane the
+         request is really for: the app updates its selected pane and emits 'select' in the order it
+         chooses, and a reset aimed at the wrong pane is a reset that does nothing (measured — the
+         select-handler version of this line left a 2 s backoff in place and check 6 went red).
+         ORDER MATTERS: this runs BEFORE the gate below, which would otherwise return on its first
+         line and never reach the reset (measured the same way — check 6 red a second time). */
+      if (id !== lastPolledPane) {
+        lastPolledPane = id;
+        st.nextTryAt = 0;
+        st.backoffMs = 0;
+      }
+      /* §13.12 item 2: a pane that just timed out waits out its backoff instead of asking the same
+         cold question on the very next tick. The gate is on the AUTOMATIC attempt only — the reader's
+         "retry now" (retryNow), arriving at the pane (above) and any body that lands all clear
+         `nextTryAt`, so this can never become a pane that has stopped trying. */
+      if (st.stall && st.nextTryAt && Date.now() < st.nextTryAt) return;
       var since = st.gotCursor ? st.cursor : 0;
       /* §8.2 tail mode: the FIRST request is a tail page, and a tail page carries NO `since` —
          `since` walks forward from a cursor while `tail=1` starts from the end, so the server
@@ -992,6 +1096,7 @@
       inflight = req;
       lastAsk = { id: id, since: sigSince, tail: tailFirst, at: nowMs };
       armReqTimer(req);                            // DEFECT-18(2): this request releases itself
+      armSlowTick();                               // §13.12 item 2: the read's own clock starts here
       var extra = { tail: tailFirst };
       /* DEFECT-12, the second half: the AbortController is useless unless its signal travels with
          the request. Without this line `abort()` only flips a flag we ourselves read — the fetch
@@ -1019,6 +1124,13 @@
       st.fetches++;
       st.lastFetchAt = Date.now();
       st.stall = null;                               // a body arrived: nothing is stalled any more
+      /* §13.12 item 2: the backoff belongs to a RUN of timeouts, so a body ends the run — the next
+         read asks immediately, and a pane that recovered is not punished for having been slow. */
+      st.stallRun = 0; st.backoffMs = 0; st.nextTryAt = 0;
+      /* the size, when the body carries one. Read before the error branches below, because a server
+         that refuses a read for being too big is exactly the server that has a size worth naming. */
+      var bodyBytes = bodySize(body);
+      if (bodyBytes !== null) { st.sizeBytes = bodyBytes; st.sizeSrc = 'server'; }
       if (body && body.__q) st.lastQuery = body.__q;
       var code = (body && body.error && body.error.code) ? String(body.error.code) : '';
 
@@ -1117,18 +1229,49 @@
           st.tailChecked = true;
           st.tailMode = (body.tail === true || body.tail === 1) ? true : (body.truncated !== true);
           st.verifyTail = !st.tailMode;
+          /* §13.12 item 2: a tail REQUEST's cursor is the byte offset at EOF, so the reply hands the
+             client the size of the session for free — but only if the reply really is a tail page, and
+             the live server does not say so in the body: it sends no `tail` flag and `truncated:true`
+             (measured 2026-09-26), so tail mode is only CONFIRMED by the follow-up call above. The
+             cursor is therefore kept as a CANDIDATE and committed below, and thrown away if the
+             verification disproves tail mode. Doing it in one step is what left the size unknown in
+             the live run while the strip already showed the cursor: the flag is not there yet. */
+          var cand = numOrNull(body.cursor);
+          if (cand !== null) st.tailCursor = cand;
         } else if (st.verifyTail) {
           st.verifyTail = false;
           st.tailMode = (added > 0) ? false : true;
         }
+        /* commit the candidate once tail mode is confirmed, discard it once it is disproved. A HEAD
+           page's cursor is a position in the middle of the log and a hermes cursor is a row id —
+           either would be a lie told with a real number, so neither is ever reported as a size. The
+           server's own field always wins over a derived one. */
+        if (st.sizeSrc !== 'server') {
+          if (st.tailMode === true && st.tailCursor && st.source && st.source.kind === 'claude_jsonl') {
+            st.sizeBytes = st.tailCursor; st.sizeSrc = 'tail-cursor';
+          } else if (st.tailMode === false && st.sizeSrc === 'tail-cursor') {
+            st.sizeBytes = null; st.sizeSrc = '';
+          }
+        }
 
         resolvePending(st);
         if (id === currentPaneId()) {
-          renderNew(st, false);
-          renderPendings(st);
-          refreshWorking(st);
-          if (follow) scrollToBottom();
-          else if (added) { newCount += added; updateJump(); }
+          if (frozen) {
+            /* §13.8 rules 2 and 4 — THE choke point: every record that arrives while the reader is
+               holding a selection reaches here already stored in st.messages (above), so nothing is
+               dropped and nothing is drawn. No render, no pending repaint, no working tick, no
+               auto-scroll: any one of them would replace the anchor node under the reader's drag and
+               the browser answers that by collapsing the range (measured 2026-09-25: a 395-character
+               drag collapsed to nothing on the very next poll). leaveFreeze() draws the queue in one
+               pass, in log order, the moment the reader is done. */
+            frozenAdded += added;
+          } else {
+            renderNew(st, false);
+            renderPendings(st);
+            refreshWorking(st);
+            if (follow) scrollToBottom();
+            else if (added) { newCount += added; updateJump(); }
+          }
         }
         /* Fallback walk (only when tail mode is off or not yet proven): a session longer than one
            page would otherwise open on its OLDEST page (since=0 is the beginning per §8.2). Walk the
@@ -1143,7 +1286,11 @@
         }
       }
       syncTimers();
-      if (id === currentPaneId()) { renderState(st); renderStatus(st); }
+      /* §13.8 rule 2: the empty-state sentence and the status strip are part of the view the reader
+         may be selecting in — #hdChatState lives in the list itself — so a frozen view does not
+         repaint them either. leaveFreeze() refreshes both; a stale line is the honest cost of not
+         moving a single node under a live selection. */
+      if (id === currentPaneId() && !frozen) { renderState(st); renderStatus(st); }
     }
 
     /* ---------------- pending sends (§8.3) ---------------- */
@@ -1156,7 +1303,7 @@
         var st = paneState(id);
         var p = { id: 'p' + (++pendingSeq), text: body, sentAt: Date.now(), since: st.messages.length, lost: false, resolved: false };
         st.pending.push(p);
-        if (id === currentPaneId()) { renderPendings(st); if (follow) scrollToBottom(); }
+        if (id === currentPaneId() && !frozen) { renderPendings(st); if (follow) scrollToBottom(); }
         syncTimers();
         return true;
       } catch (e) { return false; }
@@ -1202,8 +1349,11 @@
         var p = st.pending[i];
         if (!p.lost && (now - p.sentAt) >= PENDING_TIMEOUT_MS) { p.lost = true; lost = true; }
       }
-      if (lost) renderPendings(st);
-      else refreshPendingNotes(st, now);
+      /* §13.8 rule 2: the pending bubble and its note are painted INTO the list, so a frozen view
+         leaves them as they are. The pending-clock bookkeeping above still runs — the note is only
+         late, never wrong, and leaveFreeze() repaints the group. */
+      if (lost) { if (!frozen) renderPendings(st); }
+      else if (!frozen) refreshPendingNotes(st, now);
       return lost;
     }
 
@@ -1835,6 +1985,10 @@
     function refreshWorking(st) {
       try {
         if (!st || st.id !== currentPaneId() || mode !== 'chat' || unmounted) return false;
+        /* §13.8 rule 2: the working tail ticks IN PLACE — it replaces the label node inside the open
+           turn every second, which is exactly the mutation that breaks a selection held over that
+           turn. Frozen, the label stands still and leaveFreeze() brings it up to date. */
+        if (frozen) return false;
         return updateWorking(st);
       } catch (e) { return false; }
     }
@@ -1854,6 +2008,18 @@
         /* §8.2 tail mode: say where the first paint came from, so a server that lacks it is visible */
         if (st.tailChecked) bits.push(st.tailMode === true ? 'tail mode (opened at the end of the log)'
           : 'tail mode not available — caught up from the start');
+        /* §13.12 item 2: the size of the session, and the state of the read, VISIBLE rather than
+           silent. `~` marks a size derived from a tail reply's EOF cursor rather than measured and
+           reported by the server (a trailing partial line is not counted by the cursor). */
+        if (st.sizeBytes) bits.push('session ' + (st.sizeSrc === 'tail-cursor' ? '~' : '') + sizeText(st.sizeBytes));
+        if (id && inflight && inflight.id === id) {
+          var inAge = Date.now() - inflight.startedAt;
+          if (inAge >= FRESH_MS) bits.push('read in flight · ' + secsOf(inAge) + 's');
+        }
+        if (st.stall) {
+          bits.push(st.nextTryAt ? 'next attempt in ' + secsOf(st.nextTryAt - Date.now()) + 's'
+            : 'next attempt on the next tick');
+        }
         if (st.stalls > 0) bits.push(st.stalls + ' request' + (st.stalls === 1 ? '' : 's') + ' stalled');
       }
       if (!auto) bits.push('test mode (no polling)');
@@ -1867,7 +2033,7 @@
       if (hiddenEmpties > 0) warn.push(hiddenEmpties + ' empty record' + (hiddenEmpties === 1 ? '' : 's') + ' (no text) hidden');
       /* DEFECT-12: the honest sentence about the request that never came back */
       if (st && st.stall) {
-        warn.push(STALL_NOTE.replace('%s', (Math.max(1, Math.round(st.stall.ms / 1000)) + 's')));
+        warn.push(STALL_NOTE.replace('%s', secsOf(st.stall.ms) + 's') + sizeClause(st));
       }
       stWarn.textContent = warn.join(' · ');
       stWarn.classList.toggle('chat-warn-on', warn.length > 0);
@@ -1879,17 +2045,58 @@
       olderEl.classList.toggle('hidden', !olderEl.textContent);
     }
 
+    /* §13.12 item 2 — the one line the reader is looking at while a big session opens. It is built
+       from what is actually true at the moment it is asked, and it is asked again once a second while
+       a read is slow or a retry is pending (slowTick), so it MOVES: a sentence that cannot move is
+       indistinguishable from a panel that is stuck, which is the whole of the user's report. */
+    function stateTextFor(st, id, nowMs) {
+      if (!id) return 'select a pane in the sidebar to read its conversation.';
+      var since = (st && inflight && inflight.id === id) ? inflight.startedAt : 0;
+      var age = since ? (nowMs - since) : 0;
+      var retrying = !!(st && st.stall);          // this attempt follows a named timeout
+      var firstLoad = !(st && st.lastFetchAt);    // nothing has ever been painted in this pane
+      /* nothing in flight: the honest events are the timeout, a real error, a first fetch that has
+         not started yet, and an empty session */
+      if (!since) {
+        if (retrying) {
+          var m = STALL_STATE_HEAD.replace('%s', secsOf(st.stall.ms) + 's') + sizeClause(st) + ' ' +
+            STALL_STATE_TAIL;
+          if (st.nextTryAt > nowMs) m += ' (next attempt in ' + secsOf(st.nextTryAt - nowMs) + 's)';
+          m += '.';
+          if (!st.messages.length) m += ' ' + STALL_RAW_HINT;
+          return m;
+        }
+        if (st && st.error) return errorText(st.error);
+        if (firstLoad) return 'reading the structured session of ' + id + ' …';
+        if (st.empty || !st.messages.length) return EMPTY_NOTE;
+        return '';
+      }
+      /* a request IS in flight for this pane */
+      if (age < FRESH_MS) {
+        /* fresh: the bare sentence is still the truth. A RETRY says so instead — "reading …" after a
+           named timeout would hide the one fact the reader already knows. */
+        if (retrying) {
+          return RETRY_STATE_HEAD.replace('%ss', secsOf(age) + 's') + sizeClause(st) +
+            (firstLoad ? ' ' + SLOW_STATE_TAIL : '');
+        }
+        if (firstLoad) return 'reading the structured session of ' + id + ' …';
+        return '';
+      }
+      /* NOT fresh any more: name the elapsed time, the size when known, and — the thing the parked
+         sentence never said — that the request is still alive and has not stalled */
+      var head = (retrying ? RETRY_STATE_HEAD : SLOW_STATE_HEAD)
+        .replace('%id', id).replace('%ss', secsOf(age) + 's');
+      return head + sizeClause(st) + (firstLoad ? ' ' + SLOW_STATE_TAIL : '');
+    }
+
     function renderState(st) {
       var id = currentPaneId();
-      var msg = '';
-      if (!id) msg = 'select a pane in the sidebar to read its conversation.';
-      /* DEFECT-18(2): a timed-out read is not "reading …" any more and it is not an error either —
-         say which timeout it was and point at the retry. This is the line the reader is looking at. */
-      else if (st && st.stall) msg = STALL_STATE;
-      else if (st && st.error) msg = errorText(st.error);
-      else if (st && !st.lastFetchAt) msg = 'reading the structured session of ' + id + ' …';
-      else if (st && (st.empty || !st.messages.length)) msg = EMPTY_NOTE;
-      stateEl.textContent = msg;
+      var msg = stateTextFor(st, id, Date.now());
+      /* the slow/retry pulse re-asks this line once a second, and most of those seconds the sentence
+         has not changed: writing the same string still replaces the text node, so the write is
+         skipped when the sentence is identical (it is the one node a reader may be selecting in, and
+         a needless replacement of it is exactly the §13.8 failure mode, only smaller) */
+      if (stateEl.textContent !== msg) stateEl.textContent = msg;
       stateEl.classList.toggle('hidden', !msg);
       return msg;
     }
@@ -1937,6 +2144,9 @@
 
     function applyMode() {
       var chat = (mode === 'chat');
+      /* §13.8 rule 3: leaving the chat view releases the freeze, and the full render below is the
+         catch-up pass (`apply:false` — the queue must not be drawn twice). */
+      if (!chat) leaveFreeze(false);
       host.classList.toggle('hidden', !chat);
       var pre = document.getElementById('transcript');
       if (pre) pre.classList.toggle('hidden', chat);
@@ -1999,9 +2209,14 @@
         } else {
           st.olderNote = '';
         }
-        scrollEl.scrollTop = Math.max(0, scrollEl.scrollHeight - keep);
-        follow = (scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight) <= stickPx();
-        renderStatus(st);
+        /* §13.8 rule 2: this is the reader's own click (so it normally lands unfrozen), but the reply
+           can arrive after a NEW drag has begun — then not even this repaint may move the nodes under
+           the selection. leaveFreeze() anchors the view and repaints the strip. */
+        if (!frozen) {
+          scrollEl.scrollTop = Math.max(0, scrollEl.scrollHeight - keep);
+          follow = (scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight) <= stickPx();
+          renderStatus(st);
+        }
       });
       return true;
     }
@@ -2017,6 +2232,9 @@
       clearReqTimer();
       if (inflight) abandonInflight('pane-switch');
       lastAsk = null;
+      /* §13.12 item 2: the reader's own attempt skips the backoff — the way forward is never gated */
+      var st = currentPaneId() ? paneState(currentPaneId()) : null;
+      if (st) { st.nextTryAt = 0; st.backoffMs = 0; }
       poll();
       return true;
     }
@@ -2040,11 +2258,48 @@
         }, WORKING_TICK_MS);
       }
       if (!wantWorking && workingTimer) { window.clearInterval(workingTimer); workingTimer = null; }
+      /* §13.12 item 2: one timer exists exactly while the visible pane's read is SLOW or a retry is
+         pending, and for no longer. It re-asks the two lines that carry the truth — the state line and
+         the strip — so the elapsed seconds and the "next attempt in Ns" countdown actually move. A
+         panel whose sentence cannot move is exactly what the user reported as stuck. Nothing else is
+         touched: no message node, no list, no scroll, and nothing at all while §13.8's freeze is
+         held (a reader holding a selection must not have the state line replaced under the drag). */
+      var idSlow = currentPaneId();
+      var stSlow = idSlow ? paneState(idSlow) : null;
+      var wantSlow = want && !!stSlow && (!!stSlow.stall || (!!inflight && inflight.id === idSlow));
+      if (!wantSlow && slowTimer) { window.clearInterval(slowTimer); slowTimer = null; }
+    }
+
+    /* §13.12 item 2: arm the pulse at the moment a request goes out — NOT from poll()'s own tick,
+       which returns early while a read is in flight (`latchDecision` → 'wait'), so nothing else would
+       ever arm it. It is dropped by syncTimers the moment the read is over, so the interval exists
+       only while the pane is really waiting on something: a fraction of a second on a warm server. */
+    function armSlowTick() {
+      if (slowTimer || !auto || unmounted || mode !== 'chat') return false;
+      slowTimer = window.setInterval(slowTick, SLOW_TICK_MS);
+      return true;
+    }
+
+    /* §13.12 item 2: the slow/retry line's pulse. Cheap on purpose — two text nodes, no list, no
+       scroll — and gated on the §13.8 freeze like every other write into the chat host. */
+    function slowTick() {
+      try {
+        if (unmounted || mode !== 'chat' || frozen) return false;
+        var id = currentPaneId();
+        if (!id) return false;
+        renderState(paneState(id));
+        renderStatus(paneState(id));
+        return true;
+      } catch (e) { return false; }
     }
 
     var onKey = function (e) {
       try {
         if (unmounted) return;
+        /* §13.8 rule 3: Escape is the reader's own way out of the frozen state. Deliberately before
+           the guards below and never swallowed — an overlay that wants this Escape still gets it, and
+           a reader who presses Escape to resume the stream gets exactly that. */
+        if (e.key === 'Escape') { if (frozen) leaveFreeze(true); return; }
         if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
         if (e.key !== 't' && e.key !== 'T') return;
         var t = e.target || {};
@@ -2118,7 +2373,182 @@
       (document.head || document.documentElement).appendChild(s);
     }
 
+    /* ═══════════════════════════════════════════ §13.8 — the reader's selection outranks the stream
+
+       The user's report: dragging across the streaming conversation broke the selection within
+       seconds — "the selected part vanished", or it grew to "everything before the cursor". Confirmed
+       on this build (live app, 2026-09-25): a real drag built a 395-character selection; ONE poll
+       later it was collapsed to nothing, its anchor moved into the scroll container. It is the
+       ordinary consequence of mutating a DOM that holds a live selection: renderNew() redraws the open
+       turn, the anchor's text node is replaced, and the browser answers by collapsing the range or
+       expanding it to the start of the mutated container. Auto-scroll while the button is down
+       compounds it.
+
+       So the stream yields, for exactly as long as the reader is holding a selection. While frozen,
+       ingest() still records every message (nothing is dropped) and every DOM write the stream would
+       make is deferred; leaveFreeze() applies them in ONE pass, in log order, and lets the view catch
+       up (stick-to-bottom, or the "N new ↓" chip the reader had).
+
+       Frozen while EITHER holds (rule 1):
+         · a primary mousedown inside the scroll container has not been released — the reader is about
+           to select, and this fires BEFORE any selection exists, which is the earliest moment the
+           stream can be stopped; or
+         · a non-collapsed selection intersects the chat list.
+       Released (rule 3) on: the primary button coming up with no selection, the selection collapsing,
+       Escape, a pane switch, leaving the chat view, and unmount. Never a permanent lock: the poll tick
+       re-derives the same invariant, so a mouseup lost outside the window releases too. */
+    var frozen = false;
+    var frozenWhy = '';
+    var frozenSince = 0;
+    var frozenAdded = 0;                // records that arrived while frozen — drawn once, on release
+    var pressDown = false;              // a primary mousedown inside the scroller, not yet released
+    var selHeld = false;                // a non-collapsed selection intersecting the chat list
+    var freezeOff = false;              // test-only (§13.8 teeth): freezing disabled altogether
+    var catchUpTimer = null;            // the one deferred catch-up pass, never two
+    var FREEZE_SELFHEAL_MS = 1500;      // a press whose mouseup was lost is released after this long
+
+    /** the reader's live selection, or null when there is none / the browser will not say */
+    function readerSelection() {
+      try {
+        var s = window.getSelection ? window.getSelection() : null;
+        if (!s || !s.rangeCount || s.isCollapsed) return null;
+        return s;
+      } catch (e) { return null; }
+    }
+    /** does the live selection reach into the chat list? (a drag that began outside it counts) */
+    function selectionTouchesChat(s) {
+      try {
+        for (var i = 0; i < s.rangeCount; i++) {
+          var r = s.getRangeAt(i);
+          var n = r.commonAncestorContainer;
+          var e = (n && n.nodeType === 1) ? n : (n ? n.parentNode : null);
+          if (!e) continue;
+          if (e === listEl || listEl.contains(e)) return true;
+          if (e.contains && e.contains(listEl)) return true;      // a range spanning past the list
+        }
+      } catch (err) { /* a selection we cannot describe is not one we can judge */ }
+      return false;
+    }
+    function enterFreeze(why) {
+      if (freezeOff || frozen || unmounted || mode !== 'chat') return false;
+      frozen = true;
+      frozenWhy = why;
+      frozenSince = Date.now();
+      frozenAdded = 0;
+      return true;
+    }
+    /** release the freeze and run the ONE catch-up pass (rule 3). `apply:false` is for callers that
+     *  are about to full-render anyway (a pane switch, leaving the view, unmount) — the queue is
+     *  still consumed exactly once, by them. */
+    function leaveFreeze(apply) {
+      var queued = frozenAdded;
+      frozen = false;
+      frozenWhy = '';
+      frozenSince = 0;
+      frozenAdded = 0;
+      pressDown = false;
+      selHeld = false;
+      if (apply === false || unmounted || mode !== 'chat') return true;
+      /* Nothing was ever held back → this is a pure state release, NOT a repaint. A reader's plain
+         click freezes for the milliseconds between press and release, and repainting the list right
+         then is what breaks the click itself: the browser dispatches `click` on the mousedown target
+         after this handler returns, and a redraw has detached it (measured 2026-09-25 — a fold head
+         stopped folding, and a §13.2 file link stopped opening its menu). */
+      if (queued <= 0) return true;
+      deferCatchUp();
+      return true;
+    }
+    /** The queued records, drawn in ONE pass — one task later, for the reason above: a release almost
+     *  always happens inside a mouseup or selectionchange handler, and the click that follows it must
+     *  still find the nodes it was pressed on. */
+    function deferCatchUp() {
+      if (catchUpTimer) { window.clearTimeout(catchUpTimer); catchUpTimer = null; }
+      catchUpTimer = window.setTimeout(function () {
+        catchUpTimer = null;
+        try {
+          if (unmounted || mode !== 'chat' || frozen) return;      // a new drag owns the DOM now
+          var id = currentPaneId();
+          var st = id ? paneState(id) : null;
+          if (!st) return;
+          renderNew(st, false);                  // everything queued, in log order, in one pass
+          renderPendings(st);
+          refreshWorking(st);
+          renderState(st);
+          renderStatus(st);
+          if (follow) scrollToBottom(); else updateJump();
+        } catch (e) { /* the records are still in st.messages; the next poll draws them */ }
+      }, 0);
+      return catchUpTimer;
+    }
+    /** Re-derive the invariant. With no selection and no button down there is nothing left to
+     *  protect, so a press whose mouseup never arrived cannot lock the view (rule 3). */
+    function freezeSelfCheck() {
+      if (!frozen) return false;
+      var s = readerSelection();
+      selHeld = !!(s && selectionTouchesChat(s));
+      if (selHeld) return true;                                     // a real selection is still held
+      if (pressDown && (Date.now() - frozenSince) < FREEZE_SELFHEAL_MS) return true;   // a drag may be starting
+      pressDown = false;
+      leaveFreeze(true);
+      return false;
+    }
+    /** rule 1a: a primary press inside the scroller, before any selection exists */
+    function onFreezeDown(ev) {
+      try {
+        if (freezeOff || unmounted || mode !== 'chat') return;
+        if (ev && ev.button !== undefined && ev.button !== 0) return;      // primary button only
+        var t = ev && ev.target;
+        if (!t || !scrollEl.contains(t)) return;
+        pressDown = true;
+        enterFreeze('mousedown');
+      } catch (e) { /* a reader action must never break the view */ }
+    }
+    /** rule 3a: the button coming up. A drag that ENDED with a selection keeps it protected. */
+    function onFreezeUp(ev) {
+      try {
+        if (ev && ev.button !== undefined && ev.button !== 0) return;
+        pressDown = false;
+        if (!frozen) return;
+        var s = readerSelection();
+        selHeld = !!(s && selectionTouchesChat(s));
+        if (selHeld) return;
+        leaveFreeze(true);
+      } catch (e) { /* ignore */ }
+    }
+    /** rule 1b + 3b: the browser's own answer to "is something selected" */
+    function onFreezeSelect() {
+      try {
+        if (freezeOff || unmounted) return;
+        var s = readerSelection();
+        selHeld = !!(s && selectionTouchesChat(s));
+        if (selHeld) { if (mode === 'chat') enterFreeze('selection'); return; }
+        /* collapsed or gone. Only a release when no drag is in progress: a mousedown's own collapse
+           fires before the drag has made a selection, and must not interrupt it. */
+        if (frozen && !pressDown) leaveFreeze(true);
+      } catch (e) { /* ignore */ }
+    }
+    function onFreezeVisibility() {
+      try {
+        if (document.hidden && frozen) leaveFreeze(false);   // rule 3: a hidden view is a left view
+        /* §13.12 item 2 (the same listener, so the view has exactly one visibility hook): coming back
+           to the tab is a reader arriving at the pane, so a read that was waiting out its backoff is
+           asked again at once instead of up to 30 s later — the cold scan it was waiting for has very
+           likely finished in the meantime, which is the cheapest recovery there is. */
+        if (!document.hidden && !unmounted && mode === 'chat') {
+          var st = currentPaneId() ? paneState(currentPaneId()) : null;
+          if (st) { st.nextTryAt = 0; st.backoffMs = 0; }
+        }
+      } catch (e) { /* ignore */ }
+    }
+
     /* ---------------- wiring ---------------- */
+
+    /* §13.8: capture phase, on the document, so the press is seen before any module that might stop
+       its propagation — a drag that breaks the selection because a listener threw is still broken. */
+    document.addEventListener('mousedown', onFreezeDown, true);
+    window.addEventListener('mouseup', onFreezeUp, true);
+    document.addEventListener('selectionchange', onFreezeSelect);
+    document.addEventListener('visibilitychange', onFreezeVisibility);
 
     scrollEl.addEventListener('scroll', onScroll);
     listEl.addEventListener('click', onListClick);
@@ -2131,9 +2561,12 @@
 
     try {
       offSelect = ctx.events.on('select', function () {
+        /* §13.8 rule 3: a pane switch leaves the view the reader was selecting in — release, and let
+           applyMode's full render be the catch-up. */
+        leaveFreeze(false);
         follow = true;
         newCount = 0;
-        applyMode();
+        applyMode();                     // §13.12: poll() itself skips the backoff for a pane newly arrived at
         poll();
       });
     } catch (e) { offSelect = null; }
@@ -2206,7 +2639,13 @@
       refresh: function () { poll(); },
       unmount: function () {
         unmounted = true;
+        leaveFreeze(false);                          // §13.8 rule 3: no freeze outlives the mount
+        if (catchUpTimer) { window.clearTimeout(catchUpTimer); catchUpTimer = null; }
         if (liveHost === host) liveHost = null;
+        document.removeEventListener('mousedown', onFreezeDown, true);
+        window.removeEventListener('mouseup', onFreezeUp, true);
+        document.removeEventListener('selectionchange', onFreezeSelect);
+        document.removeEventListener('visibilitychange', onFreezeVisibility);
         /* §13: the two behaviour modules go with the view they were mounted into — the copy listener
            is removed from the host and the link module stops observing it */
         try { if (copyApi && copyApi.unmount) copyApi.unmount(); } catch (e) { /* gone */ }
@@ -2218,6 +2657,7 @@
         if (pollTimer) { window.clearInterval(pollTimer); pollTimer = null; }
         if (pendingTimer) { window.clearInterval(pendingTimer); pendingTimer = null; }
         if (workingTimer) { window.clearInterval(workingTimer); workingTimer = null; }
+        if (slowTimer) { window.clearInterval(slowTimer); slowTimer = null; }
         if (offSelect) { try { offSelect(); } catch (e) { /* ignore */ } }
         if (offStatus) { try { offStatus(); } catch (e) { /* ignore */ } }
         if (host.parentNode) host.parentNode.removeChild(host);
@@ -2225,6 +2665,19 @@
       /* test seams — used by window.HD.chatviewTest and the ?selftest=1 chat cases only */
       __ingest: ingest,
       __ingestTail: function (id, body) { return ingest(id, body, { tail: true }); },
+      /* §13.8 seams: the frozen state as the module holds it, and the OFF switch the contract's
+         control run needs — a green with no teeth is not proof, so the same drag must be able to break
+         the selection again with freezing disabled. */
+      __freeze: function () {
+        return { frozen: frozen, why: frozenWhy, since: frozenSince, added: frozenAdded,
+                 pressDown: pressDown, selHeld: selHeld, off: freezeOff };
+      },
+      __setFreeze: function (on) {
+        freezeOff = !on;
+        if (freezeOff && frozen) leaveFreeze(true);
+        return !freezeOff;
+      },
+      __releaseFreeze: function () { return leaveFreeze(true); },
       /* A2: the pane's fold map as the module itself holds it (never the DOM's opinion of it) */
       __foldKeys: function (id) {
         var st = paneState(id || currentPaneId());
@@ -2275,6 +2728,15 @@
       },
       __retry: function () { return retryNow(); },
       __reqTimerArmed: function () { return !!reqTimer; },
+      /* §13.12 item 2 seams: the state line as the shipped function builds it (a check asserts the
+         SENTENCE, not a copy of it), the slow/retry pulse, and the backoff bookkeeping */
+      __stateText: function (id, nowMs) {
+        var pid = id || currentPaneId();
+        return stateTextFor(pid ? paneState(pid) : null, pid || null, nowMs || Date.now());
+      },
+      __slowTick: function () { return slowTick(); },
+      __freshMs: FRESH_MS,
+      __backoffMaxMs: STALL_BACKOFF_MAX_MS,
       /* DEFECT-18(1): the signature of the last read issued — a check asserts that the twin of a
          mount/select pair never reaches the wire by reading this beside the fetch log */
       __lastAsk: function () { return lastAsk ? { id: lastAsk.id, since: lastAsk.since, tail: lastAsk.tail } : null; },
@@ -2309,6 +2771,7 @@
         if (!auto && pollTimer) { window.clearInterval(pollTimer); pollTimer = null; }
         if (!auto && pendingTimer) { window.clearInterval(pendingTimer); pendingTimer = null; }
         if (!auto && workingTimer) { window.clearInterval(workingTimer); workingTimer = null; }
+        if (!auto && slowTimer) { window.clearInterval(slowTimer); slowTimer = null; }
         syncTimers();
         renderStatus(currentPaneId() ? paneState(currentPaneId()) : null);
         return auto;
@@ -2330,7 +2793,7 @@
       return {
         id: ID, mode: mode, visible: (mode === 'chat') && !unmounted, paneId: id, auto: auto,
         renderer: rendererName(), pollMs: POLL_MS, polling: !!pollTimer, pendingTimer: !!pendingTimer,
-        workingTimer: !!workingTimer,
+        workingTimer: !!workingTimer, slowTimer: !!slowTimer,
         agent: st ? st.agent : null, source: st ? st.source : null, cursor: st ? st.cursor : null,
         messages: st ? st.messages.length : 0,
         rendered: st ? domLastOf(st) - domFirstOf(st) : 0,
@@ -2362,7 +2825,19 @@
         pending: st ? st.pending.map(function (p) {
           return { id: p.id, text: p.text, lost: !!p.lost, resolved: !!p.resolved, since: p.since, ageMs: Date.now() - p.sentAt };
         }) : [],
-        lastQuery: st ? st.lastQuery : '', fetches: st ? st.fetches : 0, errors: st ? st.errors : 0
+        lastQuery: st ? st.lastQuery : '', fetches: st ? st.fetches : 0, errors: st ? st.errors : 0,
+        /* §13.12 item 2: how long the visible pane's read has been in flight (0 = nothing in flight),
+           whether that read is past FRESH_MS, the size the server reported (and where it came from),
+           the run of consecutive timeouts and when the next automatic attempt is due — a check reads
+           these instead of parsing the sentence */
+        loadingMs: (st && inflight && inflight.id === id) ? (Date.now() - inflight.startedAt) : 0,
+        slow: !!(st && inflight && inflight.id === id && (Date.now() - inflight.startedAt) >= FRESH_MS),
+        freshMs: FRESH_MS, stallRun: st ? num(st.stallRun) : 0, backoffMs: st ? num(st.backoffMs) : 0,
+        nextTryInMs: (st && st.nextTryAt) ? Math.max(0, st.nextTryAt - Date.now()) : 0,
+        sizeBytes: st ? st.sizeBytes : null, sizeSrc: st ? st.sizeSrc : '',
+        /* §13.8: whether the stream is holding off the reader's selection, why, and how many records
+           are waiting for the release — a check reads this instead of guessing from the DOM */
+        frozen: frozen, frozenWhy: frozenWhy, frozenQueued: frozenAdded, freezeOff: freezeOff
       };
     }
   }
@@ -2379,6 +2854,10 @@
       setPane: function (id) { return !!(handle && handle.__setPaneOverride(id)); },
       setStatus: function (id, status) { return handle ? handle.__setStatus(id, status) : null; },
       setAuto: function (on) { return handle ? handle.__setAuto(on) : false; },
+      /* §13.8: the frozen state, the OFF switch (the control run), and a manual release */
+      freeze: function () { return handle ? handle.__freeze() : null; },
+      setFreeze: function (on) { return handle ? handle.__setFreeze(on) : false; },
+      releaseFreeze: function () { return handle ? handle.__releaseFreeze() : false; },
       ingest: function (id, body) { if (!handle) return false; handle.__ingest(id, body); return true; },
       /* the SAME ingest, but marked as the answer to a `tail=1` request — the first-load path */
       ingestTail: function (id, body) { if (!handle) return false; handle.__ingestTail(id, body); return true; },
@@ -2404,6 +2883,11 @@
       setReqTimeoutMs: function (ms) { return handle ? handle.__setReqTimeoutMs(ms) : 0; },
       reqTimerArmed: function () { return handle ? handle.__reqTimerArmed() : false; },
       retry: function () { return handle ? handle.__retry() : false; },
+      /* §13.12 item 2 */
+      stateText: function (id, nowMs) { return handle ? handle.__stateText(id, nowMs) : ''; },
+      slowTick: function () { return handle ? handle.__slowTick() : false; },
+      freshMs: function () { return handle ? handle.__freshMs : 0; },
+      backoffMaxMs: function () { return handle ? handle.__backoffMaxMs : 0; },
       lastAsk: function () { return handle ? handle.__lastAsk() : null; },
       dedupMs: function () { return handle ? handle.__dedupMs : 0; },
       attach: function () { return handle ? handle.__attach() : null; },

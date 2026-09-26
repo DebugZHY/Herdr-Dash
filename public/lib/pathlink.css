@@ -9,6 +9,9 @@
  *     .hd-pl-menu-path                        the path VERBATIM: it wraps, it is never ellipsised
  *     .hd-pl-menu-btn[data-hd-act]             "Open" / "Open File Location"
  *     .hd-pl-menu-note[.hd-pl-bad]             what the server did, or why it did not
+ *   .hd-pl-note[.hd-pl-bad]                   §13.5: what a FOLDER click leaves behind (fixed, at the link)
+ *     .hd-pl-note-path                        the path the server RESOLVED and handed over
+ *     .hd-pl-note-text                        the server's own sentence, or its refusal
  *
  * Two of these declarations are load-bearing for the round's honesty rule, so they are stated rather
  * than styled for taste: the menu's path WRAPS (pre-wrap + anywhere, and deliberately no
@@ -77,3 +80,40 @@ a.hd-pl-link[data-hd-kind="dir"] { border-bottom-style: dashed; }   /* a folder 
   overflow-wrap: anywhere;
 }
 .hd-pl-menu-note.hd-pl-bad { color: var(--st-blocked); }
+
+/* §13.5 — the note a FOLDER click leaves behind. A directory opens directly, so this is the only
+   in-page evidence the reader gets that the click did anything at all; it dismisses itself.
+   Three declarations here are the requirement, not taste:
+     · `position: fixed` — out of flow, so the note cannot push the chat or move the reader's place in
+       it (a box in the flow would scroll the log under the reader's eyes at the moment of the click);
+     · `pointer-events: none` — the note is NEVER a click target. A second click on the same folder
+       link has to reach the LINK beneath, which is what replaces the note instead of feeding the note
+       itself; it also means the note can never take a click away from the page;
+     · no animation — the same rule as the menu: a click is a state, not a running thing.
+   `z-index: 41` is one above the menu (40): a note is always the newest surface on screen. */
+.hd-pl-note {
+  position: fixed;
+  z-index: 41;
+  display: block;
+  max-width: min(560px, 90vw);
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-panel2);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  font-size: 11px;
+  pointer-events: none;
+}
+.hd-pl-note-path {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--fg);
+  white-space: pre-wrap;        /* the whole resolved path, wrapped — never cut, same as the menu */
+  overflow-wrap: anywhere;
+}
+.hd-pl-note-text {
+  color: var(--fg-dim);
+  overflow-wrap: anywhere;
+}
+.hd-pl-note.hd-pl-bad { border-color: var(--st-blocked); }
+.hd-pl-note.hd-pl-bad .hd-pl-note-text { color: var(--st-blocked); }

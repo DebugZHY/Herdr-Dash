@@ -49,9 +49,15 @@ right showing that pane's own usage and background processes.
   including text a fold is currently hiding — and reports the true character count. If the browser refuses the
   clipboard it says so and tells you what to do instead; it never pretends to have copied.
 - **File paths become links**: a path in an agent's output that really exists on this machine is clickable. A **folder**
-  opens directly; a **file** offers *Open* (the default program) and *Open File Location* (the containing folder, with
-  the file selected). A path that does not exist — including anything the agent elided with `…` — stays plain text:
-  nothing is guessed, and nothing is opened unless you click it.
+  opens in File Explorer and is brought to the front; if a window for that same folder is already open, that window is
+  raised instead of a second one being opened; a **file** offers *Open* (the default program) and *Open File Location*
+  (the containing folder, with the file selected). The click is answered on the page with a short receipt saying what
+  was handed to the system — never a silent nothing. A path that does not exist — including anything the agent elided
+  with `…` — stays plain text: nothing is guessed, and nothing is opened unless you click it.
+- **Selecting text while the stream runs**: pressing the mouse in the chat view freezes the stream where it is — nothing
+  re-renders or scrolls under your cursor while you drag, and no record is lost — then the queued records are added in
+  order when you release. A read that takes a moment says what it is waiting for ("still reading … 4s so far"),
+  reports a timeout as a timeout, and retries on its own instead of parking the panel.
 - **Keys**: `Ctrl+K` command palette · `?` shortcut overlay · `Ctrl+1..9` / `j`,`k` select a pane · `/` focus the
   prompt · `Esc` closes overlays (sent to a pane only when *esc→pane* is armed) · `g b` board, `g i` inbox, `g p`
   palette, `g f` fan-out, `g s` search, `g g` changes · `\` collapse/restore the sidebar.

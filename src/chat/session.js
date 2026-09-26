@@ -433,7 +433,7 @@ function resolvePaneSession(input) {
  * gains records, which is exactly the fact the watchdog needs; it is the caller's
  * job to pass it from the read it already did, so no extra query exists for it.
  *
- * The clock is injectable (test/chat.mjs drives the 60 s window in milliseconds).
+ * The clock is injectable (the local test suite drives the 60 s window in milliseconds).
  */
 function createBindingTracker(opts) {
   const o = opts || {};

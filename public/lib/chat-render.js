@@ -2,7 +2,7 @@
  * (CONTRACT-v2 §8.3, owner: W3).
  *
  * This file is NOT a §3 module: it mounts nothing and owns no panel. It is the renderer W2's
- * `chatview` module calls, and it is deliberately DOM-only so `test/chat-render.mjs` can hold
+ * `chatview` module calls, and it is deliberately DOM-only so `the local test suite` can hold
  * it to fixtures without a browser.
  *
  * FROZEN INTERFACE (§8.5 — do not rename; W2 codes against it):
@@ -22,7 +22,7 @@
  * carry text fetched from the network. Every node below is built with createElement/createTextNode
  * and filled with `textContent`; the ONLY innerHTML in this file is `= ''` (clearing, in clear()).
  * Message text is therefore never parsed as HTML — there is nothing to escape on the way in, and
- * nothing an `<img onerror=…>` in a prompt or a result can execute. test/chat-render.mjs serialises
+ * nothing an `<img onerror=…>` in a prompt or a result can execute. the local test suite serialises
  * the produced tree and asserts that a message cannot produce an element; it also fails if any
  * non-empty innerHTML assignment ever appears here.
  *
@@ -177,7 +177,7 @@
   /** The only innerHTML in this file: '' removes children, and message text never goes through it.
    *  Nothing calls it any more — A3 removed the last in-place re-render (a reader's expand is now
    *  redrawn from `opts.openKeys` instead of repainting a live box) — but the invariant "the one
-   *  innerHTML assignment in this source line-clear" is pinned by test/chat-render.mjs. */
+   *  innerHTML assignment in this source line-clear" is pinned by the local test suite. */
   function clear(node) { node.innerHTML = ''; }
   function pre(text, cls) { var p = el('pre', cls); p.textContent = str(text); return p; }
   /** A class-name token we are willing to put in className. §8.2's fields are the server's, but a
@@ -1201,7 +1201,7 @@
   };
   window.ChatRender = ChatRender;
   HD.chatRender = ChatRender;
-  /** The pure parts, for test/chat-render.mjs (and W2, if it wants the same formatting). */
+  /** The pure parts, for the local test suite (and W2, if it wants the same formatting). */
   HD.chatRenderTest = {
     fmtTime: fmtTime, fmtFull: fmtFull, tsMs: tsMs, charCount: charCount, countLines: countLines,
     firstLines: firstLines, splitFences: splitFences, splitInlineCode: splitInlineCode,

@@ -7,7 +7,7 @@
  * app copies the bytes into its own store and injects the resulting absolute path
  * into the prompt. This module is that store's only writer.
  *
- * WHAT IT GUARANTEES (each one is a test in test/attach.mjs)
+ * WHAT IT GUARANTEES (each one is a test in the local test suite)
  *
  *   Never outside the root. `<app root>\_cache\attachments` (§13.4 item 1 — the
  *   store used to be `<LOCALAPPDATA>\herdr-dash\attachments`, but a store on C:

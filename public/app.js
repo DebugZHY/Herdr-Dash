@@ -87,7 +87,7 @@ function mergeStream(prevLines, nextLines) {
  *
  * The algorithm lives in exactly one place now: public/lib/advance-buffer.js, loaded before
  * this file (index.html) so that it is the implementation this page polls with, the copy
- * public/lib/grid.js picks up as ctx.util.advanceBuffer, and the file test/parity.mjs can
+ * public/lib/grid.js picks up as ctx.util.advanceBuffer, and the file the local test suite can
  * require() in Node next to the server twin src/hdr.js (W1). Its header documents the rules,
  * the 1r/1s improvements the round-2 DEFECT-1 fix needs, and why rule 2 appends
  * `next.slice(prev.length - p)` rather than the literal `next.slice(anchor.length)`.
@@ -2766,7 +2766,7 @@ function init() {
     });
     /* §12.2.1 — `d`, under its own id: the palette keys `id -> list` (a second registration for an
        id REPLACES the first), and W3's dock module registers under `dock`, so the shell's own key
-       must not take that id. The `d` key is free — asserted in test/acceptance-v2.mjs. */
+       must not take that id. The `d` key is free — asserted in the local test suite. */
     ctx.events.emit('keys.register', {
       id: 'dock-shell',
       keys: [{ key: 'd', help: 'toggle the side dock (the selected pane\'s usage + background processes)' }]

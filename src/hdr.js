@@ -11,7 +11,7 @@
  *   request(method, params, {timeoutMs}) -> Promise<result>
  *   subscribe(subs, onEvent, onStatus)   -> { close() }
  *   stripAnsi(text)
- *   mergeStream(prevLines, nextLines)      v1 rule, kept for test/acceptance.mjs
+ *   mergeStream(prevLines, nextLines)      v1 rule, kept for the local test suite
  *   advanceBuffer(prevLines, nextLines)    v2 rule, RE-EXPORTED from the shared
  *                                          browser copy per CONTRACT-v2 §0.2 R2
  *
@@ -211,7 +211,7 @@ function stripAnsi(text) {
  * Returns `{newLines, overlapped}`; `overlapped:false` means the screen was
  * cleared / scrolled past and the caller should render a separator.
  *
- * KEPT FOR BACK-COMPAT: `test/acceptance.mjs` (the v1 harness) imports this and
+ * KEPT FOR BACK-COMPAT: `the local test suite` (the v1 harness) imports this and
  * must keep passing. New callers should use advanceBuffer() — see DEFECT-1 below.
  */
 function mergeStream(prevLines, nextLines) {
@@ -233,7 +233,7 @@ function mergeStream(prevLines, nextLines) {
  * public/lib/advance-buffer.js — the classic script the page loads (it publishes
  * `window.HD.advanceBuffer`) and the file Node can `require` through its
  * CommonJS shim. Per §0.2 R2 this module requires that file and re-exports it,
- * so the server and the page cannot drift apart again: `test/parity.mjs` now
+ * so the server and the page cannot drift apart again: `the local test suite` now
  * sees one function object, not two hand-written copies of one algorithm.
  *
  * The rules themselves (4, 1, 1r, 1s, 2, 3), their order and the reasoning live
@@ -250,7 +250,7 @@ function mergeStream(prevLines, nextLines) {
  *   4x-in-raw / 13x-in-GUI growth reported in §0.1, measured at 40,000 buffer
  *   lines for 40,000 lines of windows in §0.2.
  *
- * `test/parity.mjs` guards the arrangement: it asserts that this export IS the
+ * `the local test suite` guards the arrangement: it asserts that this export IS the
  * shared copy, and keeps the frozen pre-fix copies (mergeStream above, plus the
  * round-2 browser copy embedded in the harness) reproducing that duplication, so
  * the teeth survive a future "small optimisation" of either file.

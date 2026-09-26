@@ -46,7 +46,7 @@
  *
  *   `readTail` answers with the NEWEST messages and a cursor at the end of the
  *   file, so opening a long session lands on the live turn instead of 3.8 hours
- *   (and one page) behind it. It scans BACKWARDS from EOF in 64 KiB chunks and
+ *   (and one page) behind it. It scans BACKWARDS from EOF in `TAIL_CHUNK` pieces and
  *   never reads the whole file: the newest records that fit are parsed, older
  *   bytes are never decoded.
  */
@@ -61,6 +61,28 @@ const {
 
 const SOURCE_KIND = 'claude_jsonl';
 const READ_CHUNK = 64 * 1024;
+
+/** §13.12 item 1 — the piece size of the BACKWARDS tail scan.
+ *
+ *  How much of the file one `read` asks for is a cost decision, not a correctness
+ *  one: the scan loop in `readTail` is written to be piece-size agnostic (it
+ *  carries a partial first line across the boundary and tracks absolute offsets),
+ *  so the count of round trips and the size of the buffer it re-concatenates every
+ *  round are the only things this changes. Both grow with the number of pieces: a
+ *  scan that reads B bytes does B/P round trips and copies about B²/2P bytes
+ *  through `Buffer.concat`, so a small piece makes a WIDE scan (the 16 MB
+ *  WINDOW_BYTES_MAX cap) quadratically expensive — 256 trips and ~2 GB of copying
+ *  at 64 KiB, against 32 trips and ~260 MB at 512 KiB.
+ *
+ *  The default is 512 KiB (measured — see the §13.12 note on `readTail`).
+ *  `HD_CHAT_TAIL_CHUNK` overrides it, the same way `CLAUDE_PROJECTS_DIR` and
+ *  `CHAT_SESSION_CACHE_MS` are overridable, so the cost can be re-measured
+ *  without editing this file; anything below 8 KiB is refused (a piece smaller
+ *  than one line would still be correct but pointless). */
+const TAIL_CHUNK = (() => {
+  const raw = Number(process.env.HD_CHAT_TAIL_CHUNK);
+  return Number.isFinite(raw) && raw >= 8 * 1024 ? Math.floor(raw) : 512 * 1024;
+})();
 
 /** §9.1's candidate scan verifies at most CAND_MAX files and stops there — the
  *  cost bound is deliberate. But when that cut proves NOTHING for the pane's cwd,
@@ -89,7 +111,7 @@ const KNOWN_TYPES = new Set([...MESSAGE_TYPES, ...EXCLUDED_TYPES]);
 /**
  * Where claude keeps its projects. `CLAUDE_PROJECTS_DIR` is honoured the same
  * way the rest of this server honours HERDR_SOCKET_PATH / GIT_BIN_PATH: so a
- * test (this repo's test/chat.mjs) can point the endpoint at a fixture tree
+ * test (this repo's the local test suite) can point the endpoint at a fixture tree
  * without writing a byte inside the user's real ~/.claude.
  */
 function projectsRoot() {
@@ -558,11 +580,18 @@ async function readWindow(file, since, limit, opts) {
  * Round 7.1 (DEFECT-9) — the NEWEST whole records, with the cursor at the end of
  * the file, so opening a long session lands on the live turn.
  *
- * Reads BACKWARDS from EOF in READ_CHUNK pieces: bytes older than the window are
+ * Reads BACKWARDS from EOF in TAIL_CHUNK pieces: bytes older than the window are
  * never read at all, so a large session costs a few chunks (the measured cost is
  * in the round-7.1 report), not a full scan. Only lines terminated by '\n' are
  * records — the file's trailing partial line is left alone, exactly as in the
  * forward reader, so nothing half-written is ever shown.
+ *
+ * §13.12 item 1 — the piece size was raised from 64 KiB to TAIL_CHUNK's default
+ * because the round trips and the per-round re-concatenation below both scale with
+ * the NUMBER of pieces, and a scan that has to walk to the 16 MB cap is where that
+ * bit. Measured on this machine's largest session (51.47 MB, 200 messages): see
+ * the §13.12 report — the wall time of the read itself moves by that factor when
+ * the cap is reached, and not at all when the window closes after the first piece.
  *
  * `truncated` is true when messages were left out because they are OLDER than the
  * window — or because the newest record alone does not fit, the same edge the
@@ -604,7 +633,7 @@ async function readTail(file, limit, opts) {
     let tailBytes = 0;
 
     for (;;) {
-      const start = Math.max(0, bufStart - READ_CHUNK);
+      const start = Math.max(0, bufStart - TAIL_CHUNK);
       const chunk = Buffer.alloc(bufStart - start);
       const { bytesRead } = await fh.read(chunk, 0, chunk.length, start);
       if (!bytesRead) break;

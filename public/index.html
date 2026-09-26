@@ -32,7 +32,7 @@ if (typeof window.HD.register !== 'function') {
 }
 </script>
 
-<!-- advanceBuffer (CONTRACT-v2 §0.1) lives in exactly one file, shared with Node's test/parity.mjs:
+<!-- advanceBuffer (CONTRACT-v2 §0.1) lives in exactly one file, shared with Node's the local test suite:
      load it first so window.HD.advanceBuffer exists before app.js polls and before any module. -->
 <script src="/lib/advance-buffer.js" defer></script>
 

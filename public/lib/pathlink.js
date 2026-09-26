@@ -35,6 +35,18 @@
  * chooses between handing it to its default app and revealing it in Explorer. `exists:false`, or no
  * answer yet, leaves the agent's text exactly as written: no link, no tooltip, no click.
  *
+ * A FOLDER CLICK MUST BE VISIBLE (§13.5). A directory opens directly, so the page has no in-page
+ * result of its own to show: the system's file manager takes the path and says nothing back — it may
+ * open behind this window, or reuse a window already open. The reader therefore saw nothing happen
+ * and clicked again: four times in 1.6 s. So a directory click leaves a transient note in this
+ * module's own host, naming the path the server RESOLVED and handed over (the native form — that is
+ * what the system got, which is not necessarily the `/d/…` the agent wrote) and the server's own
+ * sentence that it was handed over. Never "opened" (§13.2.7), and no claim that a window came to the
+ * front. It is never modal, never takes focus, and is positioned out of flow, so it cannot scroll the
+ * chat or move the reader's place in it. A refusal shows the same surface with the server's own
+ * reason instead of nothing. A second click replaces the note rather than stacking; Escape and the
+ * next click anywhere dismiss it. A FILE is unchanged: it still opens its menu.
+ *
  * HONESTY (§13.2.7). The answer says what was DONE — "handed to the system" — never "opened": the
  * server hands the path to `explorer.exe`, and `explorer.exe` exits 1 even when it succeeds, so the
  * exit code is not evidence (§13.0). The menu shows the path VERBATIM (never prettified, never
@@ -52,6 +64,9 @@
  *     .hd-pl-menu-path                        the path verbatim, wrapped, never ellipsised
  *     button.hd-pl-menu-btn[data-hd-act="open"|"reveal"]   "Open" / "Open File Location"
  *     .hd-pl-menu-note                        what was done, or why it was not
+ *   .hd-pl-note[role="status"]               §13.5's transient note for a FOLDER click, same host
+ *     .hd-pl-note-path                        the path the server RESOLVED and handed over
+ *     .hd-pl-note-text                        the server's sentence, or its refusal, verbatim
  *
  * The only innerHTML in this file is '' (clearing, in clear()); everything else is createElement,
  * createTextNode and textContent, because the path came from a log and the log is untrusted text.
@@ -72,11 +87,13 @@
   var REQ_TIMEOUT_MS = 8000;             // a request the server never answers cannot freeze the panel
   var DEBOUNCE_MS = 120;                 // a burst of appends is one pass, not twenty
   var MENU_DONE_MS = 1400;               // how long the "done" sentence stays before the menu closes
+  var NOTE_MS = 4000;                    // §13.5: how long a folder note stays before it dismisses itself
   var CSS_HREF = '/lib/pathlink.css';
 
   var CLS = {
     link: 'hd-pl-link',
-    menu: 'hd-pl-menu', menuPath: 'hd-pl-menu-path', menuBtn: 'hd-pl-menu-btn', menuNote: 'hd-pl-menu-note'
+    menu: 'hd-pl-menu', menuPath: 'hd-pl-menu-path', menuBtn: 'hd-pl-menu-btn', menuNote: 'hd-pl-menu-note',
+    note: 'hd-pl-note', notePath: 'hd-pl-note-path', noteText: 'hd-pl-note-text'
   };
   var ACT_OPEN = 'open';
   var ACT_REVEAL = 'reveal';
@@ -214,6 +231,7 @@
 
   var host = null, mounted = false, observer = null, debounce = null;
   var menu = null, menuLink = null, menuNote = null, doneTimer = null;
+  var noteEl = null, noteTimer = null, notePathText = null;   // §13.5: the one note a folder click leaves
   var asked = {};             // path -> true: asked at least once, never asked again (§13.2.2)
   var truth = {};             // path -> {exists, kind}: what the server answered
   var links = 0;              // how many anchors this module has drawn (across passes)
@@ -314,13 +332,29 @@
     }
     return false;
   }
+  /* Our own chrome carries a path as verbatim TEXT, which is exactly the shape the decorator exists to
+     rewrite — so it must never be read back in. Measured on the shipped build: 1.4 s after a file menu
+     opened, the menu's own `.hd-pl-menu-path` had become an `<a class="hd-pl-link">` (the module's
+     observer fired on its own append, and the verbatim path was by definition a confirmed one). That
+     put a link inside the menu that opened it. The same would happen to §13.5's note, which is the
+     path the server just confirmed. Chrome is not the agent's output: the walk stops at it. */
+  function insideChrome(node) {
+    var n = node && node.parentNode;
+    while (isElement(n)) {
+      var c = String(n.className).split(/\s+/);
+      if (c.indexOf(CLS.menu) >= 0 || c.indexOf(CLS.note) >= 0) return true;
+      n = n.parentNode;
+    }
+    return false;
+  }
   /** The text nodes under `root`, in document order, skipping anything already inside a link of ours
-   *  (that text is the LAST thing we rewrote, not a new candidate) and optionally skipping one node. */
+   *  (that text is the LAST thing we rewrote, not a new candidate), anything inside our own chrome
+   *  (a path we are quoting, not a path we were asked about), and optionally one node. */
   function textNodes(root, skip) {
     var out = [];
     (function walk(n) {
       if (!n || n === skip) return;
-      if (isText(n)) { if (!insideLink(n)) out.push(n); return; }
+      if (isText(n)) { if (!insideLink(n) && !insideChrome(n)) out.push(n); return; }
       if (!isElement(n) && n.nodeType !== 11 && n.nodeType !== 9) return;
       var kids = n.childNodes || n.children || [];
       for (var i = 0; i < kids.length; i++) walk(kids[i]);
@@ -443,18 +477,22 @@
     note.textContent = str(text);
     note.className = cls || CLS.menuNote;
   }
-  /** §13.2.7: what the answer says is what the menu shows — the server's own sentence, or the
-   *  refusal, verbatim. A failure never closes the menu silently. */
-  function report(note, r) {
-    if (r && r.ok) {
-      var b = r.body || {};
-      say(note, str(b.done) || str(b.message) || 'the server answered ok', CLS.menuNote);
-      return true;
-    }
+  /** §13.2.7: what the answer says is what the reader is shown — the server's own sentence, or the
+   *  refusal, verbatim. A failure never closes the menu silently, and §13.5's note is the same
+   *  sentence on a surface a folder click has. Composed here, once, so the two can never drift. */
+  function doneText(r) {
+    var b = (r && r.body) || {};
+    return str(b.done) || str(b.message) || 'the server answered ok';
+  }
+  function badText(r) {
     var e = (r && (r.error || (r.body && r.body.error))) || {};
-    say(note, 'not done: ' + (e.message || ('the server answered ' + ((r && r.status) || 0)))
+    return 'not done: ' + (e.message || ('the server answered ' + ((r && r.status) || 0)))
       + (e.code ? ' (' + e.code + ')' : '')
-      + (r && r.text && !r.body ? ' — ' + str(r.text).slice(0, 200) : ''), CLS.menuNote + ' hd-pl-bad');
+      + (r && r.text && !r.body ? ' — ' + str(r.text).slice(0, 200) : '');
+  }
+  function report(note, r) {
+    if (r && r.ok) { say(note, doneText(r), CLS.menuNote); return true; }
+    say(note, badText(r), CLS.menuNote + ' hd-pl-bad');
     return false;
   }
   /** Put the menu at the link and keep it inside the window. A menu that opens off the right edge or
@@ -487,8 +525,54 @@
     m.style.left = Math.round(left) + 'px';
     m.style.top = Math.round(top) + 'px';
   }
+
+  // ── §13.5: what a folder click leaves behind ──────────────────────────────────
+
+  /* Why a note at all: the reader clicked a folder, the page did nothing it could see, so the reader
+     clicked again — four times in 1.6 s. The only thing that acted was the system's file manager, and
+     it answers nothing. So the page says which path was handed over, and dismisses itself. */
+  function onNoteKey(ev) { if (str(ev && ev.key) === 'Escape') hideNote(); }
+  function onNoteClick() { hideNote(); }        // the next click anywhere, including on the link again
+  function hideNote() {
+    if (noteTimer) { clearTimeout(noteTimer); noteTimer = null; }
+    if (!noteEl) return;
+    off(document, 'keydown', onNoteKey);
+    off(document, 'mousedown', onNoteClick);
+    if (noteEl.parentNode) noteEl.parentNode.removeChild(noteEl);
+    noteEl = null;
+    notePathText = null;
+  }
+  /** Show the ONE note. `pathText` is the path the server said it handed over — null on a refusal,
+   *  where the server's reason already names what it could not reach, and naming a path we did not
+   *  hand over would be the dishonest part. `sentence` is the server's own words, verbatim. */
+  function showNote(link, pathText, sentence, bad) {
+    hideNote();                                   // §13.5: replace, never stack
+    var owner = (host && host.appendChild) ? host : (link && link.parentNode);
+    if (!owner || !owner.appendChild) return null;
+    var n = el('div', CLS.note + (bad ? ' hd-pl-bad' : ''));
+    setAttr(n, 'role', 'status');                 // announced to a reader that wants announcing…
+    setAttr(n, 'aria-live', 'polite');
+    if (pathText) n.appendChild(el('div', CLS.notePath, pathText));
+    n.appendChild(el('div', CLS.noteText, sentence));
+    owner.appendChild(n);
+    noteEl = n;
+    notePathText = pathText ? str(pathText) : null;
+    /* Dismissal, both by §13.5: the next Escape, and the next click anywhere. The note never receives
+       a click (pathlink.css gives it `pointer-events: none`), so a second click on the same folder
+       link reaches the LINK — which is what lets it REPLACE this note rather than be swallowed by it. */
+    on(document, 'keydown', onNoteKey);
+    on(document, 'mousedown', onNoteClick);
+    noteTimer = setTimeout(function () { noteTimer = null; hideNote(); }, NOTE_MS);
+    /* Out of flow and placed at the link, like the menu: `position: fixed` cannot move the chat, and
+       the chat's scroll position is the reader's place in it (§13.5). A DOM without layout (the shim)
+       gets no position at all rather than a wrong one, exactly as the menu does. */
+    try { place(link, n); place(link, n); }
+    catch (e) { /* a page that cannot measure still gets the note */ }
+    return n;
+  }
   function openMenu(link, hit, opts) {
     closeMenu();
+    hideNote();          // one surface at a time: a file menu replaces a folder note, never stacks on it
     var owner = host && host.appendChild ? host : link.parentNode;
     if (!owner) return null;
     menu = el('div', CLS.menu);
@@ -529,6 +613,8 @@
     if (pending) return Promise.resolve({ ok: false, error: 'busy' });
     pending = true;
     var note = menuNote;
+    /* §13.5: a folder click has no menu, so its outcome has no other surface to land on. */
+    var folder = !note && !!(link && link.getAttribute && str(link.getAttribute('data-hd-kind')) === 'dir');
     if (note) say(note, action === ACT_REVEAL ? 'asking the server to reveal it…' : 'asking the server to hand it to the system…');
     return post(ROUTE_OPEN, { path: path, action: action }, opts).then(function (r) {
       pending = false;
@@ -538,9 +624,15 @@
         if (report(note, r) || action === ACT_REVEAL) {
           if (r.ok) doneTimer = setTimeout(function () { doneTimer = null; closeMenu(); }, MENU_DONE_MS);
         }
+      } else if (folder) {
+        // The path shown is the one the SERVER resolved (body.path) — the native form the system was
+        // handed, not the `/d/…` or `C:/…` the agent may have written. `path` is the fallback for a
+        // server that answers ok without echoing it.
+        if (r.ok) showNote(link, str(r.body && r.body.path) || path, doneText(r), false);
+        else showNote(link, null, badText(r), true);       // the reason, verbatim, never silence
       }
       // A directory opens with no menu in the way (§13.2.4), so the outcome has to be readable
-      // somewhere: last_action carries the server's own sentence, the same one the menu shows.
+      // somewhere: last_action carries the server's own sentence, the same one the note shows.
       lastAction = { at: Date.now(), path: path, action: action, kind: kind, ok: !!r.ok,
         done: (r.body && (r.body.done || r.body.message)) || null, status: r.status, error: lastError };
       return { ok: !!r.ok, status: r.status, action: action, path: path, done: lastAction.done,
@@ -549,6 +641,7 @@
       pending = false;
       lastError = { code: 'network', message: str(e && e.message || e) };
       if (note) say(note, 'not done: ' + lastError.message, CLS.menuNote + ' hd-pl-bad');
+      else if (folder) showNote(link, null, 'not done: ' + lastError.message, true);
       return { ok: false, error: lastError };
     });
   }
@@ -578,6 +671,7 @@
   }
 
   function mount(hostEl, opts) {
+    hideNote();                     // a remount is a new host: a note belongs to the one it was shown in
     host = hostEl || null;
     mounted = !!host;
     ensureCss();
@@ -597,6 +691,7 @@
     if (observer && observer.disconnect) { try { observer.disconnect(); } catch (e) { /* gone */ } }
     observer = null;
     closeMenu();
+    hideNote();
     host = null;
     return mod;
   }
@@ -622,6 +717,8 @@
       passes: passes,
       menu: !!menu,
       menu_path: menuLink && menuLink.getAttribute ? str(menuLink.getAttribute('data-hd-path')) : null,
+      note: !!noteEl,        // §13.5: the note a folder click is showing, if one is showing
+      note_path: notePathText,
       last_answer: lastAnswer,
       last_action: lastAction,
       last_error: lastError
@@ -635,11 +732,11 @@
     state: state
   };
   window.HD.pathlink = mod;
-  /** The pure parts, for test/pathlink.mjs. Not part of the frozen interface. */
+  /** The pure parts, for the local test suite. Not part of the frozen interface. */
   window.HD.pathlinkTest = {
     candidatesIn: candidatesIn, anchorsIn: anchorsIn, linksIn: linksIn, trimRun: trimRun,
     runFrom: runFrom, CLS: CLS, MAX_PER_PASS: MAX_PER_PASS, MIN_CANDIDATE: MIN_CANDIDATE,
     MAX_CANDIDATE: MAX_CANDIDATE, REJECT_AT: REJECT_AT, ANCHOR: ANCHOR, STOP: STOP, BEFORE: BEFORE,
-    ROUTE_INFO: ROUTE_INFO, ROUTE_OPEN: ROUTE_OPEN, ACTION_HEADER: ACTION_HEADER
+    ROUTE_INFO: ROUTE_INFO, ROUTE_OPEN: ROUTE_OPEN, ACTION_HEADER: ACTION_HEADER, NOTE_MS: NOTE_MS
   };
 })();

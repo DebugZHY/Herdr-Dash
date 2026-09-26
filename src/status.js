@@ -442,7 +442,7 @@ async function readUsageTail(file) {
  * output. NOTE, disclosed rather than smoothed over: the example JSON beside the
  * rule shows 145759, which is input + cache_read + cache_creation WITHOUT output
  * (148163 with it). The sentence is normative; the example's arithmetic is not.
- * `test/status.mjs` pins the sentence's sum so the choice is visible.
+ * `the local test suite` pins the sentence's sum so the choice is visible.
  *
  * A usage object missing any of the four counters has no honest total, so the
  * whole block is absent rather than short a term.

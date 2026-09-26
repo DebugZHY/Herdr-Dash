@@ -507,7 +507,7 @@
    button.hd-cv-attach-remove, and the drop state is .hd-cv-drop-active on the composer container.
    The row lives with the composer (W2's #promptBox / .prompt-line), and the composer is the one part
    of the panel that must not move: every state below therefore changes a colour, a border STYLE or an
-   inset shadow, never a box. The suite measures that (test/chat-render.mjs, "§10"), rather than
+   inset shadow, never a box. The suite measures that (the local test suite, "§10"), rather than
    trusting these words. */
 
 /* The row sits above the input in the composer's own flow and is bounded in BOTH directions: eight
@@ -609,7 +609,7 @@
    the dashed edge does, from the inside, so the mark survives whatever the container's own rule says:
    W2's `#promptBox { background: var(--bg-panel) }` outranks a class selector for background-color,
    which is why the fill below is an addition for plain containers and not the affordance itself.
-   Both marks are measured in the engine in test/chat-render.mjs (§10). */
+   Both marks are measured in the engine in the local test suite (§10). */
 .hd-cv-drop-active {
   outline: 2px dashed var(--accent);
   outline-offset: -2px;

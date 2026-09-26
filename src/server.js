@@ -53,7 +53,7 @@ const READ_SOURCES = new Set(['visible', 'recent', 'recent_unwrapped', 'detectio
 
 // §9 (round 7.6): the pane→session binding is re-derived on every /api/chat poll.
 // Two knobs, both env-overridable for the same reason HERDR_SOCKET_PATH is: the
-// fixture server in test/chat.mjs has to drive a 60 s watchdog inside a test.
+// fixture server in the local test suite has to drive a 60 s watchdog inside a test.
 //   CHAT_SESSION_CACHE_MS  how long one pane read / store lookup / candidate scan
 //                          is reused (the page polls faster than this)
 //   CHAT_STALE_MS          §9.4's "~60 s" window
@@ -556,7 +556,7 @@ async function handleCli(req, res, body) {
  * There is no shell anywhere: argv arrays go to cp.spawn with shell:false, so a
  * caller value can never be re-parsed as a command or as a second flag.
  *
- * test/git-view.mjs parses the marked block and asserts BY ENUMERATION that (a)
+ * the local test suite parses the marked block and asserts BY ENUMERATION that (a)
  * the rows are exactly the seven §7.1 lists, (b) no row starts with or contains a
  * write subcommand, and (c) `mode=<anything not status|diff>` is refused, so the
  * table cannot be reached with a subcommand the table does not hold.
@@ -564,7 +564,7 @@ async function handleCli(req, res, body) {
  * §7.1 errata 2: `mode=diff` always reports `diff_available`, and a
  * `no_diff_reason` token when it is false — see step 4 of handleGit.
  */
-/* BEGIN §7.1 SUBCOMMAND WHITELIST (parsed by test/git-view.mjs) */
+/* BEGIN §7.1 SUBCOMMAND WHITELIST (parsed by the local test suite) */
 const GIT_ARGV = {
   toplevel: ['rev-parse', '--show-toplevel'],
   branch: ['rev-parse', '--abbrev-ref', 'HEAD'],
@@ -717,7 +717,7 @@ function parsePorcelainZ(stdout) {
       // An untracked file is neither staged nor unstaged — it is not in the index
       // at all, which is exactly what `untracked` says. §7.1 does not spell this
       // out; this is the reading that keeps staged/unstaged/untracked one badge
-      // per row instead of counting a new file twice (test/git-view.mjs asserts
+      // per row instead of counting a new file twice (the local test suite asserts
       // the invariant, so the choice is visible rather than incidental).
       staged: !untracked && x !== ' ',
       unstaged: !untracked && y !== ' ',
@@ -892,7 +892,7 @@ async function handleGit(req, res, url) {
 
   // Line counts come from git's own numstat. A row that has worktree changes is
   // described by the unstaged pass, otherwise by the staged one — the same rule
-  // test/git-view.mjs applies when it checks these numbers against git's output.
+  // the local test suite applies when it checks these numbers against git's output.
   const unstaged = parseNumstatZ(numstatR.stdout);
   const staged = parseNumstatZ(numstatCachedR.stdout);
   for (const e of files) {
@@ -1116,6 +1116,48 @@ const claudeLogCache = new Map();       // cwd -> {at, candidates}
 const liveCache = new Map();            // key -> {at, value}
 const liveInflight = new Map();         // key -> Promise (joined, never re-run)
 
+// §13.12 item 1 (round 9.12): the two lanes a TAIL read can answer from without
+// waiting for herdr, so that /api/chat has a bound a page-load burst cannot break.
+//
+// MEASURED, on this machine, for this route: the FILE side is not the problem. The
+// tail scan reads at most 6.50 MB of source across all 132 sessions on the machine
+// at limit=200, and its wall time is ≤ 26 ms (p50 8 ms) — including the 51.47 MB
+// session (§13.12's scanprobe). Everything that can turn one request into seconds
+// is herdr work inside §9's resolution: the pane read, the candidate scan, the
+// store lookup and the repair WRITE, each queued behind whatever else herdr is
+// doing — one /api/pane read costs 100–126 ms inside a page-load burst against
+// 8–13 ms alone, and a page load fires six resolutions at once.
+//
+// So a tail read answers from the binding this process last READ and VERIFIED,
+// re-checked HERE — the file must still be under the projects root and still carry
+// the pane's cwd, two local reads and no herdr — while the resolver keeps running
+// in the background (so herdr's record is still repaired and the next poll's
+// memory is re-endorsed). That is lane 1, and it costs no herdr call at all.
+//
+// A pane this process has never read has no memory (and a restart has none for any
+// pane), so a COLD read takes lane 2: the resolver gets SCAN_WAIT_MS to answer, and
+// if it overruns, herdr's OWN record for the pane is verified locally (its file
+// exists and carries the pane's cwd) and served with the overrun disclosed in
+// `x-hd-session-scan: herdr-record` — the scan finishes behind it and re-endorses or
+// corrects the binding for the next poll. Lane 2 is not a guess: it is the pane's
+// own reported session, checked the same way §7.1 requires. A pane herdr records no
+// session for, or whose record does not verify, keeps the resolving road (there is
+// nothing to fall back to — the scan IS the answer there).
+const SCAN_WAIT_MS = (() => {
+  const raw = Number(process.env.CHAT_SCAN_WAIT_MS);
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 900;
+})();
+const readMemory = new Map();           // pane_id -> {agent, session_id, file, cwd, working, live, fields, at}
+/** §13.12 item 1's proof hook: makes §9's resolution take at least this long, so the
+ *  bound lane 2 gives a tail read can be MEASURED against a scan as slow as the one
+ *  seen on the PM's instance (5–9 s) without waiting for herdr to actually be slow.
+ *  Unset (0) everywhere except a measurement run. */
+const SCAN_DELAY_MS = (() => {
+  const raw = Number(process.env.CHAT_SCAN_DELAY_MS);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
+})();
+const READ_MEMORY_MAX = 256;
+
 async function paneTexts(paneId) {
   const hit = paneTextCache.get(paneId);
   if (hit && Date.now() - hit.at < SESSION_CACHE_MS) return hit;
@@ -1198,7 +1240,7 @@ function claimedByOtherPanes(agents, paneId) {
 }
 
 /** §9's resolution, and the fields every reply carries about it. */
-async function liveSessionFor(paneId, entry, agent, herdrSessionId, agents, readerPick) {
+async function liveSessionFor(paneId, entry, agent, herdrSessionId, agents, readerPick, mark) {
   // §11.3: one cold resolution per pane+session, never one per request. The key
   // carries everything that decides the answer (the pane, the agent, herdr's own
   // record, the reader's pick), so a change in any of them — a healed record, an
@@ -1219,7 +1261,7 @@ async function liveSessionFor(paneId, entry, agent, herdrSessionId, agents, read
     // from the same work, and the second one says so instead of hiding the wait.
     return Object.assign({}, await running, { scan: 'joined' });
   }
-  const job = resolveLiveSession(paneId, entry, agent, herdrSessionId, agents, readerPick);
+  const job = resolveLiveSession(paneId, entry, agent, herdrSessionId, agents, readerPick, mark);
   liveInflight.set(key, job);
   try {
     const value = await job;
@@ -1237,7 +1279,8 @@ async function liveSessionFor(paneId, entry, agent, herdrSessionId, agents, read
 /** The cold path itself: the pane read, the store/log lookup, the resolver and
  *  the §9.3 heal. Only `liveSessionFor` calls this, so the sharing above is the
  *  only way in. */
-async function resolveLiveSession(paneId, entry, agent, herdrSessionId, agents, readerPick) {
+async function resolveLiveSession(paneId, entry, agent, herdrSessionId, agents, readerPick, mark) {
+  if (SCAN_DELAY_MS) await new Promise((r) => setTimeout(r, SCAN_DELAY_MS));
   const cwd = typeof entry.cwd === 'string' ? entry.cwd.trim() : '';
   const inp = {
     agent,
@@ -1247,6 +1290,7 @@ async function resolveLiveSession(paneId, entry, agent, herdrSessionId, agents, 
     reader_pick: readerPick,
   };
   const texts = await paneTexts(paneId);
+  if (mark) mark('paneTexts');
   inp.pane_text_visible = texts.visible;
   inp.pane_text_recent = texts.recent;
 
@@ -1267,6 +1311,7 @@ async function resolveLiveSession(paneId, entry, agent, herdrSessionId, agents, 
     }
   } else if (agent === 'claude' && cwd) {
     inp.candidates = await claudeLogs(cwd);
+    if (mark) mark('claudeLogs');
     const boundFile = chatClaude.findSessionFile(herdrSessionId);
     if (boundFile) {
       const st = await fsp.stat(boundFile).catch(() => null);
@@ -1277,7 +1322,9 @@ async function resolveLiveSession(paneId, entry, agent, herdrSessionId, agents, 
   }
 
   const res = chatSession.resolvePaneSession(inp);
+  if (mark) mark('resolve');
   const heal = await healHerdr(paneId, agent, herdrSessionId, res, entry);
+  if (mark) mark('heal');
   return { res, heal, texts, cwd };
 }
 
@@ -1415,7 +1462,221 @@ function chatReply(res, base, source, win, tail, since) {
   }));
 }
 
+/** §13.12: where a /api/chat request spends its time, off unless HD_CHAT_TIMING=1.
+ *  A phase list, not a single total: the route's cost is a herdr round-trip, a
+ *  session binding, a file identity check and a tail read, and only a per-phase
+ *  mark says which one a slow reply actually paid for. */
+const CHAT_TIMING = process.env.HD_CHAT_TIMING === '1' || process.argv.includes('--chat-timing');
+if (CHAT_TIMING) console.log('[hd-chat-timing] per-phase timing for /api/chat is on');
+function chatClock(paneId) {
+  const t0 = process.hrtime.bigint();
+  const marks = [];
+  const at = (name) => marks.push([name, Number(Number(process.hrtime.bigint() - t0) / 1e6).toFixed(2)]);
+  at('start');
+  return {
+    at,
+    done(extra) {
+      const total = Number(process.hrtime.bigint() - t0) / 1e6;
+      console.log('[hd-chat-timing] ' + JSON.stringify(Object.assign({
+        time: new Date().toISOString(), pane_id: paneId, total_ms: Number(total.toFixed(1)), phases: marks,
+      }, extra || {})));
+    },
+  };
+}
+
+/**
+ * §13.12 item 1 — remember the binding a successful claude reply was built from.
+ * `live` is the resolver's own answer (or the reply path's), so this only ever
+ * stores a binding §9 has already produced — the memory cannot invent one. A
+ * resolution that did not resolve REMOVES the memory: a binding the resolver
+ * refuses must not be served out of a cache.
+ */
+function rememberBinding(paneId, agent, entry, live, fileKnown) {
+  const res = (live && live.res) || {};
+  const sid = res.session_id ? String(res.session_id) : '';
+  if (!res.resolved || !sid) { readMemory.delete(paneId); return null; }
+  const file = fileKnown || (agent === 'claude' ? chatClaude.findSessionFile(sid) : null);
+  const mem = {
+    agent,
+    session_id: sid,
+    file,
+    cwd: (live && live.cwd) || (entry && entry.cwd) || '',
+    working: { working: !!(entry && entry.agent_status === 'working') },
+    live,
+    fields: sessionFields(live),
+    at: Date.now(),
+  };
+  readMemory.set(paneId, mem);
+  if (readMemory.size > READ_MEMORY_MAX) {
+    let oldest = null;
+    for (const [k, v] of readMemory) if (!oldest || v.at < oldest[1].at) oldest = [k, v];
+    if (oldest) readMemory.delete(oldest[0]);
+  }
+  return mem;
+}
+
+/** The scan is allowed SCAN_WAIT_MS to answer a tail read; `SCAN_TIMEOUT` comes back
+ *  when it did not. The promise stays handled either way (its rejection is
+ *  delivered to the reject handler below), so losing the race cannot raise an
+ *  unhandled rejection. */
+const SCAN_TIMEOUT = Symbol('scan-timeout');
+/** What a lane that has already SENT its reply returns. The reply value itself is
+ *  `undefined` (`ok()`/`sendJson()` return nothing), so a lane cannot hand it back —
+ *  and a caller that tested it would run a second reply behind the first. */
+const SERVED = true;
+function raceDeadline(p, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve(SCAN_TIMEOUT), ms);
+    if (timer.unref) timer.unref();
+    p.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
+/**
+ * The resolving road still RUNS on every tail request — in the background when a
+ * lane answered — because it is what keeps herdr's record honest (§9.3's repair)
+ * and what makes the next poll's memory re-endorsed rather than older and older.
+ * Its failure is logged, not thrown: nobody is waiting for it.
+ */
+function refreshBinding(paneId, agent, entry, herdrSessionId, agents) {
+  const job = liveSessionFor(paneId, entry, agent, herdrSessionId, agents, null, null);
+  job.then(
+    (live) => { rememberBinding(paneId, agent, entry, live); },
+    (e) => {
+      // The pane is gone (or herdr refused): the memory must not outlive it.
+      readMemory.delete(paneId);
+      console.log('[hd-chat] ' + JSON.stringify({
+        event: 'chat_background_scan_failed', pane_id: paneId, agent,
+        error: String((e && e.message) || e),
+      }));
+    },
+  );
+  return job;
+}
+
+/**
+ * Lane 1 answered without asking herdr anything, so the background scan has to
+ * fetch herdr's record itself — in the background, where its cost (one
+ * `agent.list`, served from the 5 s cache a page load has already filled) cannot
+ * be felt. Two facts end the memory here rather than in the scan: a pane herdr no
+ * longer knows, and a pane whose agent is no longer claude — serving either would
+ * be a binding the pane has moved on from, and neither can be corrected by a scan
+ * that never runs.
+ */
+function refreshFromHerdr(paneId) {
+  agentList().then(
+    ({ agents }) => {
+      const entry = agents.find((a) => a && a.pane_id === paneId);
+      if (!entry) { readMemory.delete(paneId); return; }
+      const session = entry.agent_session;
+      const agent = String((session && session.agent) || entry.agent || '');
+      if (agent !== 'claude') { readMemory.delete(paneId); return; }
+      refreshBinding(paneId, agent, entry, session && session.value != null ? String(session.value) : '', agents);
+    },
+    (e) => {
+      console.log('[hd-chat] ' + JSON.stringify({
+        event: 'chat_background_agent_list_failed', pane_id: paneId, error: String((e && e.message) || e),
+      }));
+    },
+  );
+}
+
+/**
+ * §13.12 item 1, lane 1 — the BOUNDED tail road: no herdr call at all, so nothing
+ * here can queue behind a busy herdr or behind §9's repair write. The memory is
+ * only usable when the local filesystem still agrees with it (the file is still
+ * under the projects root, and one of its own records still carries the pane's
+ * cwd), which is the identity check §7.1 already requires — the difference is only
+ * WHERE the session id came from (this process's own last, verified read).
+ *
+ * Returns the reply, or null when there is no memory for this pane or the local
+ * check failed. `null` means: take the resolving road, never guess.
+ */
+async function replyFromMemory(res, paneId, limit, mark, clk) {
+  const mem = readMemory.get(paneId);
+  if (!mem || mem.agent !== 'claude' || !mem.session_id) return null;
+  const file = chatClaude.findSessionFile(mem.session_id);
+  if (mark) mark('findSessionFile');
+  if (!file) { readMemory.delete(paneId); return null; }
+  const identity = await chatClaude.verifyCwd(file, mem.cwd);
+  if (mark) mark('verifyCwd');
+  if (!identity.ok) { readMemory.delete(paneId); return null; }
+  const win = await chatClaude.readTail(file, limit, mem.working);
+  if (mark) mark('readTail');
+  const sessionId = mem.session_id;
+  const base = Object.assign({ pane_id: paneId, agent: mem.agent }, mem.fields);
+  const live = mem.live || { res: {}, texts: {}, cwd: mem.cwd };
+  Object.assign(base, observeBinding(paneId, sessionId, live, win));
+  const age = Date.now() - mem.at;
+  res.setHeader('x-hd-session-scan', 'remembered');
+  res.setHeader('x-hd-session-age-ms', String(age));
+  console.log('[hd-chat] ' + JSON.stringify({
+    event: 'chat_read_remembered', pane_id: paneId, session_id: sessionId,
+    age_ms: age, bytes: win.tailBytes, messages: win.messages.length,
+  }));
+  chatReply(res, base, { kind: chatClaude.SOURCE_KIND, session_id: sessionId, path: file }, win, true, 0);
+  if (clk) clk.done({ lane: 'remembered', scan: 'remembered', age_ms: age, messages: win.messages.length, tail_bytes: win.tailBytes, file_size: win.eof });
+  // `SERVED`, not the reply: `ok()`/`sendJson()` returns nothing, so the only thing
+  // a caller can test is that this lane answered — and a caller that tests the
+  // REPLY would fall through and run the resolving road behind a reply already sent.
+  return SERVED;
+}
+
+/**
+ * §13.12 item 1, lane 2 — the overrun road. Only reached when the resolver did NOT
+ * answer within SCAN_WAIT_MS and this process has no memory for the pane, so the
+ * answer is herdr's OWN record, verified locally exactly as §7.1 requires (its file
+ * exists under the projects root and one of its own records carries the pane's
+ * cwd). Nothing is guessed: this is the same binding `resolvePaneSession` falls
+ * back to, served without waiting for the candidate weighing that is still running.
+ * Returns the reply, or null when herdr's record cannot be verified — in which case
+ * the caller must wait for the scan, because the scan IS the answer for that pane.
+ */
+async function replyFromHerdrRecord(res, paneId, agent, entry, herdrSessionId, limit, scanMs, mark, clk) {
+  if (!herdrSessionId) return null;
+  const cwd = typeof entry.cwd === 'string' ? entry.cwd.trim() : '';
+  if (!cwd) return null;
+  const file = chatClaude.findSessionFile(herdrSessionId);
+  if (mark) mark('findSessionFile');
+  if (!file) return null;
+  const identity = await chatClaude.verifyCwd(file, cwd);
+  if (mark) mark('verifyCwd');
+  if (!identity.ok) return null;
+  const working = { working: entry.agent_status === 'working' };
+  const win = await chatClaude.readTail(file, limit, working);
+  if (mark) mark('readTail');
+  const live = {
+    res: {
+      resolved: true, session_id: herdrSessionId, detected_by: chatSession.SIGNALS.HERDR,
+      corroborated: false, reason: null, candidates: [],
+      note: `herdr's own record for this pane (its file exists and carries the pane's cwd); the pane scan has been running ${scanMs} ms and is still going`,
+    },
+    texts: {},
+    // Honest, not `null`: the heal has not been decided yet — the scan that decides
+    // it (and reports the session to herdr when it disagrees) is still running, and
+    // the next poll's fields carry its verdict.
+    heal: { herdr_healed: false, heal_reason: 'not decided yet — the pane scan is still running (see x-hd-session-scan)' },
+    cwd,
+  };
+  const base = Object.assign({ pane_id: paneId, agent }, sessionFields(live));
+  Object.assign(base, observeBinding(paneId, herdrSessionId, live, win));
+  res.setHeader('x-hd-session-scan', 'herdr-record');
+  res.setHeader('x-hd-session-scan-ms', String(scanMs));
+  console.log('[hd-chat] ' + JSON.stringify({
+    event: 'chat_read_herdr_record', pane_id: paneId, session_id: herdrSessionId,
+    scan_ms: scanMs, bytes: win.tailBytes, messages: win.messages.length,
+  }));
+  chatReply(res, base, { kind: chatClaude.SOURCE_KIND, session_id: herdrSessionId, path: file }, win, true, 0);
+  if (clk) clk.done({ lane: 'herdr-record', scan: 'herdr-record', scan_ms: scanMs, messages: win.messages.length, tail_bytes: win.tailBytes, file_size: win.eof });
+  return SERVED;
+}
+
 async function handleChat(req, res, url) {
+  const clk = CHAT_TIMING ? chatClock(url.searchParams.get('pane_id')) : null;
+  const mark = clk ? clk.at : () => {};
   const paneId = url.searchParams.get('pane_id');
   if (!paneId) {
     throw { code: 'bad_request', message: '"pane_id" query parameter is required, e.g. /api/chat?pane_id=w6:p2' };
@@ -1434,8 +1695,23 @@ async function handleChat(req, res, url) {
     };
   }
 
+  const readerPick = url.searchParams.get('session_id');
+
+  // ── §13.12 item 1, lane 1: the bounded tail road ────────────────────────────
+  // A TAIL read with a memory for this pane is answered HERE, before the first
+  // herdr call, so no page-load burst can queue it behind anything. The resolving
+  // road is started behind the reply (see refreshFromHerdr): §9.3's repair still
+  // runs, herdr's record is still corrected, and the memory is re-endorsed.
+  // A reader pick is never served from memory — the pick is the reader's own
+  // binding and has to be checked against the pane's candidates below.
+  if (tail && !readerPick) {
+    const remembered = await replyFromMemory(res, paneId, limit, mark, clk);
+    if (remembered) { refreshFromHerdr(paneId); return remembered; }
+  }
+
   // 1. herdr's own record of which agent runs in this pane.
   const { agents } = await agentList();
+  mark('agentList');
   const entry = agents.find((a) => a && a.pane_id === paneId);
   if (!entry) {
     const known = await paneInSnapshot(paneId);
@@ -1461,10 +1737,37 @@ async function handleChat(req, res, url) {
   // Round 7.6 (§9) — the pane's LIVE session, decided from the pane itself. From
   // here on `sessionId` is the resolved one: everything below (the file, the
   // cursor, the rows) follows the binding this reply announces.
-  const readerPick = url.searchParams.get('session_id');
-  const live = await liveSessionFor(paneId, entry, agent, herdrSessionId, agents, readerPick);
+  //
+  // §13.12 item 1, lane 2: a claude TAIL read that this process has no memory for
+  // (a cold process, or a memory the local check rejected) gives the scan
+  // SCAN_WAIT_MS. If it overruns, herdr's own record answers — verified locally —
+  // and the scan finishes behind the reply instead of in front of it. A window
+  // read, a reader pick and every hermes pane keep the resolving road below.
+  let live = null;
+  if (tail && agent === 'claude' && !readerPick) {
+    const job = liveSessionFor(paneId, entry, agent, herdrSessionId, agents, null, mark);
+    const raced = await raceDeadline(job, SCAN_WAIT_MS);
+    if (raced === SCAN_TIMEOUT) {
+      job.then(
+        (v) => { rememberBinding(paneId, agent, entry, v); },
+        (e) => { readMemory.delete(paneId); console.log('[hd-chat] ' + JSON.stringify({
+          event: 'chat_background_scan_failed', pane_id: paneId, agent, error: String((e && e.message) || e),
+        })); },
+      );
+      const served = await replyFromHerdrRecord(res, paneId, agent, entry, herdrSessionId, limit, SCAN_WAIT_MS, mark, clk);
+      if (served) return served;
+      // herdr's record does not verify for this pane: nothing may be guessed, so
+      // the scan IS the answer and this request waits for it (the pre-§13.12 road).
+      live = Object.assign({}, await job, { scan: 'fresh' });
+    } else {
+      live = raced;
+    }
+  } else {
+    live = await liveSessionFor(paneId, entry, agent, herdrSessionId, agents, readerPick, mark);
+  }
+  mark('liveSession');
   // §11.3's diagnostic, as a response header rather than a JSON field: §8.2's key
-  // set is frozen (test/chat.mjs asserts it exactly), and this says which of the
+  // set is frozen (the local test suite asserts it exactly), and this says which of the
   // three ways the resolution was obtained — `fresh` (this request ran the cold
   // scan), `joined` (it shared a scan already in flight) or `cached` (a scan within
   // the last CHAT_SESSION_CACHE_MS). The client ignores it; a test can assert that
@@ -1507,6 +1810,7 @@ async function handleChat(req, res, url) {
 
   if (agent === 'claude') {
     const file = chatClaude.findSessionFile(sessionId);
+    mark('findSessionFile');
     if (!file) {
       throw {
         code: 'session_file_missing',
@@ -1516,10 +1820,12 @@ async function handleChat(req, res, url) {
     }
     // The pane's cwd is herdr's, never the client's (same rule as §7.1).
     const known = await paneInSnapshot(paneId);
+    mark('paneSnapshot');
     if (!known.exists || !known.cwd) {
       throw { code: 'pane_not_found', message: `pane "${paneId}" has no cwd in the herdr snapshot` };
     }
     const identity = await chatClaude.verifyCwd(file, known.cwd);
+    mark('verifyCwd');
     if (!identity.ok && identity.reason === 'mismatch') {
       throw {
         code: 'session_cwd_mismatch',
@@ -1538,8 +1844,17 @@ async function handleChat(req, res, url) {
     const win = tail
       ? await chatClaude.readTail(file, limit, working)
       : await chatClaude.readWindow(file, since, limit, working);
+    mark('readTail');
     Object.assign(base, observeBinding(paneId, sessionId, live, win));
-    return chatReply(res, base, { kind: chatClaude.SOURCE_KIND, session_id: sessionId, path: file }, win, tail, since);
+    // §13.12 item 1: this reply was built from a verified binding, so it is what the
+    // tail lane may answer from — with the file it was read from, so the memory does
+    // not have to search for it again. A reply built from the READER's pick is not
+    // remembered: the pick is that request's binding, not the pane's (§9.5), and a
+    // memory of it would keep serving the picked session after the pick is gone.
+    if (!readerPick) rememberBinding(paneId, agent, entry, live, file);
+    const reply = chatReply(res, base, { kind: chatClaude.SOURCE_KIND, session_id: sessionId, path: file }, win, tail, since);
+    if (clk) clk.done({ lane: 'resolved', scan: live.scan, messages: win.messages.length, tail_bytes: win.tailBytes, file_size: win.eof });
+    return reply;
   }
 
   // hermes
@@ -1556,7 +1871,9 @@ async function handleChat(req, res, url) {
     ? chatHermes.readTail(file, sessionId, limit, working)
     : chatHermes.readWindow(file, sessionId, since, limit, working);
   Object.assign(base, observeBinding(paneId, sessionId, live, win));
-  return chatReply(res, base, { kind: chatHermes.SOURCE_KIND, session_id: sessionId, path: file }, win, tail, since);
+  const reply = chatReply(res, base, { kind: chatHermes.SOURCE_KIND, session_id: sessionId, path: file }, win, tail, since);
+  if (clk) clk.done({ lane: 'resolved', agent: 'hermes', scan: live.scan, messages: win.messages.length, records: win.records });
+  return reply;
 }
 
 /**
