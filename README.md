@@ -16,71 +16,55 @@ leaves your machine.
 
 ## Run
 
-Double-click **`herdr-dash.cmd`**. It starts the control console — hidden, on <http://127.0.0.1:7432/> — if it is not
-already up, then opens that page in your browser. `create-shortcut.cmd` puts a "herdr-dash" shortcut on your Desktop
-if you would rather not go looking for the file.
+Double-click **`herdr-dash.cmd`** — or the Desktop shortcut that `create-shortcut.cmd` makes. It starts the **control
+console** hidden on <http://127.0.0.1:7432/> if it is not already up, then opens it. One page, both looking and acting:
 
-The console is one page for both looking and acting:
+- **Status**: running / stopped / started outside this console — port, PID, uptime, herdr's version and protocol, and
+  the tail of the server log, refreshed every couple of seconds.
+- **Start / stop / restart**, and open the app in a new tab. A refusal is shown with the reason it was refused.
+- The app runs detached and hidden, so closing the page stops nothing.
 
-- **Status**: whether the app is running, stopped, or was started outside this console — with its port, PID, uptime,
-  herdr's version and protocol, and the tail of the server log, refreshed every couple of seconds.
-- **Start / stop / restart** the app, and open it in a new tab. A refusal is shown with the reason it was refused.
-- The app is started detached and hidden, so closing the page stops nothing.
-
-There is a command line too, for terminals and scripts:
+The same thing from a terminal:
 
 ```
 node tools/hdctl.js status           # what is running, on which port, and since when
-node tools/hdctl.js start            # start the app (--app-port M to move it off 7433)
-node tools/hdctl.js stop             # stop it, after checking the process really is this app
-node tools/hdctl.js restart
+node tools/hdctl.js start | stop | restart      # --app-port M moves the app off 7433
 ```
 
-`herdr-dash.cmd` hands its arguments straight to that CLI (`herdr-dash.cmd status`), so the exit code and the message
-are the console's own: `0` means the operation happened, anything else is a refusal with the reason. A stop verifies
-that the process on the port is a `node` running `src/server.js` that answers `/api/health` before it kills anything,
-and it never kills by process name.
-
-The app can still be run on its own: `node src/server.js` (or `npm start`, or `--port 8080`).
-
-The old `start.cmd` and `stop.cmd` are gone — the console replaces both, and nothing here needs administrator rights.
+`herdr-dash.cmd status` hands its arguments straight to that CLI: exit `0` means the operation happened, anything else
+is a refusal with the reason. A stop first verifies that the port's process is a `node` running `src/server.js` that
+answers `/api/health`, and it never kills by process name. The app can still be run on its own:
+`node src/server.js [--port 8080]`.
 
 ## Usage
 
 Three columns: the workspace / tab / pane tree on the left, the selected pane in the middle, and a **side dock** on the
 right showing that pane's own usage and background processes.
 
-- **Pick a pane** in the tree (`Ctrl+1..9` or `j` / `k`). `t` switches between the structured **chat view** and the
-  **raw terminal transcript** — both stay available.
-- **Send a prompt** in the box at the bottom: `Enter` sends, `Shift+Enter` adds a newline, and *wait for idle* queues
-  the message until the pane is free. *send text* sends the text literally (verbatim, no newline), which is what menus
-  and REPLs expect.
-- **Attachments**: use the paperclip, drag a file onto the window, or paste. The file is copied into the app's own
-  store — `<app>\_cache\attachments\<pane>\<utc>-name` (set `HD_ATTACH_ROOT` to move it) — and sent to the agent as an
-  absolute path, which the agent opens with its own tools. Failures show the server's own reason; they are never
-  silently dropped.
-- **Console** (bottom): run native `herdr` commands server-side (`cli` mode) or raw RPC — useful when the GUI does not
-  expose something.
-- **Dock** (`d`): the selected pane's own status line (model, tokens, percentage, elapsed) and its background
-  processes. Where the agent elided something with `…`, the dock says so instead of guessing; claude's figures are
-  shown as claude prints them.
-- **Changes view** (`g g`): read-only git status/diff for the directories herdr has panes in.
-- **Copy** (`⧉` on every message, thinking block and tool card): puts that block's **verbatim** text on the clipboard —
-  including text a fold is currently hiding — and reports the true character count. If the browser refuses the
-  clipboard it says so and tells you what to do instead; it never pretends to have copied.
-- **File paths become links**: a path in an agent's output that really exists on this machine is clickable. A **folder**
-  opens in File Explorer and is brought to the front; if a window for that same folder is already open, that window is
-  raised instead of a second one being opened; a **file** offers *Open* (the default program) and *Open File Location*
-  (the containing folder, with the file selected). The click is answered on the page with a short receipt saying what
-  was handed to the system — never a silent nothing. A path that does not exist — including anything the agent elided
-  with `…` — stays plain text: nothing is guessed, and nothing is opened unless you click it.
-- **Selecting text while the stream runs**: pressing the mouse in the chat view freezes the stream where it is — nothing
-  re-renders or scrolls under your cursor while you drag, and no record is lost — then the queued records are added in
-  order when you release. A read that takes a moment says what it is waiting for ("still reading … 4s so far"),
-  reports a timeout as a timeout, and retries on its own instead of parking the panel.
-- **Keys**: `Ctrl+K` command palette · `?` shortcut overlay · `Ctrl+1..9` / `j`,`k` select a pane · `/` focus the
-  prompt · `Esc` closes overlays (sent to a pane only when *esc→pane* is armed) · `g b` board, `g i` inbox, `g p`
-  palette, `g f` fan-out, `g s` search, `g g` changes · `\` collapse/restore the sidebar.
+- **Panes** (`Ctrl+1..9` or `j` / `k`): `t` switches between the structured **chat view** and the raw terminal
+  transcript — both stay available.
+- **Prompts**: `Enter` sends, `Shift+Enter` adds a newline, *wait for idle* queues until the pane is free, and *send
+  text* sends the text verbatim (what menus and REPLs expect).
+- **Attachments**: paperclip, drag-and-drop, or paste. The file is copied to
+  `<app>\_cache\attachments\<pane>\<utc>-name` (`HD_ATTACH_ROOT` moves it) and sent to the agent as an absolute path.
+  Failures show the server's own reason; they are never silently dropped.
+- **Console** (bottom): run native `herdr` commands server-side (`cli` mode) or raw RPC — for what the GUI does not
+  expose.
+- **Dock** (`d`): the pane's own status line (model, tokens, percentage, elapsed) and its background processes. Where
+  the agent elided something with `…`, the dock says so instead of guessing.
+- **Changes** (`g g`): read-only git status/diff for the directories herdr has panes in.
+- **Copy** (`⧉` on every message, thinking block and tool card): that block's **verbatim** text on the clipboard —
+  including text a fold is hiding — with the true character count. If the browser refuses, it says so; it never
+  pretends to have copied.
+- **File paths become links** once the server confirms they exist. A **folder** opens in File Explorer, brought to the
+  front, and an already-open window for that folder is raised instead of opening a second; a **file** offers *Open* and
+  *Open File Location*. The click is answered on the page with a short receipt — never a silent nothing. Anything else,
+  including a path the agent elided with `…`, stays plain text.
+- **Selecting text while the stream runs** freezes the stream under your cursor until you release, then the queued
+  records are added in order. A slow read says what it is waiting for ("still reading … 4s so far"), reports a timeout
+  as a timeout, and retries on its own.
+- **Keys**: `Ctrl+K` palette · `?` shortcuts · `Ctrl+1..9` / `j`,`k` panes · `/` prompt · `Esc` closes overlays ·
+  `g b` board, `g i` inbox, `g p` palette, `g f` fan-out, `g s` search, `g g` changes · `\` collapse the sidebar.
 
 ## What it deliberately does not do
 
@@ -101,12 +85,10 @@ whitelisted actions `open` / `reveal`, refuses cross-origin callers, requires an
 the system with an argv array (never a shell); `POST /api/pathinfo` only stats; the attachment store only ever writes
 inside its own directory.
 
-The control console (`herdr-dash.cmd`, `tools/hdctl.js`) also binds `127.0.0.1` only, on its own port 7432. Its
-start / stop / restart are writes, and they need the per-run token its own page carries in `x-hd-ctl-token` **and** a
-same-origin `Origin` / `Sec-Fetch-Site` — anything else is answered `403` with no action taken, so another page on
-this machine cannot drive it. Its stop only ever kills one PID that passed the same three-way identity check the old
-`stop.cmd` used — a `node(.exe)` whose command line runs `src\server.js`, and an `/api/health` that answers with
-`uptime_ms` — and it never kills by process name (`taskkill /PID`, never `/IM`).
+The control console binds `127.0.0.1:7432` only. Its start / stop / restart are writes and need the per-run token its
+own page carries plus a same-origin check, or they are refused `403` with no action taken, so another page on this
+machine cannot drive it. A stop kills at most one verified PID — a `node(.exe)` whose command line runs
+`src\server.js` and whose `/api/health` answers with `uptime_ms` — never by process name.
 
 ## License
 
