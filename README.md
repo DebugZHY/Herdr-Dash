@@ -16,14 +16,34 @@ leaves your machine.
 
 ## Run
 
+Double-click **`herdr-dash.cmd`**. It starts the control console — hidden, on <http://127.0.0.1:7432/> — if it is not
+already up, then opens that page in your browser. `create-shortcut.cmd` puts a "herdr-dash" shortcut on your Desktop
+if you would rather not go looking for the file.
+
+The console is one page for both looking and acting:
+
+- **Status**: whether the app is running, stopped, or was started outside this console — with its port, PID, uptime,
+  herdr's version and protocol, and the tail of the server log, refreshed every couple of seconds.
+- **Start / stop / restart** the app, and open it in a new tab. A refusal is shown with the reason it was refused.
+- The app is started detached and hidden, so closing the page stops nothing.
+
+There is a command line too, for terminals and scripts:
+
 ```
-node src/server.js            # or: npm start        (start.cmd / stop.cmd on Windows)
-node src/server.js --port 8080
+node tools/hdctl.js status           # what is running, on which port, and since when
+node tools/hdctl.js start            # start the app (--app-port M to move it off 7433)
+node tools/hdctl.js stop             # stop it, after checking the process really is this app
+node tools/hdctl.js restart
 ```
 
-Then open <http://127.0.0.1:7433>. `start.cmd` does the whole thing (probes the port first, never starts a second
-instance, waits for `/api/health`, opens the browser); `stop.cmd` stops only its own instance and tells you what it
-found.
+`herdr-dash.cmd` hands its arguments straight to that CLI (`herdr-dash.cmd status`), so the exit code and the message
+are the console's own: `0` means the operation happened, anything else is a refusal with the reason. A stop verifies
+that the process on the port is a `node` running `src/server.js` that answers `/api/health` before it kills anything,
+and it never kills by process name.
+
+The app can still be run on its own: `node src/server.js` (or `npm start`, or `--port 8080`).
+
+The old `start.cmd` and `stop.cmd` are gone — the console replaces both, and nothing here needs administrator rights.
 
 ## Usage
 
@@ -80,6 +100,13 @@ Requests that change something on disk go through narrow, logged endpoints: `POS
 whitelisted actions `open` / `reveal`, refuses cross-origin callers, requires an existing path, and hands the path to
 the system with an argv array (never a shell); `POST /api/pathinfo` only stats; the attachment store only ever writes
 inside its own directory.
+
+The control console (`herdr-dash.cmd`, `tools/hdctl.js`) also binds `127.0.0.1` only, on its own port 7432. Its
+start / stop / restart are writes, and they need the per-run token its own page carries in `x-hd-ctl-token` **and** a
+same-origin `Origin` / `Sec-Fetch-Site` — anything else is answered `403` with no action taken, so another page on
+this machine cannot drive it. Its stop only ever kills one PID that passed the same three-way identity check the old
+`stop.cmd` used — a `node(.exe)` whose command line runs `src\server.js`, and an `/api/health` that answers with
+`uptime_ms` — and it never kills by process name (`taskkill /PID`, never `/IM`).
 
 ## License
 
