@@ -44,7 +44,9 @@
  *
  * ADDITIVE FIELDS beyond the frozen shape, because honesty needs them and extra keys break
  * no reader: `app.why`, `app.orphan`, `app.record_state`, `app.record_note`, `app.herdr.error`,
- * `app.listener_pids`; `log.name`, `log.mine`, `log.from`, `log.files`, `log.server_log`
+ * `app.herdr.explain` (a herdr failure already turned into words: {kind,short,hint,raw} —
+ * see tools/herdr-error-text.js), `app.listener_pids`; `log.name`, `log.mine`, `log.from`,
+ * `log.files`, `log.server_log`
  * (whether the frozen path `server.log` resolves, and why not when it does not); and
  * `stopped_pid` in a CLI stop answer. `log.path` is the file the tail really came from.
  *
@@ -71,6 +73,9 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn, spawnSync } = require('node:child_process');
+// Every herdr/pipe failure shown to a person goes through this (see the file's header):
+// it turns `connect EPERM \\.\pipe\...` into a sentence plus the thing to do about it.
+const { explainHerdrError, isHerdrErrorText } = require('./herdr-error-text');
 
 // --------------------------------------------------------------------------- constants
 
@@ -465,8 +470,15 @@ async function statusPayload(appPort) {
     started_by: null,
   };
   if (state === 'running' && app.herdr.version === null) {
-    app.herdr.error = (health.json && health.json.error && (health.json.error.message || health.json.error.code))
+    // `error` keeps its old meaning and type (a string): readers built against it must not
+    // notice this change. `explain` is the addition — the same failure already classified,
+    // so the page and the CLI have words for the user instead of an errno (see
+    // tools/herdr-error-text.js). The classifier reads whichever shape the app sent:
+    // {kind,errno,message} once src/server.js carries them, or today's {code,message}.
+    const herdrError = (health.json && health.json.error) || null;
+    app.herdr.error = (herdrError && (herdrError.message || herdrError.code))
       || 'the app answered without a herdr version (herdr may be unreachable)';
+    app.herdr.explain = explainHerdrError(herdrError || { message: app.herdr.error });
   }
   if (state === 'foreign' || state === 'stopped') app.why = why;
 
@@ -748,6 +760,9 @@ function page({ ctlPort, appPort, token }) {
   header { padding:14px 18px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; }
   h1 { font-size:16px; margin:0; font-weight:600; }
   .dim { color:var(--dim); }
+  /* The second line under a value: the explanation, always visible, never behind a hover. */
+  .hint { display:block; margin-top:2px; color:var(--dim); }
+  .hint.action { color:var(--warn); }
   main { padding:18px; display:flex; flex-direction:column; gap:14px; max-width:1100px; }
   section.card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px 16px; }
   .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
@@ -794,7 +809,7 @@ function page({ ctlPort, appPort, token }) {
       <dt>pid</dt><dd id="fPid">…</dd>
       <dt>uptime</dt><dd id="fUptime">…</dd>
       <dt>started by</dt><dd id="fBy">…</dd>
-      <dt>herdr</dt><dd id="fHerdr">…</dd>
+      <dt>herdr</dt><dd><span id="fHerdr">…</span><span class="hint" id="fHerdrHint"></span><span class="hint dim" id="fHerdrRaw"></span></dd>
       <dt>log</dt><dd id="fLog">…</dd>
     </dl>
     <div class="row" style="margin-top:14px">
@@ -830,6 +845,13 @@ function page({ ctlPort, appPort, token }) {
   var currentTail = 30;
 
   function $(id) { return document.getElementById(id); }
+
+  // A visible second line under a value. Empty text hides the line so no stray gap is left.
+  function setHint(id, text, action) {
+    var el = $(id);
+    el.textContent = text || '';
+    el.className = 'hint' + (id === 'fHerdrRaw' ? ' dim' : '') + (action ? ' action' : '');
+  }
 
   function fmtUptime(ms) {
     if (typeof ms !== 'number' || !isFinite(ms)) return '—';
@@ -877,9 +899,25 @@ function page({ ctlPort, appPort, token }) {
     else if (app.started_by === 'external') $('fBy').textContent = 'started outside this console — its output is NOT written by hdctl, so the log shown below may belong to another run';
     else $('fBy').textContent = '—';
     var h = app.herdr || {};
-    if (h.version || h.protocol) $('fHerdr').textContent = 'v' + h.version + ' · protocol ' + h.protocol;
-    else if (h.error) $('fHerdr').textContent = 'unknown — ' + h.error;
-    else $('fHerdr').textContent = app.state === 'running' ? 'unknown — the health answer carries no herdr figures' : '—';
+    var ex = h.explain || null;                 // the failure already turned into words
+    if (h.version || h.protocol) {
+      $('fHerdr').textContent = 'v' + h.version + ' · protocol ' + h.protocol;
+      setHint('fHerdrHint', '', false);
+      setHint('fHerdrRaw', '', false);
+    } else if (ex) {
+      $('fHerdr').textContent = ex.short;
+      setHint('fHerdrHint', ex.hint, ex.kind === 'denied');
+      // The raw errno is kept as dim secondary text — never instead of the explanation.
+      setHint('fHerdrRaw', (ex.raw && ex.raw !== ex.hint) ? ex.raw : '', false);
+    } else if (h.error) {
+      $('fHerdr').textContent = 'unknown — ' + h.error;
+      setHint('fHerdrHint', '', false);
+      setHint('fHerdrRaw', '', false);
+    } else {
+      $('fHerdr').textContent = app.state === 'running' ? 'unknown — the health answer carries no herdr figures' : '—';
+      setHint('fHerdrHint', '', false);
+      setHint('fHerdrRaw', '', false);
+    }
     $('fLog').textContent = (log.path || '—') + ' · ' + fmtBytes(log.size) + (log.rotated ? ' · previous run kept as server.log.1' : '')
       + (log.mine ? '' : (app.state === 'running' || app.orphan ? ' · not written by this console' : ''))
       + (log.server_log && log.server_log.exists && !log.server_log.is_read_file ? ' · ' + log.server_log.note : '');
@@ -1158,7 +1196,15 @@ async function main() {
     emit(st);
     const a = st.app;
     say('port ' + appPort + ': ' + a.state + (a.state === 'foreign' ? ' — ' + a.why : '') + (a.pid ? ' · pid ' + a.pid : '') + (a.started_by ? ' · started_by ' + a.started_by : ''));
-    if (a.state === 'running') say('herdr ' + (a.herdr.version ? 'v' + a.herdr.version + ' protocol ' + a.herdr.protocol : 'unknown (' + (a.herdr.error || 'no figures') + ')') + ' · uptime ' + Math.floor(a.uptime_ms / 1000) + 's · log ' + st.log.name + ' (' + st.log.size + ' bytes' + (st.log.mine ? '' : ', NOT written by hdctl') + ')');
+    if (a.state === 'running') {
+      // Same words as the page: the reason on one line, what to do about it on the next.
+      if (a.herdr.version) {
+        say('herdr v' + a.herdr.version + ' protocol ' + a.herdr.protocol + ' · uptime ' + Math.floor(a.uptime_ms / 1000) + 's · log ' + st.log.name + ' (' + st.log.size + ' bytes' + (st.log.mine ? '' : ', NOT written by hdctl') + ')');
+      } else {
+        say((a.herdr.explain ? a.herdr.explain.short : 'herdr unknown (' + (a.herdr.error || 'no figures') + ')') + ' · uptime ' + Math.floor(a.uptime_ms / 1000) + 's · log ' + st.log.name + ' (' + st.log.size + ' bytes' + (st.log.mine ? '' : ', NOT written by hdctl') + ')');
+        if (a.herdr.explain) say('    ' + a.herdr.explain.hint);
+      }
+    }
     if (a.orphan) say('orphan: ' + a.record_note);
     return 0;
   }
@@ -1181,6 +1227,16 @@ async function main() {
   if (result.log_tail && result.log_tail.length) {
     say('last lines of ' + (result.log_name || st.log.name) + ':');
     for (const l of result.log_tail) process.stderr.write('    ' + l + '\n');
+  }
+  // The app's own log is shown verbatim above — but when those lines carry a herdr pipe
+  // failure, the user is looking at the same errno the page used to show, so say what it
+  // means and what to do, once, in the same words. Only that one case is summarised;
+  // unrelated log noise is left alone.
+  const herdrLine = (result.log_tail || []).find(isHerdrErrorText);
+  if (herdrLine) {
+    const ex = explainHerdrError({ code: 'pipe_error', message: herdrLine });
+    say('herdr: ' + ex.short);
+    say('    ' + ex.hint);
   }
   return result.ok ? 0 : 1;
 }

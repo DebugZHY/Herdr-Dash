@@ -35,12 +35,54 @@ const pipe = '\\\\.\\pipe\\' + (process.env.HERDR_SOCKET_PATH
 // ── errors ──────────────────────────────────────────────────────────────────
 // `code` is either herdr's own code (e.g. "pane_not_found", "invalid_request")
 // or one of ours: "timeout", "pipe_error", "pipe_closed".
+//
+// A `pipe_error` carries three extra READ-ONLY fields describing WHY the OS
+// refused the connection. They exist so callers can tell the two very different
+// failures apart without pattern-matching a message:
+//
+//   kind  'denied'  (EPERM/EACCES)  the pipe exists but our token may not open
+//                                   it — on this machine that means the herdr
+//                                   server runs ELEVATED (High integrity) and
+//                                   we do not (Medium). The fix is to elevate.
+//   kind  'missing' (ENOENT)        no pipe with that name — herdr is not
+//                                   running (or HERDR_SOCKET_PATH is wrong).
+//                                   The fix is to start herdr.
+//   kind  'other'                   anything else, incl. ENOTSOCK (a regular
+//                                   file sits at the bare path).
+//   errno the OS errno string, e.g. 'EPERM'
+//   pipe  the pipe path that was attempted
+//
+// They stay null on every other HerdrError (timeout, pipe_closed, herdr's own
+// error codes): those never touched a failing socket.
 class HerdrError extends Error {
   constructor(code, message) {
     super(message);
     this.name = 'HerdrError';
     this.code = code || 'herdr_error';
+    this.kind = null;
+    this.errno = null;
+    this.pipe = null;
   }
+}
+
+/**
+ * Classify a socket error's errno into the three-way `kind` above.
+ * Node always sets `err.code` to the errno STRING on Windows pipe failures
+ * ('EPERM', 'ENOENT', ...); `err.errno` is the numeric libuv code (-4048, ...),
+ * so prefer the string and never leak the number into the public field.
+ */
+function errnoOf(err) {
+  if (err) {
+    if (typeof err.code === 'string' && err.code) return err.code;
+    if (typeof err.errno === 'string' && err.errno) return err.errno;
+  }
+  return null;
+}
+
+function kindOf(errno) {
+  if (errno === 'EPERM' || errno === 'EACCES') return 'denied';
+  if (errno === 'ENOENT') return 'missing';
+  return 'other';
 }
 
 let seq = 0;
@@ -94,7 +136,13 @@ function request(method, params, opts) {
       }
     });
     socket.on('error', (err) => {
-      fail(new HerdrError('pipe_error', `herdr pipe error on ${method}: ${err.message}`));
+      // The message text is part of the /api/health contract and of hdctl.js's
+      // fallback parse — keep the wording, add the classification alongside it.
+      const e = new HerdrError('pipe_error', `herdr pipe error on ${method}: ${err.message}`);
+      e.errno = errnoOf(err);
+      e.kind = kindOf(e.errno);
+      e.pipe = pipe;
+      fail(e);
     });
     socket.on('close', () => {
       if (settled) return;

@@ -306,7 +306,24 @@ async function handleHealth(req, res) {
     });
   } catch (e) {
     const m = herdrError(e);
-    err(res, m.code, m.message, { pipe: hdr.pipe, uptime_ms: Date.now() - STARTED_AT });
+    // `err()` merges `extra` at the TOP level, so passing an `error` key here
+    // REPLACES the {code,message} it just built — the whole object is spelled
+    // out for that reason. `code` and `message` are unchanged (hdctl.js parses
+    // `message` as its fallback), and the existing top-level `pipe`/`uptime_ms`
+    // are kept. `error.pipe`, `error.kind` and `error.errno` are additive: they
+    // let a caller tell an access-denied pipe (herdr elevated, we are not) from
+    // a missing one without pattern-matching the message.
+    err(res, m.code, m.message, {
+      pipe: hdr.pipe,
+      uptime_ms: Date.now() - STARTED_AT,
+      error: {
+        code: m.code,
+        message: m.message,
+        pipe: hdr.pipe,
+        kind: (e && e.kind) || null,
+        errno: (e && e.errno) || null,
+      },
+    });
   }
 }
 

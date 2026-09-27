@@ -11,22 +11,34 @@ rem Running this twice is harmless: if the shortcut is already there and already
 rem correct it is left exactly as it is; if it points somewhere else (the folder was
 rem moved) it is repaired. Nothing is created outside your own Desktop, no
 rem administrator rights are needed, and no dialog is shown either way.
+rem
+rem This shortcut does NOT elevate: it is a normal shortcut at your own level, and
+rem elevation is your right-click on herdr-dash.cmd itself.
+rem
+rem The work itself is in tools\create-shortcut.ps1, which is where the Desktop
+rem path and the created / repaired / already-correct wording live. That helper
+rem takes -LnkPath, so it can be run against a temp path without touching a real
+rem Desktop; this launcher never passes it, so a plain double-click only ever
+rem writes to the Desktop it asks Windows for.
+rem
+rem THIS FILE IS CRLF ON PURPOSE. cmd finds a goto's label by scanning the file, and
+rem a .cmd whose lines end in a bare LF loses its place once the file grows - measured
+rem on herdr-dash.cmd, whose label lookup then failed with "cannot find the batch".
+rem Keep every line under 200 characters for the same reason. Both are enforced here
+rem deliberately; see the note in tools\create-shortcut.ps1 for the inline PowerShell
+rem this file used to carry as one 1093-character line.
 rem ---------------------------------------------------------------------------
 setlocal EnableExtensions
 cd /d "%~dp0"
 set "PAUSE=1"
 if /i "%~1"=="--no-pause" set "PAUSE=0"
-set "HD_DIR=%~dp0"
 
 if not exist "herdr-dash.cmd" goto no_launcher
 
-rem The Desktop is asked for, not assumed: on many machines it is redirected into
-rem OneDrive, and %USERPROFILE%\Desktop would then be the wrong folder (or absent).
-rem The shortcut is read back before it is written, so this can say honestly whether
-rem it created one, repaired one, or found one already correct.
-set "PS=$d=[Environment]::GetFolderPath('Desktop'); if (-not $d) { Write-Host '[herdr-dash] could not find your Desktop folder - nothing was created.'; exit 1 }; $lnk=Join-Path $d 'herdr-dash.lnk'; $t=Join-Path $env:HD_DIR 'herdr-dash.cmd'; $w=New-Object -ComObject WScript.Shell; $had=$false; $old=''; if (Test-Path -LiteralPath $lnk) { $had=$true; $old=$w.CreateShortcut($lnk).TargetPath }; $s=$w.CreateShortcut($lnk); $s.TargetPath=$t; $s.WorkingDirectory=$env:HD_DIR; $s.Description='herdr-dash - control console for the herdr dashboard'; $s.WindowStyle=1; $s.Save(); if ($had -and $old -eq $t) { Write-Host '[herdr-dash] the shortcut is already there and already correct - left unchanged.' } elseif ($had) { Write-Host ('[herdr-dash] repaired the existing shortcut (it pointed at ' + $old + ').') } else { Write-Host '[herdr-dash] created the shortcut.' }; Write-Host ('[herdr-dash]   shortcut: ' + $lnk); Write-Host ('[herdr-dash]   target:   ' + $t); Write-Host ('[herdr-dash]   start in: ' + $env:HD_DIR); Write-Host '[herdr-dash] double-click it to open the control console.'; exit 0"
-rem No -ExecutionPolicy Bypass: it only governs .ps1 FILES, and this runs inline code.
-powershell -NoProfile -Command "%PS%"
+rem No -ExecutionPolicy Bypass: it only concerns .ps1 FILES, and the default policy
+rem already runs the helpers this project ships (tools\elevate-self.ps1 is invoked
+rem the same way), so nothing here needs it.
+powershell -NoProfile -File "tools\create-shortcut.ps1"
 set "RC=%errorlevel%"
 if not "%RC%"=="0" goto failed
 
