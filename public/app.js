@@ -2418,6 +2418,68 @@ function runSelfTest() {
         'openedBefore=' + a3Opened + ' messages=' + a3State.messages +
         ' mapHasTrimmedId=' + Object.prototype.hasOwnProperty.call(chat.openKeys(A3_R), 'selftest-old#think0'));
 
+      /* (n) the reader's position INSIDE a block that has its own scrollbar. Two halves have to hold
+         on their own: the browser's scroll event is what writes the position into the pane's map (and
+         it lands after this synchronous task, so nothing may lean on it having already landed), and a
+         redraw must put the reader back no matter what. The defect: the box scrolls on its own, the
+         reader drags it, a record arrives, the turn is redrawn — and the box came back at the top. */
+      const N_P = 'selftest:p13';
+      const N_FIRST = 'SELFTEST-SCROLL-FIRST: the head of a reply long enough to scroll on its own';
+      const nLong = [N_FIRST]
+        .concat(Array.from({ length: 300 }, (_, i) => 'SELFTEST-SCROLL line ' + (i + 1))).join('\n');
+      const N_CTL = 'selftest-scroll-a#text';
+      const nCtl = (id) => a3Ctl(id);
+      const nBox = (id) => a3Body(nCtl(id));
+      chat.setAuto(false);
+      chat.setStatus(N_P, 'idle');
+      chat.setPane(N_P);
+      chat.ingest(N_P, { ok: true, pane_id: N_P, agent: 'claude', cursor: 1, truncated: false, skipped: 0,
+        unknown_records: 0, messages: [
+          { key: 'selftest-scroll-u', ts: t0, role: 'user', kind: 'text', sidechain: false,
+            text: 'selftest: a prompt whose reply is far too long for one screen' },
+          { key: 'selftest-scroll-a', ts: t0 + 1000, role: 'assistant', kind: 'text', sidechain: false,
+            text: nLong }
+        ] });
+      const nClosed = nCtl(N_CTL);
+      const nClosedAria = nClosed ? nClosed.getAttribute('aria-expanded') : null;
+      if (nClosed) nClosed.click();
+      const nOpenCtl = nCtl(N_CTL);   // re-found: the click re-rendered the node, so nClosed is stale
+      const nOpenBox = nBox(N_CTL);
+      check('(n) the long block is a real scroll region and starts closed',
+        !!nClosed && nClosedAria === 'false' && !!nOpenCtl &&
+        nOpenCtl.getAttribute('aria-expanded') === 'true' &&
+        !!nOpenBox && nOpenBox.scrollHeight > nOpenBox.clientHeight + 50,
+        'ctl=' + !!nClosed + ' ariaBefore=' + nClosedAria + ' ariaAfter=' + (nOpenCtl && nOpenCtl.getAttribute('aria-expanded')) +
+        ' scrollHeight=' + (nOpenBox && nOpenBox.scrollHeight) + ' clientHeight=' + (nOpenBox && nOpenBox.clientHeight));
+      if (nOpenBox) nOpenBox.scrollTop = 200;
+      const nAt200 = nOpenBox ? nOpenBox.scrollTop : null;
+      check('(n) setting the position alone records nothing: the map is written by the listener, not by the assignment',
+        nAt200 === 200 && Object.keys(chat.scrollKeys(N_P)).length === 0,
+        'readBack=' + nAt200 + ' map=' + JSON.stringify(chat.scrollKeys(N_P)));
+      if (nOpenBox) nOpenBox.setAttribute('data-selftest-probe', '1');
+      chat.ingest(N_P, { ok: true, cursor: 2, truncated: false, skipped: 0, unknown_records: 0,
+        messages: [{ key: 'selftest-scroll-t', ts: t0 + 2000, role: 'assistant', kind: 'thinking',
+          sidechain: false, text: 'selftest: a record that arrives while the reader is scrolled inside the long block' }] });
+      const nProbes = document.querySelectorAll('#hdChatList [data-selftest-probe]').length;
+      check('(n) the redraw really happened: the marked block node was detached',
+        nProbes === 0, 'probes=' + nProbes);
+      const nKeptCtl = nCtl(N_CTL);
+      const nKeptBox = nBox(N_CTL);
+      check('(n) the reader\'s position inside the open block survives the redraw even when no scroll event has landed yet',
+        !!nKeptCtl && nKeptCtl.getAttribute('aria-expanded') === 'true' && !!nKeptBox && nKeptBox.scrollTop === 200,
+        'aria=' + (nKeptCtl && nKeptCtl.getAttribute('aria-expanded')) + ' scrollTop=' + (nKeptBox && nKeptBox.scrollTop));
+      const nKeys = Object.keys(chat.scrollKeys(N_P));
+      check('(n) the position is per record: the map key names the record that owns the block',
+        nKeys.length === 1 && nKeys[0].indexOf('selftest-scroll-a') === 0,
+        'keys=' + JSON.stringify(nKeys));
+      if (nKeptBox) nKeptBox.scrollTop = 120;
+      if (nKeptBox) nKeptBox.dispatchEvent(new Event('scroll'));
+      const nMap6 = chat.scrollKeys(N_P);
+      const nKeys6 = Object.keys(nMap6);
+      check('(n) a landed scroll event is recorded by the list\'s own listener (the browser\'s async event, delivered here)',
+        nKeys6.length === 1 && nMap6[nKeys6[0]] === 120,
+        'map=' + JSON.stringify(nMap6));
+
       /* leave the page readable: raw transcript on screen, the user's stored preference restored */
       chat.setStatus(null, null);
       chat.setPane('selftest:p1');

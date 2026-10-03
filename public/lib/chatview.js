@@ -916,6 +916,10 @@
              otherwise start open). A3.1: a FALSE entry is the reader speaking, so the map is read
              with hasOwnProperty and an entry is never deleted merely for being falsy. */
           openKeys: {},
+          /* `openScroll` keeps the reader's position inside each scroll region (a box's key -> its
+             scrollTop). A redraw replaces the box node, so a position that is not remembered here
+             is lost with it — a fresh element starts at the top. */
+          openScroll: {},
           /* §8.2 tail mode: `tailChecked` = the first (tail) response was seen; `tailMode` = the
              server really answered from the tail; `verifyTail` = one forward call is pending */
           tailChecked: false, tailMode: null, verifyTail: false,
@@ -1218,6 +1222,16 @@
           }
           if (!kept) delete st.openKeys[ok];
         }
+        /* a remembered scroll position belongs to a box of a record, so it is dropped by the same
+           rule — a box key starts with its message key, so the record's prefix is the test. */
+        for (var sk in st.openScroll) {
+          if (!Object.prototype.hasOwnProperty.call(st.openScroll, sk)) continue;
+          var keptScroll = false;
+          for (var sli = 0; sli < liveIds.length && !keptScroll; sli++) {
+            keptScroll = (sk === liveIds[sli]) || (sk.indexOf(liveIds[sli] + '|') === 0);
+          }
+          if (!keptScroll) delete st.openScroll[sk];
+        }
 
         /* §8.2 tail mode (W1). A tail response carries the cursor at EOF, so `truncated` there means
            "older records exist BEFORE this window" and must NOT start a forward walk. A server
@@ -1390,6 +1404,7 @@
       if (st && st.rendered) {
         for (var i = 0; i < st.rendered.length; i++) {
           var n = st.rendered[i].node;
+          if (n) harvestScroll(st, n);                // read the positions before the node goes
           if (n && n.parentNode) n.parentNode.removeChild(n);
         }
         st.rendered = [];
@@ -1398,7 +1413,10 @@
       }
       var sel = '.hd-cv-turn, .chat-turn, .hd-cv-msg, .chat-msg, .chat-pending, .chat-looserec';
       var stray = listEl.querySelectorAll(sel);
-      for (var j = stray.length - 1; j >= 0; j--) if (stray[j].parentNode) stray[j].parentNode.removeChild(stray[j]);
+      for (var j = stray.length - 1; j >= 0; j--) {
+        harvestScroll(st, stray[j]);                  // read the positions before the node goes
+        if (stray[j].parentNode) stray[j].parentNode.removeChild(stray[j]);
+      }
     }
 
     /* ── A1: turns, not messages, are the DOM unit ────────────────────────────────────────────
@@ -1524,6 +1542,7 @@
       while (st.rendered.length && st.rendered[st.rendered.length - 1].from >= from) {
         var g = st.rendered.pop();
         if (g.node === st.workingNode) st.workingNode = null;
+        if (g.node) harvestScroll(st, g.node);        // read the positions before the node goes
         if (g.node && g.node.parentNode) g.node.parentNode.removeChild(g.node);
       }
     }
@@ -1531,6 +1550,7 @@
       while (st.rendered.length > 1 && st.rendered[0].to <= floor) {
         var g = st.rendered.shift();
         if (g.node === st.workingNode) st.workingNode = null;
+        if (g.node) harvestScroll(st, g.node);        // read the positions before the node goes
         if (g.node && g.node.parentNode) g.node.parentNode.removeChild(g.node);
       }
     }
@@ -1737,6 +1757,59 @@
       return true;
     }
 
+    /* every scroll region a block can hold — the boxes chatview.css gives `overflow: auto` with a
+       height cap, so each of them shows its own slider and can be scrolled by the reader */
+    var SCROLL_BOXES = '.hd-cv-body, .hd-cv-resbox, .hd-cv-res, .hd-cv-json, .hd-cv-think-body, ' +
+                       '.hd-cv-card-body';
+
+    /** the stable name of one scroll region: its message's key, its first class (the block kind)
+        and its ordinal among the same-class boxes of that message. Derived from the DOM on demand
+        and never parsed back apart, because a message key may itself contain the separators. */
+    function boxKey(box) {
+      var node = (box && box.closest) ? box.closest('.hd-cv-msg, .chat-msg') : null;
+      var mk = node && node.getAttribute ? node.getAttribute('data-key') : null;
+      if (!mk) return null;                          // a node without a key cannot be remembered
+      var cls = (box.classList && box.classList.length) ? box.classList[0] : '';
+      if (!cls) return null;
+      var same = node.querySelectorAll('.' + cls);
+      for (var i = 0; i < same.length; i++) {
+        if (same[i] === box) return mk + '|' + cls + '#' + i;
+      }
+      return null;                                   // not a descendant of this node after all
+    }
+
+    /** read the reader's live position out of every scroll box under `root` BEFORE its node is torn
+        down. A scroll event is delivered only after the task that changed the position, so a redraw
+        that runs first would find nothing in the map — the DOM itself is therefore read at the
+        moment it is about to be replaced. Only a position below the top is kept: a fresh box starts
+        at the top, so "no entry" already means "the top" and the map then holds exactly the boxes
+        the reader has scrolled away from the top. */
+    function harvestScroll(st, root) {
+      if (!st || !st.openScroll || !root || !root.querySelectorAll) return;
+      var boxes = root.querySelectorAll(SCROLL_BOXES);
+      for (var i = 0; i < boxes.length; i++) {
+        var key = boxKey(boxes[i]);
+        if (!key) continue;
+        if (boxes[i].scrollTop > 0) st.openScroll[key] = boxes[i].scrollTop;
+        else delete st.openScroll[key];
+      }
+    }
+
+    /** put the reader back where they were in every box the fresh `root` brought with it. A box
+        that is hidden has no position to restore yet, and a saved 0 needs no write — the element
+        already starts there. */
+    function syncScroll(st, root) {
+      if (!st || !st.openScroll || !root || !root.querySelectorAll) return;
+      var boxes = root.querySelectorAll(SCROLL_BOXES);
+      for (var i = 0; i < boxes.length; i++) {
+        var box = boxes[i];
+        if (box.hidden === true) continue;
+        var key = boxKey(box);
+        var top = key ? st.openScroll[key] : null;
+        if (typeof top === 'number' && top > 0) box.scrollTop = top;
+      }
+    }
+
     /** every message node a freshly rendered group put on screen, in one pass: A2's folds and A3's
         opens are both re-applied here, so a record that is redrawn (append, refresh, loadWhole,
         pane switch) comes back exactly as the reader left it */
@@ -1744,11 +1817,13 @@
       if (!st || !root || !root.querySelectorAll) return;
       var nodes = root.querySelectorAll('.hd-cv-msg, .chat-msg');
       for (var i = 0; i < nodes.length; i++) { ensureFold(st, nodes[i]); syncOpen(st, nodes[i]); }
+      syncScroll(st, root);                          // and the reader's position inside each box
     }
 
     /** re-draw ONE message through the active renderer (its own folded form), keeping the classes
         this module and A1 put on the node so the redraw cannot lose "reply" or "interim" */
     function rerenderOne(st, node, m) {
+      harvestScroll(st, node);                       // the position this node holds before it is replaced
       var frag = renderMessages([m], renderOpts(st));
       var fresh = frag && frag.firstChild;
       if (!fresh || fresh.nodeType !== 1) return null;
@@ -1901,6 +1976,7 @@
         if (node) {
           syncOpen(st, node);      // repair, for a renderer that does not read the map
           ensureFold(st, node);    // A2 hinges on this node as well: keep its folded look
+          syncScroll(st, node);    // the reopened box comes back at the reader's position
         }
         return open;
       });
@@ -2119,6 +2195,24 @@
       follow = dist <= stickPx();
       if (follow) newCount = 0;
       updateJump();                     // pinned -> hidden; unpinned -> "N new ↓" / "jump to latest ↓"
+    }
+    /* a scroll INSIDE a box does not bubble, so this is one listener on the list in the capture
+       phase (the box does not exist yet at mount time, and there is one per block). The panel's own
+       scroller is excluded: it has onScroll. Only a position below the top is kept — a fresh box
+       starts at the top, so dropping the entry when the reader returns there is what keeps an older
+       value from pulling them back down when the message is redrawn. */
+    function onListScroll(e) {
+      try {
+        var box = e.target;
+        if (!box || box === listEl) return;
+        var key = boxKey(box);
+        if (!key) return;
+        var id = currentPaneId();
+        if (!id) return;
+        var st = paneState(id);
+        if (box.scrollTop > 0) st.openScroll[key] = box.scrollTop;
+        else delete st.openScroll[key];
+      } catch (err) { /* a reader's scroll must never break the view */ }
     }
 
     function renderAll() {
@@ -2551,6 +2645,7 @@
     document.addEventListener('visibilitychange', onFreezeVisibility);
 
     scrollEl.addEventListener('scroll', onScroll);
+    listEl.addEventListener('scroll', onListScroll, true);   // capture: inner box scrolls do not bubble
     listEl.addEventListener('click', onListClick);
     jumpBtn.addEventListener('click', function () { scrollToBottom(); });
     olderBtn.addEventListener('click', function () { loadOlder(); });
@@ -2652,6 +2747,7 @@
         try { if (pathApi && pathApi.unmount) pathApi.unmount(); } catch (e) { /* gone */ }
         document.removeEventListener('keydown', onKey);
         scrollEl.removeEventListener('scroll', onScroll);
+        listEl.removeEventListener('scroll', onListScroll, true);
         listEl.removeEventListener('click', onListClick);
         clearReqTimer();                             // DEFECT-18(2): no timer outlives the mount
         if (pollTimer) { window.clearInterval(pollTimer); pollTimer = null; }
@@ -2693,6 +2789,8 @@
         for (var k in st.openKeys) if (Object.prototype.hasOwnProperty.call(st.openKeys, k)) out[k] = !!st.openKeys[k];
         return out;
       },
+      /* the pane's remembered positions inside scrollable blocks (box key -> scrollTop) */
+      __scrollKeys: function (id) { return paneState(id || currentPaneId()).openScroll; },
       __messages: function (id) { return paneState(id || currentPaneId()).messages.slice(); },
       __tick: function (nowMs) { return pendingTick(typeof nowMs === 'number' ? nowMs : Date.now()); },
       /* DEFECT-12 seams: the latch is an object with a clock, so a test can age it and watch the
@@ -2876,6 +2974,7 @@
       messages: function (id) { return handle ? handle.__messages(id) : []; },
       foldKeys: function (id) { return handle ? handle.__foldKeys(id) : []; },
       openKeys: function (id) { return handle ? handle.__openKeys(id) : {}; },
+      scrollKeys: function (id) { return handle ? handle.__scrollKeys(id) : {}; },
       state: function () { return handle ? handle.state() : null; },
       dom: function () { return handle ? handle.__dom() : null; },
       renderer: rendererName,
