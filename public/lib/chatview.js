@@ -920,6 +920,11 @@
              scrollTop). A redraw replaces the box node, so a position that is not remembered here
              is lost with it — a fresh element starts at the top. */
           openScroll: {},
+          /* the reader's position of the panel scroller itself, or null when there is none to
+             restore. A block keeps a position of its own; this is the panel, which a full render
+             rebuilds from scratch. Meaningful only while the view is unpinned: a pinned reader asked
+             for the tail, so a re-render must land at the bottom and this must not fight it. */
+          panelTop: null,
           /* §8.2 tail mode: `tailChecked` = the first (tail) response was seen; `tailMode` = the
              server really answered from the tail; `verifyTail` = one forward call is pending */
           tailChecked: false, tailMode: null, verifyTail: false,
@@ -2194,6 +2199,11 @@
       var dist = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
       follow = dist <= stickPx();
       if (follow) newCount = 0;
+      /* remember the panel's place for a later full render: a pinned view keeps none (that render
+         must land at the tail), an unpinned one keeps its exact offset — 0 is a real position. */
+      var pid = currentPaneId();
+      var st = pid ? paneState(pid) : null;
+      if (st) st.panelTop = follow ? null : scrollEl.scrollTop;
       updateJump();                     // pinned -> hidden; unpinned -> "N new ↓" / "jump to latest ↓"
     }
     /* a scroll INSIDE a box does not bubble, so this is one listener on the list in the capture
@@ -2218,6 +2228,9 @@
     function renderAll() {
       var id = currentPaneId();
       var st = id ? paneState(id) : null;
+      /* read the panel's live offset before the list is emptied, but only when it is really laid
+         out: a host that is still hidden reports 0, which would erase a good remembered position. */
+      if (st && !follow && scrollEl.clientHeight > 0) st.panelTop = scrollEl.scrollTop;
       clearMessages(st);
       if (st) {
         st.expanded = st.expanded || false;
@@ -2230,7 +2243,14 @@
       renderPendings(st);
       renderState(st);
       renderStatus(st);
-      if (follow) scrollToBottom(); else updateJump();
+      if (follow) scrollToBottom();
+      else {
+        if (st && st.panelTop !== null) {
+          scrollEl.scrollTop = st.panelTop;              // the same records under the reader's eyes
+          follow = (scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight) <= stickPx();
+        }
+        updateJump();
+      }
       decoratePaths();                             // §13.2.1: the whole list, after a full render
     }
 
@@ -2791,6 +2811,8 @@
       },
       /* the pane's remembered positions inside scrollable blocks (box key -> scrollTop) */
       __scrollKeys: function (id) { return paneState(id || currentPaneId()).openScroll; },
+      /* the panel scroller's remembered position for this pane, or null when there is none */
+      __panelTop: function (id) { return paneState(id || currentPaneId()).panelTop; },
       __messages: function (id) { return paneState(id || currentPaneId()).messages.slice(); },
       __tick: function (nowMs) { return pendingTick(typeof nowMs === 'number' ? nowMs : Date.now()); },
       /* DEFECT-12 seams: the latch is an object with a clock, so a test can age it and watch the
@@ -2975,6 +2997,7 @@
       foldKeys: function (id) { return handle ? handle.__foldKeys(id) : []; },
       openKeys: function (id) { return handle ? handle.__openKeys(id) : {}; },
       scrollKeys: function (id) { return handle ? handle.__scrollKeys(id) : {}; },
+      panelTop: function (id) { return handle ? handle.__panelTop(id) : null; },
       state: function () { return handle ? handle.state() : null; },
       dom: function () { return handle ? handle.__dom() : null; },
       renderer: rendererName,

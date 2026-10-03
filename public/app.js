@@ -2480,6 +2480,70 @@ function runSelfTest() {
         nKeys6.length === 1 && nMap6[nKeys6[0]] === 120,
         'map=' + JSON.stringify(nMap6));
 
+      /* (o) the PANEL's own scroller, not a box inside a message: the reader parks it up the log, the
+         view is rebuilt (a mode round trip clears and redraws the whole list), and the same records
+         must still be under their eyes. A reader sitting at the tail is the other half: the pin is
+         the state, and putting an offset back must not fight it. */
+      const O_P = 'selftest:p14';
+      const oKeyT = () => document.dispatchEvent(new KeyboardEvent('keydown', { key: 't', bubbles: true, cancelable: true }));
+      const oLines = (k) => Array.from({ length: 15 }, (_, i) => 'selftest panel line ' + k + '.' + (i + 1)).join('\n');
+      const oFixture = [];
+      for (let i = 0; i < 16; i++) {
+        oFixture.push({ key: 'selftest-panel-u' + i, ts: t0 + i * 2, role: 'user', kind: 'text', sidechain: false,
+          text: 'selftest: prompt ' + i });
+        oFixture.push({ key: 'selftest-panel-a' + i, ts: t0 + i * 2 + 1, role: 'assistant', kind: 'text', sidechain: false,
+          text: oLines(i) });
+      }
+      if (api2.viewMode() !== 'chat') oKeyT();   // the fixture is the chat view, not the raw transcript
+      chat.setAuto(false);
+      chat.setStatus(O_P, 'idle');
+      chat.setPane(O_P);
+      chat.ingest(O_P, { ok: true, pane_id: O_P, agent: 'claude', cursor: 1, truncated: false, skipped: 0,
+        unknown_records: 0, messages: oFixture });
+      const oDom = chat.dom();
+      const oSc = oDom.scroll;
+      const oJump = oDom.jump;
+      if (oJump && !oJump.classList.contains('hidden')) oJump.click();   // the reader's own way back to the tail
+      check('(o) the panel holds a real scroll region',
+        !!oSc && oSc.scrollHeight > oSc.clientHeight + 400 && !!oJump && oJump.classList.contains('hidden'),
+        'scrollHeight=' + (oSc && oSc.scrollHeight) + ' clientHeight=' + (oSc && oSc.clientHeight) +
+        ' chipHidden=' + (oJump && oJump.classList.contains('hidden')));
+      const oWant = Math.max(1, oSc.scrollHeight - oSc.clientHeight - 300);
+      oSc.scrollTop = oWant;
+      oSc.dispatchEvent(new Event('scroll'));
+      const oSeam = chat.panelTop(O_P);
+      check('(o) an unpinned reader is remembered, and the pin is dropped honestly',
+        Math.abs(oSc.scrollTop - oWant) < 1 && oSeam === oSc.scrollTop && !oJump.classList.contains('hidden'),
+        'set=' + oWant + ' readBack=' + oSc.scrollTop + ' seam=' + JSON.stringify(oSeam) +
+        ' chip=' + JSON.stringify(oJump.textContent));
+      const oMark = document.querySelector('#hdChatList .hd-cv-msg, #hdChatList .chat-msg');
+      if (oMark) oMark.setAttribute('data-selftest-panelprobe', '1');
+      const oMarkedBefore = document.querySelectorAll('#hdChatList [data-selftest-panelprobe]').length;
+      oKeyT();
+      oKeyT();
+      const oMarkedAfter = document.querySelectorAll('#hdChatList [data-selftest-panelprobe]').length;
+      check('(o) the full re-render really happened: the marked node was replaced',
+        oMarkedBefore === 1 && oMarkedAfter === 0,
+        'markedBefore=' + oMarkedBefore + ' markedAfter=' + oMarkedAfter);
+      const oBefore = oSc.scrollTop;
+      oKeyT();
+      oKeyT();
+      const oAfter = oSc.scrollTop;
+      check('(o) the reader\'s position survives the mode round trip',
+        oBefore > 0 && oAfter === oBefore && !oJump.classList.contains('hidden'),
+        'before=' + oBefore + ' after=' + oAfter + ' chip=' + JSON.stringify(oJump.textContent));
+      oSc.scrollTop = oSc.scrollHeight;
+      oSc.dispatchEvent(new Event('scroll'));
+      const oPinnedSeam = chat.panelTop(O_P);
+      const oPinnedChip = oJump.classList.contains('hidden');
+      oKeyT();
+      oKeyT();
+      const oDist = oSc.scrollHeight - oSc.scrollTop - oSc.clientHeight;
+      check('(o) a pinned reader stays pinned, and the state says so',
+        oPinnedChip && oPinnedSeam === null && oDist <= 2,
+        'seam=' + JSON.stringify(oPinnedSeam) + ' distFromTail=' + oDist +
+        ' chip=' + JSON.stringify(oJump.textContent));
+
       /* leave the page readable: raw transcript on screen, the user's stored preference restored */
       chat.setStatus(null, null);
       chat.setPane('selftest:p1');
