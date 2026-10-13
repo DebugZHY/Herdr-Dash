@@ -24,6 +24,8 @@ console** hidden on <http://127.0.0.1:7432/> if it is not already up, then opens
 - **Status**: running / stopped / started outside this console — port, PID, uptime, herdr's version and protocol, and
   the tail of the server log, refreshed every couple of seconds.
 - **Start / stop / restart**, and open the app in a new tab. A refusal is shown with the reason it was refused.
+- **Stop this console** stops the console and releases its own port. The app keeps running — it is a separate,
+  detached process on purpose, so to release both ports, stop the app and then quit the console.
 - The app runs detached and hidden, so closing the page stops nothing.
 
 The same thing from a terminal:
@@ -31,13 +33,16 @@ The same thing from a terminal:
 ```
 node tools/hdctl.js status           # what is running, on which port, and since when
 node tools/hdctl.js start | stop | restart      # --app-port M moves the app off 7433
+node tools/hdctl.js quit             # stop the console itself and release its port (--port N for another console)
 node tools/pipe-probe.js             # can this shell reach herdr? exit 0 · 3 denied · 4 no herdr
 ```
 
 `herdr-dash.cmd status` hands its arguments straight to that CLI: exit `0` means the operation happened, anything else
 is a refusal with the reason. A stop first verifies that the port's process is a `node` running `src/server.js` that
-answers `/api/health`, and it never kills by process name. The app can still be run on its own:
-`node src/server.js [--port 8080]`.
+answers `/api/health`, and it never kills by process name. `quit` does the same for the console itself — one verified
+PID, never by name — and when the console was started elevated and the shell you ran it from may not kill it, it says
+so and points at the page's own button rather than pretending. Nothing is listening is a success: `quit` is safe to
+repeat. The app can still be run on its own: `node src/server.js [--port 8080]`.
 
 `herdr-dash.cmd` reads a few environment variables of its own:
 
@@ -102,7 +107,8 @@ right showing that pane's own usage and background processes.
 
 The server binds `127.0.0.1` **with no authentication**, and it is powerful: it can type into your agent panes, i.e.
 issue instructions as you. Do not expose the port — no port forwarding, no `0.0.0.0`, no reverse proxy. Anything that
-can reach this port on this machine can act inside your agents; stop the process when you are done.
+can reach this port on this machine can act inside your agents; stop the process when you are done — the console has a
+supported way out: **Stop this console** on its own page, or `herdr-dash.cmd quit`.
 
 Requests that change something on disk go through narrow, logged endpoints: `POST /api/open` accepts only the
 whitelisted actions `open` / `reveal`, refuses cross-origin callers, requires an existing path, and hands the path to
@@ -111,8 +117,11 @@ inside its own directory.
 
 The control console binds `127.0.0.1:7432` only. Its start / stop / restart are writes and need the per-run token its
 own page carries plus a same-origin check, or they are refused `403` with no action taken, so another page on this
-machine cannot drive it. A stop kills at most one verified PID — a `node(.exe)` whose command line runs
-`src\server.js` and whose `/api/health` answers with `uptime_ms` — never by process name.
+machine cannot drive it. `POST /api/quit` is a write under the same guard and stops the console itself: it releases the
+console's port and leaves the app alone. A stop kills at most one verified PID — a `node(.exe)` whose command line runs
+`src\server.js` and whose `/api/health` answers with `uptime_ms` — never by process name; the CLI's `quit` resolves and
+verifies the console's own PID the same way, and refuses — saying so — when the console outranks the shell it was run
+from.
 
 ## License
 

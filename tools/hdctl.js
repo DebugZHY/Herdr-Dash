@@ -92,6 +92,13 @@ const CREATION_SKEW_MS = 120000;                          // record vs OS proces
 const STOP_WAIT_MS = 5000;                                // after the kill, wait for the port
 const PROBE_TIMEOUT_MS = 2500;                            // one /api/health read
 const CONNECT_TIMEOUT_MS = 700;                           // one TCP connect
+const QUIT_WAIT_MS = 3000;                                // after a console kill, wait for its port
+
+/* The serving console's own server and its one-shot exit latch, so the exit paths (the page's quit
+   write, a signal) can close the listener exactly once. Both are null/false whenever this process is
+   not serving — the CLI verbs never are. */
+let ctlServer = null;
+let shuttingDown = false;
 
 // ------------------------------------------------------------------------------- output
 
@@ -739,6 +746,81 @@ async function restartApp(appPort) {
   return { ok: false, did: startResult.did === 'already_running' ? 'already_running' : 'failed', message: 'the stop step succeeded but the start step did not: ' + startResult.message, stop: stopResult, start: startResult };
 }
 
+/**
+ * The console's own way out: close the listener so its port is released, then exit.
+ *
+ * Nothing here touches the app — it is spawned detached on purpose and keeps running. The fallback
+ * timer is deliberately not unref'd: if a connection refuses to close, this still exits and frees the
+ * port. Whoever asked for the exit has already been answered by the time this runs.
+ */
+function shutdownConsole() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try { if (ctlServer && typeof ctlServer.closeAllConnections === 'function') ctlServer.closeAllConnections(); } catch { /* older node */ }
+  try { if (ctlServer) ctlServer.close(); } catch { /* already closed */ }
+  setTimeout(() => process.exit(0), 250);
+}
+
+/** The console's identity leg, mirroring the app's: node(.exe) whose command line is hdctl.js. */
+function consoleIdentityVerdict(ident) {
+  if (ident.error) return { ok: false, reason: 'the process could not be identified (' + ident.error + ')' };
+  if (!ident.exists) return { ok: false, reason: 'the process is already gone' };
+  if (!/^node(\.exe)?$/i.test(String(ident.name || ''))) return { ok: false, reason: 'the process is ' + ident.name + ', not node(.exe)' };
+  if (!/hdctl\.js/i.test(String(ident.commandLine || ''))) return { ok: false, reason: 'its command line does not run hdctl.js' };
+  return { ok: true, reason: null };
+}
+
+/**
+ * Stop the console serving `ctlPort`, from OUTSIDE it.
+ *
+ * This is not the console's own exit — it has one that cannot be refused by any permission (the
+ * page's own quit write, see the /api/quit route). This leg exists for a caller that cannot click:
+ * it resolves the port's owner, proves it is this console, and kills exactly that pid. A kill the
+ * shell is not allowed to make (a console started elevated outranks a normal terminal) is reported
+ * as a refusal that names the way out, never as a success.
+ */
+async function stopConsole(ctlPort) {
+  const before = await portState(ctlPort);
+  if (!before.listening) {
+    if (before.unknown) {
+      return { ok: false, did: 'refused', message: 'nothing answers on port ' + ctlPort + ' and netstat could not be read, so "the console is already stopped" is not something this can claim — check it with: netstat -ano | findstr :' + ctlPort };
+    }
+    return { ok: true, did: 'nothing_listening', message: 'nothing is listening on port ' + ctlPort + ' — the console is already stopped, nothing to quit' };
+  }
+  if (before.pids.length === 0) {
+    return { ok: false, did: 'refused', message: 'something is listening on port ' + ctlPort + ' but its owning process could not be determined (netstat reported no listener) — not killing anything' };
+  }
+  if (before.pids.length > 1) {
+    return { ok: false, did: 'refused', message: 'more than one process listens on port ' + ctlPort + ' (pids ' + before.pids.join(', ') + ') — this is not a state a single decision can be made in, so nothing was killed' };
+  }
+  const pid = before.pids[0];
+  const verdict = consoleIdentityVerdict(await processIdentity(pid));
+  if (!verdict.ok) {
+    return { ok: false, did: 'refused', pid, message: 'pid ' + pid + ' holds port ' + ctlPort + ' but ' + verdict.reason + ' — not killing it (quit stops a console, nothing else)' };
+  }
+
+  const t0 = Date.now();
+  const kill = spawnSync('taskkill', ['/PID', String(pid), '/F'], { encoding: 'utf8', windowsHide: true, timeout: 15000 });
+  const killOut = String((kill.stdout || '') + (kill.stderr || '')).trim();
+  if (kill.error || kill.status !== 0) {
+    return {
+      ok: false, did: 'failed', pid,
+      message: 'could not stop pid ' + pid + ' on port ' + ctlPort + ': ' + (kill.error ? kill.error.message : killOut || 'taskkill exit ' + kill.status)
+        + ' — a console started elevated cannot be killed from a terminal that is not, so stop it from its own page (that button always works) or from an elevated terminal: taskkill /F /PID ' + pid,
+    };
+  }
+  let after = null;
+  while (Date.now() - t0 < QUIT_WAIT_MS) {
+    after = await portState(ctlPort);
+    if (!after.listening) break;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  if (after && after.listening) {
+    return { ok: false, did: 'still_listening', pid, message: 'pid ' + pid + ' was killed, but something is STILL listening on port ' + ctlPort + ' (pids ' + (after.pids.join(', ') || 'unknown') + ') — check it with: netstat -ano | findstr :' + ctlPort };
+  }
+  return { ok: true, did: 'stopped', pid, waited_ms: Date.now() - t0, message: 'stopped the console (pid ' + pid + '); port ' + ctlPort + ' is free — nothing is listening there now. The app was not touched.' };
+}
+
 // ----------------------------------------------------------------------------------- page
 
 const PAGE_TOKEN_KEY = '__HDCTL_TOKEN__';
@@ -816,6 +898,7 @@ function page({ ctlPort, appPort, token }) {
       <button id="bStart" class="primary">Start</button>
       <button id="bStop" class="danger">Stop</button>
       <button id="bRestart">Restart</button>
+      <button id="bQuit" class="danger" title="stops this console and releases its port; the app keeps running">Stop this console</button>
       <button id="bOpen">Open the app in a new tab</button>
       <button id="bCopy">Copy the app URL</button>
     </div>
@@ -985,6 +1068,25 @@ function page({ ctlPort, appPort, token }) {
       show('err', 'this browser has no clipboard API — the URL is ' + url);
     }
   };
+  $('bQuit').onclick = function () {
+    if (busy) return;
+    busy = true;                       // also stops the poll below: there is nothing left to poll
+    show('busy', 'stopping this console…');
+    fetch('/api/quit', { method: 'POST', headers: { 'x-hd-ctl-token': TOKEN } })
+      .then(function (r) { return r.json().then(function (b) { return { status: r.status, body: b }; }); })
+      .then(function (res) {
+        var b = res.body || {};
+        var msg = b.message || (b.error && (b.error.message || b.error.code)) || JSON.stringify(b);
+        if (res.status === 200 && b.ok) {
+          show('ok', 'quit: ' + msg);
+          ['bStart', 'bStop', 'bRestart', 'bQuit'].forEach(function (id) { if ($(id)) $(id).disabled = true; });
+        } else {
+          busy = false;
+          show('err', 'quit refused (' + res.status + '): ' + msg);
+        }
+      })
+      .catch(function (e) { busy = false; show('err', 'quit failed: ' + e.message); });
+  };
   $('bLogRefresh').onclick = function () { loadLog(currentTail); };
   Array.prototype.forEach.call(document.querySelectorAll('button[data-tail]'), function (b) {
     b.onclick = function () { currentTail = Number(b.getAttribute('data-tail')); loadLog(currentTail); };
@@ -1079,6 +1181,28 @@ async function serve({ ctlPort, appPort }) {
           files: st.log.files, server_log: st.log.server_log,
         });
       }
+      /* The console's own exit, asked for by its own page. Same guard as the other writes, and the
+         answer is written BEFORE anything closes, so the page gets a reply rather than a reset
+         connection. The shutdown itself does not wait on sockets that may never drain. */
+      if (req.method === 'POST' && route === '/api/quit') {
+        if (!sameOrigin(req, ctlPort)) {
+          return sendJson(res, 403, { ok: false, error: { code: 'forbidden', message: 'the request did not come from this console\'s own page (Origin/Sec-Fetch-Site) — no action was taken' } });
+        }
+        if (!tokenOk(req, token)) {
+          return sendJson(res, 403, { ok: false, error: { code: 'forbidden', message: 'a write needs the per-run token in the x-hd-ctl-token header — no action was taken' } });
+        }
+        req.resume();
+        say('quit: requested from the page (pid ' + process.pid + ')');
+        sendJson(res, 200, {
+          ok: true, action: 'quit', did: 'quitting',
+          message: 'this console is stopping and port ' + ctlPort + ' is being released; the app on port ' + appPort + ' keeps running',
+        });
+        res.once('finish', () => shutdownConsole());       // only once the answer is on the wire
+        return undefined;
+      }
+      if (route === '/api/quit') {
+        return sendJson(res, 405, { ok: false, error: { code: 'method_not_allowed', message: route + ' needs POST (with the token header)' } });
+      }
       if (req.method === 'POST' && (route === '/api/start' || route === '/api/stop' || route === '/api/restart')) {
         if (!sameOrigin(req, ctlPort)) {
           return sendJson(res, 403, { ok: false, error: { code: 'forbidden', message: 'the request did not come from this console\'s own page (Origin/Sec-Fetch-Site) — no action was taken' } });
@@ -1117,6 +1241,13 @@ async function serve({ ctlPort, appPort }) {
     }
   });
 
+  ctlServer = server;                    // the exit paths (page quit, signals) close this
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK']) {
+    try {
+      process.on(sig, () => { say(sig + ': stopping the console — the app keeps running.'); shutdownConsole(); });
+    } catch { /* not every signal name exists on every platform */ }
+  }
+
   try {
     await new Promise((resolve, reject) => {
       const onErr = (e) => { server.removeListener('listening', onUp); reject(e); };
@@ -1141,6 +1272,7 @@ const USAGE = [
   '  node tools/hdctl.js                          serve the control page on 127.0.0.1:7432',
   '  node tools/hdctl.js status                   print the app status as JSON (exit 0)',
   '  node tools/hdctl.js start|stop|restart       do it; exit 0 = it happened, non-zero = refused',
+  '  node tools/hdctl.js quit                     stop the console on this port and release it',
   '',
   'options:',
   '  --port N        the control console\'s own port (default 7432, env HD_CTL_PORT)',
@@ -1168,7 +1300,7 @@ function parseArgv(argv) {
       if (a === '--port') out.ctlPort = n; else out.appPort = n;
       continue;
     }
-    if (/^[a-z]+$/.test(a) && ['status', 'start', 'stop', 'restart'].includes(a)) {
+    if (/^[a-z]+$/.test(a) && ['status', 'start', 'stop', 'restart', 'quit'].includes(a)) {
       if (out.verb) { out.bad = 'more than one verb: ' + out.verb + ' and ' + a; continue; }
       out.verb = a;
       continue;
@@ -1207,6 +1339,15 @@ async function main() {
     }
     if (a.orphan) say('orphan: ' + a.record_note);
     return 0;
+  }
+
+  /* The console's own exit, kept out of the app table below: it acts on THIS port, not on the app, and
+     its success means a console released its port (this process, killed from outside, or none at all). */
+  if (args.verb === 'quit') {
+    const r = await stopConsole(args.ctlPort);
+    emit({ ok: r.ok, action: 'quit', did: r.did, message: r.message, port: args.ctlPort, pid: r.pid ?? null, waited_ms: r.waited_ms ?? null });
+    (r.ok ? say : fail)('quit: ' + r.did + ' — ' + r.message);
+    return r.ok ? 0 : 1;
   }
 
   const result = args.verb === 'start' ? await startApp(appPort)
