@@ -2847,11 +2847,31 @@ function init() {
     });
     modelSel.disabled = false;
   }
+  /* the model the pane is currently running, read from the dock module's last /api/status answer
+     (the same source the usage chip paints from) — available for every agent, not just claude */
+  function currentModelText() {
+    const dockApi = (ctx.modules && ctx.modules.api) ? ctx.modules.api('dock') : null;
+    if (!dockApi || typeof dockApi.latest !== 'function') return null;
+    let ans = null;
+    try { ans = dockApi.latest(); } catch (e) { ans = null; }
+    const st = ans && ans.status, cx = ans && ans.context;
+    return (st && st.model) || (cx && cx.model) || null;
+  }
   function updateModelSel() {
     if (!modelSel) return;
     const pane = state.selected ? findPane(state.selected) : null;
     const agent = pane && pane.agent;
-    if (!pane || agent !== 'claude') { setModelSelPlaceholder(agent ? 'model: n/a' : 'model…'); modelSel.disabled = true; modelCache = { paneId: null, models: null }; return; }
+    const cur = currentModelText();
+    if (!pane) { setModelSelPlaceholder('model…'); modelSel.disabled = true; modelCache = { paneId: null, models: null }; return; }
+    /* only claude has a dash-driven switcher. hermes/pi show their current model read-only —
+       pi's /model input channel is unreliable and its cancel key (ctrl+c) kills the process, so
+       driving its picker from the dash is not safe to automate */
+    if (agent !== 'claude') {
+      setModelSelPlaceholder(cur ? ('model: ' + cur) : 'model: —');
+      modelSel.disabled = true;
+      modelCache = { paneId: null, models: null };
+      return;
+    }
     refreshModelList(state.selected, false);
   }
   window.__hdUpdateModelSel = updateModelSel;

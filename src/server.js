@@ -515,18 +515,41 @@ async function handlePromptAnswer(req, res, body) {
    at agent_status 'done' and is arrow-driven with the highlight on the current model, so both
    the option list and the highlight anchor come from promptdetect's claude_model parse. */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function readModelPicker(paneId) {
-  await hdr.request('pane.send_text', { pane_id: paneId, text: '/model' }, { timeoutMs: DEFAULT_TIMEOUT_MS });
-  await hdr.request('pane.send_keys', { pane_id: paneId, keys: ['enter'] }, { timeoutMs: DEFAULT_TIMEOUT_MS });
-  await sleep(1500);                                   // let the picker render
+const MODEL_KINDS = { claude_model: true };   // pi/hermes stay read-only: pi's /model input channel is unreliable and its cancel key kills the process
+
+/* the pane's agent family, from the live agent list — claude's /model is typed into its prompt
+   box (send_text), while hermes and pi only accept slash-commands through the message channel
+   (agent.prompt); typing them into the terminal does nothing (verified live). */
+async function agentFamilyOf(paneId) {
+  try {
+    const list = await hdr.request('agent.list', {}, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    const agents = (list && (list.agents || (list.result && list.result.agents))) || [];
+    for (let i = 0; i < agents.length; i++) {
+      if (agents[i] && agents[i].pane_id === paneId) return agents[i].agent || null;
+    }
+  } catch (e) { /* fall through to the send_text default */ }
+  return null;
+}
+
+async function readVisible(paneId) {
   const read = await hdr.request(
     'pane.read',
     { pane_id: paneId, source: 'visible', lines: 60, format: 'text', strip_ansi: true },
     { timeoutMs: DEFAULT_TIMEOUT_MS },
   );
-  const text = (read && read.read && read.read.text) || (read && read.text) || '';
-  const prompt = promptdetect.detect(text);
-  return prompt && prompt.kind === 'claude_model' ? prompt : null;
+  return (read && read.read && read.read.text) || (read && read.text) || '';
+}
+
+async function readModelPicker(paneId) {
+  /* claude's /model is typed into its prompt box (send_text) then entered; the picker sits at
+     agent_status 'done' and is arrow-driven with the highlight on the current model. */
+  const family = await agentFamilyOf(paneId);
+  if (family !== 'claude') return null;
+  await hdr.request('pane.send_text', { pane_id: paneId, text: '/model' }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+  await hdr.request('pane.send_keys', { pane_id: paneId, keys: ['enter'] }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+  await sleep(1500);                                   // let the picker render
+  const prompt = promptdetect.detect(await readVisible(paneId));
+  return prompt && MODEL_KINDS[prompt.kind] ? prompt : null;
 }
 
 /* GET /api/model?pane_id=.. -> { ok, models:[{n,label,current}], highlight_n } — opens /model,

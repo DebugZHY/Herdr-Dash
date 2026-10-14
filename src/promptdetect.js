@@ -180,6 +180,49 @@ function detectPiPicker(lines) {
   };
 }
 
+/* pi's /model picker is a single flat list, no numbers. The current model row leads with
+   "→ ✓", the others are plain indented rows; the footer is "Enter to select · Ctrl+S ...".
+   Selection is a relative arrow walk from the current row, so the rows are numbered by their
+   position (1-based) and highlight_n is the ✓ row's position. */
+const PI_MODEL_FOOTER = /enter to select.*ctrl\+s to set as default|ctrl\+s to set as default/i;
+function detectPiModel(lines) {
+  let footerIdx = -1;
+  for (let i = lines.length - 1; i >= Math.max(0, lines.length - 10); i--) {
+    if (PI_MODEL_FOOTER.test(inner(lines[i]))) { footerIdx = i; break; }
+  }
+  if (footerIdx < 0) return null;
+  /* walk up from the footer collecting option rows, keeping their order and which is current.
+     a row is either the current row "→ ✓ <label>" or a plain indented "<label> [provider]". */
+  const rows = [];                                    // { label, current } in top-to-bottom order
+  for (let i = footerIdx - 1; i >= 0 && rows.length < 40; i--) {
+    const raw = lines[i];
+    const t = inner(raw).trim();
+    if (!t) continue;                                 // blank lines inside the picker are allowed
+    if (isRule(raw)) break;                           // a box rule ends the picker upward
+    let label = null, current = false;
+    const mCur = /^→\s*✓?\s*(.+)$/.exec(t);
+    if (mCur) { label = mCur[1].trim(); current = true; }
+    else if (/^\S/.test(t) && t !== '>' && !/model name|model catalog|catalogs refreshed|use \/login|only showing/i.test(t)) { label = t; }
+    if (label === null) { if (rows.length) break; else continue; }   // a non-option line ends the list
+    rows.unshift({ label, current });
+  }
+  if (rows.length < 2) return null;
+  let highlightN = null;
+  const options = rows.map((r, idx) => {
+    if (r.current) highlightN = idx + 1;
+    return { n: idx + 1, label: r.label };
+  });
+  return {
+    kind: 'pi_model',
+    question: 'select a model',
+    options,
+    free_text: false,
+    highlight_n: highlightN,
+    answer_hint: 'send-keys up/down to the model then enter',
+    raw: lines.slice(Math.max(0, footerIdx - rows.length - 2), footerIdx + 1),
+  };
+}
+
 function detectYn(lines) {
   for (let i = lines.length - 1; i >= Math.max(0, lines.length - 8); i--) {
     const t = inner(lines[i]).trim();
@@ -201,7 +244,7 @@ function detectYn(lines) {
 function detect(text) {
   if (!text || typeof text !== 'string') return null;
   const lines = text.replace(/\r/g, '').split('\n');
-  return detectClaude(lines) || detectPiPicker(lines) || detectYn(lines);
+  return detectClaude(lines) || detectPiModel(lines) || detectPiPicker(lines) || detectYn(lines);
 }
 
 module.exports = { detect, _inner: inner, _numbered: numbered };
