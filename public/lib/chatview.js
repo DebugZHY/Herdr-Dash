@@ -121,8 +121,8 @@
   /* §8.3 "honest empty states": one sentence per §8.1 code, each distinct and readable. */
   var ERRORS = {
     unsupported_agent:
-      "chat view is not available for this pane's agent — the structured reader supports claude and " +
-      "hermes only. press t for the raw terminal view.",
+      "chat view is not available for this pane's agent — the structured reader supports claude, pi " +
+      "and hermes only. press t for the raw terminal view.",
     session_file_missing:
       "the agent's session log file is missing on disk — the session may not have written anything " +
       "yet, or the file was rotated away. press t for the raw terminal view.",
@@ -1266,7 +1266,8 @@
            either would be a lie told with a real number, so neither is ever reported as a size. The
            server's own field always wins over a derived one. */
         if (st.sizeSrc !== 'server') {
-          if (st.tailMode === true && st.tailCursor && st.source && st.source.kind === 'claude_jsonl') {
+          if (st.tailMode === true && st.tailCursor && st.source &&
+              (st.source.kind === 'claude_jsonl' || st.source.kind === 'pi_jsonl')) {
             st.sizeBytes = st.tailCursor; st.sizeSrc = 'tail-cursor';
           } else if (st.tailMode === false && st.sizeSrc === 'tail-cursor') {
             st.sizeBytes = null; st.sizeSrc = '';

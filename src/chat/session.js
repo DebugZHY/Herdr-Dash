@@ -66,6 +66,7 @@ const SIGNALS = {
   PANE_BANNER: 'pane_banner',
   STORE_SESSION: 'store_session',
   CWD_NEWEST: 'cwd_newest',
+  CWD_ASSIGN: 'cwd_assign',
   HERDR: 'herdr',
 };
 
@@ -343,9 +344,22 @@ function resolvePaneSession(input) {
     }
   }
 
-  // ── 3. claude: the newest jsonl under this pane's cwd ──────────────────────
-  if (agent === 'claude' && filerows.length) {
+  // ── 3. claude/pi: the newest jsonl under this pane's cwd ──────────────────
+  // A pi pane that shares its cwd with siblings takes its server-assigned log
+  // instead: rank beats mtime, or three panes would all bind the newest one.
+  if (agent === 'pi' && Array.isArray(inp.pi_assign) && inp.pi_assign.length) {
+    const me = inp.pi_assign.find((a) => a && a.pane_id === inp.pane_id) || null;
+    if (me && me.id) {
+      return Object.assign(out, {
+        resolved: true, session_id: me.id, detected_by: SIGNALS.CWD_ASSIGN,
+        corroborated: false,
+        note: `assigned by the server: this cwd has ${inp.pi_assign.length} pi pane(s) sharing ${inp.pi_assign.filter((a) => a && a.id).length} log(s); this pane takes rank ${me.rank + 1}`,
+      });
+    }
+  }
+  if (agent !== 'hermes' && filerows.length) {
     const newest = filerows[0];
+    const freshMs = agent === 'pi' ? LIMITS.FILE_FRESH_PI_MS : LIMITS.FILE_FRESH_MS;
     const runnerUp = filerows.slice(1).find((c) => newest.mtimeMs - c.mtimeMs <= LIMITS.AMBIG_MARGIN_MS) || null;
     const age = Number.isFinite(newest.mtimeMs) ? now - newest.mtimeMs : Infinity;
     const owner = claimOf(newest.id);
@@ -362,7 +376,17 @@ function resolvePaneSession(input) {
       push(runnerUp.id, SIGNALS.CWD_NEWEST, 'ambiguous');
       out.ambiguous = true;
       out.ambiguous_ids = [newest.id, runnerUp.id];
-    } else if (age > LIMITS.FILE_FRESH_MS) {
+    } else if (age > freshMs) {
+      // A pi log that has been idle longer than the freshness window is still the
+      // session this pane would resume (pi does not rotate on its own); the claim
+      // is marked not-corroborated instead of refused.
+      if (agent === 'pi') {
+        return Object.assign(out, {
+          resolved: true, session_id: newest.id, detected_by: SIGNALS.CWD_NEWEST,
+          corroborated: false,
+          note: `the newest log under this cwd was written ${Math.round(age / 60000)} min ago — the pane has been idle; showing its last session`,
+        });
+      }
       note(`the newest log under this cwd (${newest.id}) was written ${Math.round(age / 60000)} min ago — too old to be the live session`);
       push(newest.id, SIGNALS.CWD_NEWEST, 'stale');
     } else if (gained != null && gained <= LIMITS.AMBIG_MARGIN_MS) {
@@ -376,7 +400,7 @@ function resolvePaneSession(input) {
         note: bound == null ? 'herdr binds no log under this cwd' : null,
       });
     }
-  } else if (agent === 'claude' && !filerows.length) {
+  } else if (agent !== 'hermes' && !filerows.length) {
     note('no log file under this cwd proves it belongs to the pane');
   }
 
@@ -389,7 +413,7 @@ function resolvePaneSession(input) {
   // is the fallback §9.1 names and the caller's own file check turns it into the
   // precise `session_file_missing` (the answer this had before round 7.6).
   const herdrUsable = !!herdr
-    && (agent !== 'claude' || !filerows.length || Number.isFinite(inp.bound_mtime_ms));
+    && (agent === 'hermes' || !filerows.length || Number.isFinite(inp.bound_mtime_ms));
   const paneNamesHerdr = vis.distinct.includes(herdr) || rec.distinct.includes(herdr);
   if (herdrUsable) {
     out.resolved = true;

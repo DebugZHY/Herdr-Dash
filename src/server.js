@@ -24,11 +24,22 @@ const cp = require('node:child_process');
 const hdr = require('./hdr');
 const chatCommon = require('./chat/common');     // §8.2 message shape + caps
 const chatClaude = require('./chat/claude');     // §8.1 claude jsonl resolution/parse
+const chatPi = require('./chat/pi');             // §8.1 pi jsonl resolution/parse
 const chatHermes = require('./chat/hermes');     // §8.1 hermes sqlite resolution/parse
 const chatSession = require('./chat/session');   // §9 pane→session binding (round 7.6)
 const attach = require('./attach');              // §10 POST /api/attach (round 7.7)
 const pathsApi = require('./paths');             // §13.2 POST /api/pathinfo, /api/open (round 9)
 const statusView = require('./status');          // §12.3 GET /api/status (round 8)
+const promptdetect = require('./promptdetect');   // agent question detection from terminal text
+
+/** The jsonl reader for a file-log agent. claude and pi write different records
+ *  but the server route is the same shape, so the path names one accessor instead
+ *  of either module. Returns null for an agent with no jsonl log. */
+function fileLogReader(agent) {
+  if (agent === 'claude') return chatClaude;
+  if (agent === 'pi') return chatPi;
+  return null;
+}
 
 // ── config ──────────────────────────────────────────────────────────────────
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
@@ -446,6 +457,56 @@ async function handleText(req, res, body) {
   }
   const result = await hdr.request('pane.send_text', { pane_id: paneId, text: body.text }, { timeoutMs: DEFAULT_TIMEOUT_MS });
   ok(res, { result });
+}
+
+// ── agent question (round: prompt answering) ─────────────────────────────
+
+/* Read the visible terminal of a blocked pane and detect a pending question.
+ * GET /api/prompt?pane_id=.. -> { ok, pane_id, agent_status, prompt|null }
+ * prompt = { kind, question, options:[{n,label}], free_text, answer_hint } or null. */
+async function handlePromptDetect(req, res, url) {
+  const paneId = url.searchParams.get('pane_id');
+  if (!paneId) throw { code: 'bad_request', message: '"pane_id" query parameter is required' };
+
+  let status = null;
+  try {
+    const list = await hdr.request('agent.list', {}, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    const agents = (list && (list.agents || (list.result && list.result.agents))) || [];
+    for (let i = 0; i < agents.length; i++) {
+      if (agents[i] && agents[i].pane_id === paneId) { status = agents[i].agent_status || null; break; }
+    }
+  } catch (e) { /* a missing status never blocks detection */ }
+
+  const read = await hdr.request(
+    'pane.read',
+    { pane_id: paneId, source: 'visible', lines: 60, format: 'text', strip_ansi: true },
+    { timeoutMs: DEFAULT_TIMEOUT_MS },
+  );
+  const text = (read && read.read && read.read.text) || (read && read.text) || '';
+  const prompt = promptdetect.detect(text);
+  ok(res, { pane_id: paneId, agent_status: status, prompt: prompt || null });
+}
+
+/* Answer a pending question. POST /api/prompt/answer
+ * { pane_id, answer } — answer is a string: a digit for a numbered option,
+ * free text for a free-text field, or "y"/"n" for a y/n prompt.
+ * { pane_id, keys:["up","enter"] } — raw keystrokes for a pi picker.
+ * { pane_id, cancel:true } — send esc. */
+async function handlePromptAnswer(req, res, body) {
+  const paneId = requireString(body, 'pane_id');
+  if (body.cancel === true) {
+    const r = await hdr.request('pane.send_keys', { pane_id: paneId, keys: ['esc'] }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    return ok(res, { result: r, sent: 'esc' });
+  }
+  if (Array.isArray(body.keys) && body.keys.length) {
+    const r = await hdr.request('pane.send_keys', { pane_id: paneId, keys: normalizeKeys(body.keys) }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    return ok(res, { result: r, sent: 'keys' });
+  }
+  if (typeof body.answer === 'string' && body.answer.length > 0) {
+    const r = await hdr.request('pane.send_text', { pane_id: paneId, text: body.answer }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    return ok(res, { result: r, sent: 'text' });
+  }
+  throw { code: 'bad_request', message: 'provide one of: answer (string), keys (array), or cancel:true' };
 }
 
 // POST /api/rpc {method, params} — raw passthrough for any herdr method.
@@ -1114,7 +1175,7 @@ async function paneInSnapshot(paneId) {
  * because the page polls faster than a pane's text changes:
  *   paneTexts()      the pane's own text — on screen first, scrollback second
  *   storeSessions()  hermes: the `sessions` rows, filtered to the pane's cwd
- *   claudeLogs()     claude: the logs under the pane's cwd that PROVE that cwd
+ *   fileLogs()       claude/pi: the logs under the pane's cwd that PROVE that cwd
  * Everything is best-effort: a pane read that fails is `null` text, never an
  * exception, and never evidence that the pane moved (see session.js's tracker).
  *
@@ -1126,7 +1187,7 @@ async function paneInSnapshot(paneId) {
 const paneTextCache = new Map();        // pane_id -> {at, visible, recent, error}
 const paneTextInflight = new Map();
 const storeCache = new Map();           // db file -> {at, rows}
-const claudeLogCache = new Map();       // cwd -> {at, candidates}
+const fileLogCache = new Map();         // "<agent>\u0000<cwd>" -> {at, candidates}
 // §11.3 (round 7.7, DEFECT-18): the whole cold resolution for one pane+session is
 // also computed once. Round 7.6 cached its three inputs; this caches the DECISION,
 // which is what a mount that asks twice 16 ms apart was paying for twice.
@@ -1226,21 +1287,26 @@ async function storeSessions() {
   return rows;
 }
 
-/** claude logs under a cwd, newest first, cached. */
-async function claudeLogs(cwd) {
-  const hit = claudeLogCache.get(cwd);
+/** claude/pi logs under a cwd, newest first, cached per agent. */
+async function fileLogs(agent, cwd) {
+  const reader = fileLogReader(agent);
+  if (!reader) return [];
+  const key = agent + '\u0000' + cwd;
+  const hit = fileLogCache.get(key);
   if (hit && Date.now() - hit.at < SESSION_CACHE_MS) return hit.candidates;
   let candidates = [];
   try {
-    const found = await chatClaude.candidatesForCwd(cwd, {
+    const found = await reader.candidatesForCwd(cwd, {
       max: chatSession.LIMITS.CAND_MAX,
-      windowMs: chatSession.LIMITS.CAND_WINDOW_MS,
+      // Each reader owns its freshness window (pi's is a day); passing one here
+      // would override it.
+      windowMs: agent === 'pi' ? undefined : chatSession.LIMITS.CAND_WINDOW_MS,
     });
     candidates = found.candidates;
   } catch (e) {
     candidates = [];
   }
-  claudeLogCache.set(cwd, { at: Date.now(), candidates });
+  fileLogCache.set(key, { at: Date.now(), candidates });
   return candidates;
 }
 
@@ -1301,6 +1367,7 @@ async function resolveLiveSession(paneId, entry, agent, herdrSessionId, agents, 
   const cwd = typeof entry.cwd === 'string' ? entry.cwd.trim() : '';
   const inp = {
     agent,
+    pane_id: paneId,
     herdr_session_id: herdrSessionId || null,
     now: Date.now(),
     claimed: claimedByOtherPanes(agents, paneId),
@@ -1326,10 +1393,31 @@ async function resolveLiveSession(paneId, entry, agent, herdrSessionId, agents, 
         inp.store_known_ids = { [only]: chatHermes.sessionKnown(chatHermes.dbPath(), only) };
       } catch (e) { inp.store_known_ids = null; }
     }
-  } else if (agent === 'claude' && cwd) {
-    inp.candidates = await claudeLogs(cwd);
-    if (mark) mark('claudeLogs');
-    const boundFile = chatClaude.findSessionFile(herdrSessionId);
+  } else if ((agent === 'claude' || agent === 'pi') && cwd) {
+    const reader = fileLogReader(agent);
+    inp.candidates = await fileLogs(agent, cwd);
+    if (mark) mark('fileLogs');
+    if (agent === 'pi') {
+      // herdr never publishes a pi session (verified live: its report is accepted
+      // and the read-back stays empty), so when several pi panes share one cwd the
+      // server assigns the cwd's newest logs to them itself — oldest pane first,
+      // so the assignment is stable across polls.
+      const siblings = (agents || [])
+        .filter((a) => a && a.pane_id !== paneId
+          && String((a.agent_session && a.agent_session.agent) || a.agent || '') === 'pi'
+          && chatSession.sameCwd(a.cwd, cwd))
+        .map((a) => a.pane_id);
+      if (siblings.length) {
+        const order = siblings.concat([paneId]).sort();
+        const rank = order.indexOf(paneId);
+        inp.pi_assign = order.map((id, i) => {
+          const cand = inp.candidates[i];
+          return { pane_id: id, rank: i, id: cand ? cand.id : null };
+        });
+        inp.pi_rank = rank;
+      }
+    }
+    const boundFile = reader.findSessionFile(herdrSessionId);
     if (boundFile) {
       const st = await fsp.stat(boundFile).catch(() => null);
       inp.bound_mtime_ms = st && st.isFile() ? st.mtimeMs : null;
@@ -1512,7 +1600,8 @@ function rememberBinding(paneId, agent, entry, live, fileKnown) {
   const res = (live && live.res) || {};
   const sid = res.session_id ? String(res.session_id) : '';
   if (!res.resolved || !sid) { readMemory.delete(paneId); return null; }
-  const file = fileKnown || (agent === 'claude' ? chatClaude.findSessionFile(sid) : null);
+  const reader = fileLogReader(agent);
+  const file = fileKnown || (reader ? reader.findSessionFile(sid) : null);
   const mem = {
     agent,
     session_id: sid,
@@ -1579,9 +1668,9 @@ function refreshBinding(paneId, agent, entry, herdrSessionId, agents) {
  * fetch herdr's record itself — in the background, where its cost (one
  * `agent.list`, served from the 5 s cache a page load has already filled) cannot
  * be felt. Two facts end the memory here rather than in the scan: a pane herdr no
- * longer knows, and a pane whose agent is no longer claude — serving either would
- * be a binding the pane has moved on from, and neither can be corrected by a scan
- * that never runs.
+ * longer knows, and a pane whose agent no longer keeps a jsonl log — serving
+ * either would be a binding the pane has moved on from, and neither can be
+ * corrected by a scan that never runs.
  */
 function refreshFromHerdr(paneId) {
   agentList().then(
@@ -1590,7 +1679,7 @@ function refreshFromHerdr(paneId) {
       if (!entry) { readMemory.delete(paneId); return; }
       const session = entry.agent_session;
       const agent = String((session && session.agent) || entry.agent || '');
-      if (agent !== 'claude') { readMemory.delete(paneId); return; }
+      if (agent !== 'claude' && agent !== 'pi') { readMemory.delete(paneId); return; }
       refreshBinding(paneId, agent, entry, session && session.value != null ? String(session.value) : '', agents);
     },
     (e) => {
@@ -1614,14 +1703,16 @@ function refreshFromHerdr(paneId) {
  */
 async function replyFromMemory(res, paneId, limit, mark, clk) {
   const mem = readMemory.get(paneId);
-  if (!mem || mem.agent !== 'claude' || !mem.session_id) return null;
-  const file = chatClaude.findSessionFile(mem.session_id);
+  if (!mem) return null;
+  const reader = fileLogReader(mem.agent);
+  if (!reader || !mem.session_id) return null;
+  const file = reader.findSessionFile(mem.session_id);
   if (mark) mark('findSessionFile');
   if (!file) { readMemory.delete(paneId); return null; }
-  const identity = await chatClaude.verifyCwd(file, mem.cwd);
+  const identity = await reader.verifyCwd(file, mem.cwd);
   if (mark) mark('verifyCwd');
   if (!identity.ok) { readMemory.delete(paneId); return null; }
-  const win = await chatClaude.readTail(file, limit, mem.working);
+  const win = await reader.readTail(file, limit, mem.working);
   if (mark) mark('readTail');
   const sessionId = mem.session_id;
   const base = Object.assign({ pane_id: paneId, agent: mem.agent }, mem.fields);
@@ -1634,7 +1725,7 @@ async function replyFromMemory(res, paneId, limit, mark, clk) {
     event: 'chat_read_remembered', pane_id: paneId, session_id: sessionId,
     age_ms: age, bytes: win.tailBytes, messages: win.messages.length,
   }));
-  chatReply(res, base, { kind: chatClaude.SOURCE_KIND, session_id: sessionId, path: file }, win, true, 0);
+  chatReply(res, base, { kind: reader.SOURCE_KIND, session_id: sessionId, path: file }, win, true, 0);
   if (clk) clk.done({ lane: 'remembered', scan: 'remembered', age_ms: age, messages: win.messages.length, tail_bytes: win.tailBytes, file_size: win.eof });
   // `SERVED`, not the reply: `ok()`/`sendJson()` returns nothing, so the only thing
   // a caller can test is that this lane answered — and a caller that tests the
@@ -1654,16 +1745,18 @@ async function replyFromMemory(res, paneId, limit, mark, clk) {
  */
 async function replyFromHerdrRecord(res, paneId, agent, entry, herdrSessionId, limit, scanMs, mark, clk) {
   if (!herdrSessionId) return null;
+  const reader = fileLogReader(agent);
+  if (!reader) return null;
   const cwd = typeof entry.cwd === 'string' ? entry.cwd.trim() : '';
   if (!cwd) return null;
-  const file = chatClaude.findSessionFile(herdrSessionId);
+  const file = reader.findSessionFile(herdrSessionId);
   if (mark) mark('findSessionFile');
   if (!file) return null;
-  const identity = await chatClaude.verifyCwd(file, cwd);
+  const identity = await reader.verifyCwd(file, cwd);
   if (mark) mark('verifyCwd');
   if (!identity.ok) return null;
   const working = { working: entry.agent_status === 'working' };
-  const win = await chatClaude.readTail(file, limit, working);
+  const win = await reader.readTail(file, limit, working);
   if (mark) mark('readTail');
   const live = {
     res: {
@@ -1686,7 +1779,7 @@ async function replyFromHerdrRecord(res, paneId, agent, entry, herdrSessionId, l
     event: 'chat_read_herdr_record', pane_id: paneId, session_id: herdrSessionId,
     scan_ms: scanMs, bytes: win.tailBytes, messages: win.messages.length,
   }));
-  chatReply(res, base, { kind: chatClaude.SOURCE_KIND, session_id: herdrSessionId, path: file }, win, true, 0);
+  chatReply(res, base, { kind: reader.SOURCE_KIND, session_id: herdrSessionId, path: file }, win, true, 0);
   if (clk) clk.done({ lane: 'herdr-record', scan: 'herdr-record', scan_ms: scanMs, messages: win.messages.length, tail_bytes: win.tailBytes, file_size: win.eof });
   return SERVED;
 }
@@ -1744,7 +1837,7 @@ async function handleChat(req, res, url) {
   const session = entry.agent_session;
   const agent = String((session && session.agent) || entry.agent || '');
   const herdrSessionId = session && session.value != null ? String(session.value) : '';
-  if (agent !== 'claude' && agent !== 'hermes') {
+  if (agent !== 'claude' && agent !== 'pi' && agent !== 'hermes') {
     throw {
       code: 'unsupported_agent',
       message: `agent "${agent}" has no structured log this server can read — the raw terminal view stays available`,
@@ -1761,7 +1854,7 @@ async function handleChat(req, res, url) {
   // and the scan finishes behind the reply instead of in front of it. A window
   // read, a reader pick and every hermes pane keep the resolving road below.
   let live = null;
-  if (tail && agent === 'claude' && !readerPick) {
+  if (tail && fileLogReader(agent) && !readerPick) {
     const job = liveSessionFor(paneId, entry, agent, herdrSessionId, agents, null, mark);
     const raced = await raceDeadline(job, SCAN_WAIT_MS);
     if (raced === SCAN_TIMEOUT) {
@@ -1825,13 +1918,14 @@ async function handleChat(req, res, url) {
 
   const base = Object.assign({ pane_id: paneId, agent }, fields);
 
-  if (agent === 'claude') {
-    const file = chatClaude.findSessionFile(sessionId);
+  const reader = fileLogReader(agent);
+  if (reader) {
+    const file = reader.findSessionFile(sessionId);
     mark('findSessionFile');
     if (!file) {
       throw {
         code: 'session_file_missing',
-        message: `no session file "${sessionId}.jsonl" under ${chatClaude.projectsRoot()}`,
+        message: `no session file "${sessionId}.jsonl" under ${agent === 'pi' ? chatPi.sessionsRoot() : chatClaude.projectsRoot()}`,
         extra: Object.assign({}, fields, { pane_id: paneId, agent }),
       };
     }
@@ -1841,7 +1935,7 @@ async function handleChat(req, res, url) {
     if (!known.exists || !known.cwd) {
       throw { code: 'pane_not_found', message: `pane "${paneId}" has no cwd in the herdr snapshot` };
     }
-    const identity = await chatClaude.verifyCwd(file, known.cwd);
+    const identity = await reader.verifyCwd(file, known.cwd);
     mark('verifyCwd');
     if (!identity.ok && identity.reason === 'mismatch') {
       throw {
@@ -1859,8 +1953,8 @@ async function handleChat(req, res, url) {
     }
 
     const win = tail
-      ? await chatClaude.readTail(file, limit, working)
-      : await chatClaude.readWindow(file, since, limit, working);
+      ? await reader.readTail(file, limit, working)
+      : await reader.readWindow(file, since, limit, working);
     mark('readTail');
     Object.assign(base, observeBinding(paneId, sessionId, live, win));
     // §13.12 item 1: this reply was built from a verified binding, so it is what the
@@ -1869,7 +1963,7 @@ async function handleChat(req, res, url) {
     // remembered: the pick is that request's binding, not the pane's (§9.5), and a
     // memory of it would keep serving the picked session after the pick is gone.
     if (!readerPick) rememberBinding(paneId, agent, entry, live, file);
-    const reply = chatReply(res, base, { kind: chatClaude.SOURCE_KIND, session_id: sessionId, path: file }, win, tail, since);
+    const reply = chatReply(res, base, { kind: reader.SOURCE_KIND, session_id: sessionId, path: file }, win, tail, since);
     if (clk) clk.done({ lane: 'resolved', scan: live.scan, messages: win.messages.length, tail_bytes: win.tailBytes, file_size: win.eof });
     return reply;
   }
@@ -1976,7 +2070,7 @@ async function handleStatus(req, res, url) {
     if (!known.exists) throw { code: 'pane_not_found', message: `unknown pane_id "${paneId}"` };
   }
 
-  const family = agent === 'hermes' ? 'hermes' : agent === 'claude' ? 'claude' : 'other';
+  const family = agent === 'hermes' ? 'hermes' : agent === 'claude' ? 'claude' : agent === 'pi' ? 'pi' : 'other';
 
   let text = null;
   let textError = null;
@@ -2009,12 +2103,29 @@ async function handleStatus(req, res, url) {
     }
   }
 
+  let piTail = null;
+  if (family === 'pi') {
+    // herdr never publishes a pi session id, so the binding this view established
+    // for /api/chat is the only source; a pane never chatted has no context yet.
+    const mem = readMemory.get(paneId);
+    if (!sessionId && mem && mem.agent === 'pi' && mem.session_id) sessionId = mem.session_id;
+    if (!sessionId) {
+      piTail = { ok: false, reason: 'no session is bound to this pane yet — open its chat view once, or start a conversation in it' };
+    } else {
+      const file = chatPi.findSessionFile(sessionId);
+      piTail = file
+        ? await statusView.readUsageTail(file, { kind: 'pi' })
+        : { ok: false, reason: `no session file "${sessionId}.jsonl" under ${chatPi.sessionsRoot()}` };
+    }
+  }
+
   const view = statusView.interpret({
     agent,
     agent_known: !!entry,
     text,
     text_error: textError,
     claude_tail: claudeTail,
+    pi_tail: piTail,
   });
 
   ok(res, {
@@ -2241,6 +2352,7 @@ async function handle(req, res) {
     if (pathname === '/api/git') return handleGit(req, res, url);   // §7.1
     if (pathname === '/api/chat') return handleChat(req, res, url); // §8.2
     if (pathname === '/api/status') return handleStatus(req, res, url); // §12.3
+    if (pathname === '/api/prompt') return handlePromptDetect(req, res, url);
     // §2 convenience: GET /api/cli?argv=agent+list — same as the POST body, with
     // argv split on whitespace. No quoting support; use POST for arguments that
     // contain spaces.
@@ -2260,6 +2372,7 @@ async function handle(req, res) {
       '/api/pane/prompt': handlePrompt,
       '/api/pane/keys': handleKeys,
       '/api/pane/text': handleText,
+      '/api/prompt/answer': handlePromptAnswer,
       '/api/rpc': handleRpc,
       '/api/cli': handleCli,
       '/api/fanout': handleFanout,

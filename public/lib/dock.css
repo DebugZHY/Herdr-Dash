@@ -97,7 +97,10 @@
   text-transform: lowercase;
 }
 .hd-dock-family[data-family="hermes"] { color: var(--st-working); border-color: var(--st-working); }
-.hd-dock-family[data-family="claude"] { color: var(--accent); border-color: var(--accent); }
+.hd-dock-family[data-family="claude"],
+.hd-dock-family[data-family="pi"] { color: var(--accent); border-color: var(--accent); }
+/* pi prints no limit and no bar either, so its usage row reuses claude's stacked block (the shared
+   .hd-dock-claude class keeps the two looks from drifting); only the badge takes a pi selector. */
 .hd-dock-family[data-family="none"],
 .hd-dock-family[data-family="other"] { color: var(--fg-dim); }
 .hd-dock-when {

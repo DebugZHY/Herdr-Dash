@@ -61,6 +61,9 @@ if (typeof window.HD.register !== 'function') {
      mounted by mountModules() — the shell in index.html (#dockHost, #dockResize, #dockToggle) is W2's. -->
 <script src="/lib/dock.js" defer></script>
 
+<!-- the pending agent question cards (W3). Self-registers like dock.js, so mountModules() mounts it. -->
+<script src="/lib/prompt.js" defer></script>
+
 <!-- app.js publishes window.HD.ctx and mounts every module present -->
 <script src="/app.js" defer></script>
 </head>

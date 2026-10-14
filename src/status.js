@@ -386,9 +386,15 @@ function parseClaudeFooter(text) {
  * in the window (the window's own first line may be a partial one; a failed
  * `JSON.parse` skips it, which is the only correct thing to do with a half record).
  *
+ * `opts.kind` selects the shape: claude writes `type:"assistant"` records whose
+ * `message.usage` holds the counters; pi writes `type:"message"` records with
+ * `message.role === "assistant"`, and its model travels on a separate
+ * `type:"model_change"` record rather than on the message. Defaults to claude.
+ *
  * @returns {ok:true, usage, model, ts, mtime_ms, bytes_read} | {ok:false, reason, mtime_ms?}
  */
-async function readUsageTail(file) {
+async function readUsageTail(file, opts) {
+  const kind = opts && opts.kind === 'pi' ? 'pi' : 'claude';
   let fh;
   try {
     fh = await fsp.open(file, 'r');
@@ -399,28 +405,56 @@ async function readUsageTail(file) {
     const st = await fh.stat();
     if (!st.isFile()) return { ok: false, reason: 'the session log path is not a file' };
     if (st.size === 0) return { ok: false, reason: 'the session log is empty', mtime_ms: st.mtimeMs };
-    const start = Math.max(0, st.size - TAIL_BYTES);
+    // pi writes its model on a `model_change` record at the head of the session
+    // while the usage records sit at the tail, so a pi read spans the whole file;
+    // claude keeps the bounded tail (its usage records carry the model inline).
+    const span = kind === 'pi' ? st.size : TAIL_BYTES;
+    const start = Math.max(0, st.size - span);
     const len = st.size - start;
     const buf = Buffer.alloc(len);
     const { bytesRead } = await fh.read(buf, 0, len, start);
     const lines = buf.subarray(0, bytesRead).toString('utf8').split('\n');
+    let usage = null;
+    let usageRecord = null;
+    let modelChange = null;
     for (let i = lines.length - 1; i >= 0; i--) {
       if (!lines[i].trim()) continue;
       let rec;
       try { rec = JSON.parse(lines[i]); } catch (e) { continue; }
-      const usage = rec && rec.message && rec.message.usage;
-      if (rec && rec.type === 'assistant' && usage && typeof usage === 'object') {
-        return {
-          ok: true,
-          usage,
-          model: (rec.message && rec.message.model) || rec.model || usage.model || null,
-          ts: rec.timestamp || null,
-          mtime_ms: st.mtimeMs,
-          bytes_read: bytesRead,
-          window_start: start,
-          file_size: st.size,
-        };
+      if (kind === 'pi') {
+        if (!modelChange && rec && rec.type === 'model_change' && typeof rec.modelId === 'string' && rec.modelId) {
+          modelChange = rec.modelId;
+        }
+        const mess = rec && rec.message;
+        if (!usageRecord && rec && rec.type === 'message' && mess && mess.role === 'assistant'
+          && mess.usage && typeof mess.usage === 'object') {
+          usage = mess.usage;
+          usageRecord = rec;
+        }
+        if (usageRecord && modelChange) break;
+      } else {
+        const u = rec && rec.message && rec.message.usage;
+        if (rec && rec.type === 'assistant' && u && typeof u === 'object') {
+          usage = u;
+          usageRecord = rec;
+          break;
+        }
       }
+    }
+    if (usageRecord) {
+      const model = kind === 'pi'
+        ? (modelChange || (usage && usage.model) || null)
+        : ((usageRecord.message && usageRecord.message.model) || usageRecord.model || (usage && usage.model) || null);
+      return {
+        ok: true,
+        usage,
+        model,
+        ts: usageRecord.timestamp || null,
+        mtime_ms: st.mtimeMs,
+        bytes_read: bytesRead,
+        window_start: start,
+        file_size: st.size,
+      };
     }
     return {
       ok: false,
@@ -507,6 +541,55 @@ function contextFromClaude(tail, footer, textError) {
   };
 }
 
+/**
+ * pi's context block. pi's own usage record carries the four counters, so `tokens`
+ * is input + cacheRead + cacheWrite + output. pi prints no "% until auto-compact"
+ * footer and no footer context figure at all, so both stay null with a plain
+ * reason instead of a value this reader cannot see.
+ */
+function contextFromPi(tail) {
+  const absent = {};
+  if (!tail || !tail.ok) {
+    absent.context = (tail && tail.reason) || 'there is no session log to read a context figure from';
+    return { context: null, absent };
+  }
+  const u = tail.usage || {};
+  const parts = {
+    input: u.input,
+    cacheRead: u.cacheRead,
+    cacheWrite: u.cacheWrite,
+    output: u.output,
+  };
+  const missing = Object.keys(parts).filter((k) => !Number.isFinite(parts[k]));
+  if (missing.length) {
+    absent.context = `the session log's last assistant message carries no ${missing.join(', ')} token count(s), so no total can be added up`;
+    return { context: null, absent };
+  }
+  const tokens = parts.input + parts.cacheRead + parts.cacheWrite + parts.output;
+  const ageS = tail.mtime_ms != null ? Math.max(0, Math.round((Date.now() - tail.mtime_ms) / 1000)) : null;
+  absent['context.until_auto_compact_pct'] = 'pi prints no "% until auto-compact" footer, so there is no such figure to read';
+  absent['context.source_line'] = "pi's footer prints no context figure, so there is no source line for it";
+  if (ageS === null) absent['context.age_s'] = "the session log's own timestamp could not be read";
+
+  return {
+    context: {
+      source: 'pi_jsonl',
+      model: tail.model || null,
+      tokens,
+      breakdown: {
+        input: parts.input,
+        cache_read: parts.cacheRead,
+        cache_create: parts.cacheWrite,
+        output: parts.output,
+      },
+      until_auto_compact_pct: null,
+      source_line: null,
+      age_s: ageS,
+    },
+    absent,
+  };
+}
+
 // ── the shape §12.3 freezes ─────────────────────────────────────────────────
 
 /**
@@ -518,6 +601,7 @@ function contextFromClaude(tail, footer, textError) {
  *   text, text_error,     the `pane.read` result for `visible` (text null when
  *                         the read was refused, with `text_error` = herdr's code)
  *   claude_tail           the readUsageTail() result for a claude pane
+ *   pi_tail               the readUsageTail({kind:'pi'}) result for a pi pane
  * }
  * @returns {family, status, context, processes, lines_read, absent}
  *   `lines_read` (§12.3 4b) = how many lines of pane text this answer was
@@ -527,7 +611,7 @@ function contextFromClaude(tail, footer, textError) {
  */
 function interpret(input) {
   const agent = input.agent == null ? '' : String(input.agent);
-  const family = agent === 'hermes' ? 'hermes' : agent === 'claude' ? 'claude' : 'other';
+  const family = agent === 'hermes' ? 'hermes' : agent === 'claude' ? 'claude' : agent === 'pi' ? 'pi' : 'other';
   let status = null;
   let context = null;
   let processes = null;
@@ -549,6 +633,15 @@ function interpret(input) {
     const footer = parseClaudeFooter(input.text);
     const textError = input.text === null ? (input.text_error || 'the read failed') : null;
     const c = contextFromClaude(input.claude_tail, footer, textError);
+    context = c.context;
+    Object.assign(absent, c.absent);
+  } else if (family === 'pi') {
+    // pi's figures are its own jsonl's. It prints no ☤ line and no process block
+    // (hermes' own output), and no "% until auto-compact" footer, so all three are
+    // absent WITH the reason said out loud.
+    absent.status = `the ${STATUS_MARK} status line is hermes' own output; this pane runs pi, whose figures are in "context"`;
+    absent.processes = `the "Processes ${BAR} N running" block is hermes' own output; this pane runs pi`;
+    const c = contextFromPi(input.pi_tail);
     context = c.context;
     Object.assign(absent, c.absent);
   } else {
@@ -583,5 +676,6 @@ module.exports = {
   parseClaudeFooter,
   readUsageTail,
   contextFromClaude,
+  contextFromPi,
   interpret,
 };

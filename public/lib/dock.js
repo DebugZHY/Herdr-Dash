@@ -570,7 +570,7 @@
     function familyOf(body) {
       if (!body) return 'none';
       var f = txt(body.family);
-      return (f === 'hermes' || f === 'claude') ? f : 'other';
+      return (f === 'hermes' || f === 'claude' || f === 'pi') ? f : 'other';
     }
     function paneOf(ans) {
       return txt(ans && ans.pane_id) || curPane || selectedPane() || null;
@@ -688,16 +688,17 @@
 
       /* claude: no limit and no bar exist anywhere for it (§12.0) — so the shape is stacked lines
          with the context computed from claude's own jsonl, never hermes' row */
-      if (family === 'claude' && cx) {
+      if ((family === 'claude' || family === 'pi') && cx) {
+        var who = family === 'pi' ? 'pi' : 'claude';
         row = el('div', CLS.usage);
-        row.setAttribute('data-shape', 'claude');
+        row.setAttribute('data-shape', family);
         var line2 = el('div', CLS.claude);
         var mOk = has(cx.model);
         fig(line2, 'model', mOk ? txt(cx.model) : 'model not printed',
-          { missing: !mOk, title: mOk ? 'the model name the server read from claude’s records' : 'the response carried no model name' });
+          { missing: !mOk, title: mOk ? 'the model name the server read from ' + who + '’s records' : 'the response carried no model name' });
         var tN = num(cx.tokens);
         fig(line2, 'context', tN === null ? 'context size unknown' : 'context ~' + group(tN) + ' tokens',
-          { missing: tN === null, title: 'computed by the server from the last assistant record in claude’s jsonl — claude itself prints no context figure' });
+          { missing: tN === null, title: 'computed by the server from the last assistant record in ' + who + '’s jsonl — ' + who + ' itself prints no context figure' });
         var bd = (cx.breakdown && typeof cx.breakdown === 'object') ? cx.breakdown : null;
         var parts = [];
         var names = [['input', 'input'], ['cache_read', 'cache read'], ['cache_create', 'cache create'], ['output', 'output']];
@@ -710,15 +711,18 @@
         line2.appendChild(bdEl);
         var up = num(cx.until_auto_compact_pct);
         if (up === null) {
-          emptyInto(row, 'no-until', 'claude’s footer printed no auto-compact figure — the tokens above are all it shows');
+          emptyInto(row, 'no-until', family === 'pi'
+            ? (absentReason(body, 'until_auto_compact_pct') || 'pi prints no auto-compact figure — the tokens above are all it shows')
+            : 'claude’s footer printed no auto-compact figure — the tokens above are all it shows');
         } else {
           fig(line2, 'until', pcts(up) + ' until auto-compact',
-            { title: 'claude’s own footer figure — a different denominator from hermes’ used_pct, so the two are never one number' });
+            { title: who + '’s own footer figure — a different denominator from hermes’ used_pct, so the two are never one number' });
         }
         row.appendChild(line2);
-        note(row, 'claude-no-limit', 'claude prints no used/limit figure and there is no limit table anywhere — these numbers are not comparable with hermes’');
+        note(row, family === 'pi' ? 'pi-no-limit' : 'claude-no-limit',
+          who + ' prints no used/limit figure and there is no limit table anywhere — these numbers are not comparable with hermes’');
         var ageS = num(cx.age_s);
-        if (ageS !== null) note(row, 'claude-age', 'claude’s own record, ' + secs(ageS) + ' old');
+        if (ageS !== null) note(row, family === 'pi' ? 'pi-age' : 'claude-age', who + '’s own record, ' + secs(ageS) + ' old');
         s.appendChild(row);
         return s;
       }
