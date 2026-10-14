@@ -181,8 +181,10 @@ if (typeof window.HD.register !== 'function') {
           <button class="key" data-key="ctrl+o" type="button">ctrl+o</button>
         </div>
         <span class="dim small">agent</span>
-        <button id="agentModelBtn" class="btn" type="button"
-                title="switch the selected pane's model (claude: opens its /model selector, answered in the card above)">model…</button>
+        <select id="agentModelSel" class="btn" disabled
+                title="the selected claude pane's model — pick another to switch it live">
+          <option>model…</option>
+        </select>
         <span class="dim small">text</span>
         <input id="literalText" class="mono grow" type="text" placeholder="literal text (sent verbatim, no newline)">
         <button id="literalSend" class="btn" type="button">send text</button>

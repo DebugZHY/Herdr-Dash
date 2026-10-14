@@ -475,6 +475,7 @@ function renderHeader() {
   const d = $('hStatusDot');
   if (d) d.className = 'dot ' + st;
   renderUsage();                 // §12.2.2: a pane change re-evaluates the chip at once, not in 500ms
+  if (typeof window.__hdUpdateModelSel === 'function') window.__hdUpdateModelSel();
 }
 
 function renderAge() {
@@ -2811,24 +2812,60 @@ function init() {
   const lsb = $('literalSend');
   if (lsb) lsb.addEventListener('click', sendLiteral);
 
-  /* the model switcher: only meaningful for a claude pane right now. Clicking sends the pane
-     /model (which opens its selector at agent_status 'done'), then asks the prompt module to
-     watch that pane so the selector is answered in a card instead of in the terminal. */
-  const mb = $('agentModelBtn');
-  if (mb) mb.addEventListener('click', async function () {
-    const paneId = state.selected;
-    if (!paneId) { toast('no pane selected', 'info'); return; }
-    const pane = findPane(paneId);
+  /* the model droplist: shows the selected claude pane's current model and switches it when
+     the reader picks another. The list is fetched lazily (opening /model, parsing, esc-ing it
+     closed) the first time a claude pane is selected, and refetched after every switch. */
+  const modelSel = $('agentModelSel');
+  let modelCache = { paneId: null, models: null };   // models for the pane the list was built for
+  async function refreshModelList(paneId, force) {
+    if (!modelSel) return;
+    if (!force && modelCache.paneId === paneId && modelCache.models) { fillModelSel(modelCache.models); return; }
+    modelSel.disabled = true;
+    setModelSelPlaceholder('loading…');
+    const body = await api('/api/model?pane_id=' + encodeURIComponent(paneId));
+    if (!body || !body.ok) { setModelSelPlaceholder('model: —'); modelSel.disabled = true; modelCache = { paneId: null, models: null }; return; }
+    modelCache = { paneId: paneId, models: body.models || [] };
+    fillModelSel(modelCache.models);
+  }
+  function setModelSelPlaceholder(text) {
+    if (!modelSel) return;
+    modelSel.innerHTML = '';
+    const o = document.createElement('option');
+    o.textContent = text; o.value = '';
+    modelSel.appendChild(o);
+  }
+  function fillModelSel(models) {
+    if (!modelSel) return;
+    modelSel.innerHTML = '';
+    if (!models.length) { setModelSelPlaceholder('model: —'); modelSel.disabled = true; return; }
+    models.forEach(function (m) {
+      const o = document.createElement('option');
+      o.value = String(m.n);
+      o.textContent = m.label;
+      if (m.current) o.selected = true;
+      modelSel.appendChild(o);
+    });
+    modelSel.disabled = false;
+  }
+  function updateModelSel() {
+    if (!modelSel) return;
+    const pane = state.selected ? findPane(state.selected) : null;
     const agent = pane && pane.agent;
-    if (agent !== 'claude') { toast('model switching is wired for claude panes only (this pane runs ' + (agent || 'no agent') + ')', 'info'); return; }
-    /* send /model as the pane's command (text + enter), then ask the prompt module to watch
-       the pane — its /model selector sits at agent_status 'done', which the blocked-only poll
-       would never see, so the card only appears because we watch it */
-    await postJSON('/api/pane/text', { pane_id: paneId, text: '/model' });
-    await postJSON('/api/pane/keys', { pane_id: paneId, keys: ['enter'] });
-    const promptMod = state.moduleApi && state.moduleApi.prompt;
-    if (promptMod && typeof promptMod.watch === 'function') promptMod.watch(paneId);
+    if (!pane || agent !== 'claude') { setModelSelPlaceholder(agent ? 'model: n/a' : 'model…'); modelSel.disabled = true; modelCache = { paneId: null, models: null }; return; }
+    refreshModelList(state.selected, false);
+  }
+  window.__hdUpdateModelSel = updateModelSel;
+  if (modelSel) modelSel.addEventListener('change', async function () {
+    const paneId = state.selected;
+    const n = Number(modelSel.value);
+    if (!paneId || !Number.isInteger(n) || n < 1) return;
+    modelSel.disabled = true;
+    const body = await postJSON('/api/model', { pane_id: paneId, n: n });
+    if (!body || !body.ok) { toast('model switch failed — ' + errText(body), 'error'); }
+    else { toast('model → ' + (body.label || ('option ' + n)), 'ok'); }
+    refreshModelList(paneId, true);                  // refetch so the ✓-marked current row is accurate
   });
+
   const lt = $('literalText');
   if (lt) lt.addEventListener('keydown', function (e) { if (e.key === 'Enter') sendLiteral(); });
 

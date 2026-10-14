@@ -509,6 +509,64 @@ async function handlePromptAnswer(req, res, body) {
   throw { code: 'bad_request', message: 'provide one of: answer (string), keys (array), or cancel:true' };
 }
 
+// ── model switching (round: model droplist) ───────────────────────────────
+
+/* Open claude's /model picker on a pane, read its rows, then esc it closed. The picker sits
+   at agent_status 'done' and is arrow-driven with the highlight on the current model, so both
+   the option list and the highlight anchor come from promptdetect's claude_model parse. */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function readModelPicker(paneId) {
+  await hdr.request('pane.send_text', { pane_id: paneId, text: '/model' }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+  await hdr.request('pane.send_keys', { pane_id: paneId, keys: ['enter'] }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+  await sleep(1500);                                   // let the picker render
+  const read = await hdr.request(
+    'pane.read',
+    { pane_id: paneId, source: 'visible', lines: 60, format: 'text', strip_ansi: true },
+    { timeoutMs: DEFAULT_TIMEOUT_MS },
+  );
+  const text = (read && read.read && read.read.text) || (read && read.text) || '';
+  const prompt = promptdetect.detect(text);
+  return prompt && prompt.kind === 'claude_model' ? prompt : null;
+}
+
+/* GET /api/model?pane_id=.. -> { ok, models:[{n,label,current}], highlight_n } — opens /model,
+   parses it, escs it closed. */
+async function handleModelGet(req, res, url) {
+  const paneId = url.searchParams.get('pane_id');
+  if (!paneId) throw { code: 'bad_request', message: '"pane_id" query parameter is required' };
+  const prompt = await readModelPicker(paneId);
+  await hdr.request('pane.send_keys', { pane_id: paneId, keys: ['esc'] }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+  if (!prompt) throw { code: 'no_picker', message: 'the /model selector did not appear (is this a claude pane at an idle prompt?)' };
+  const models = prompt.options.map((o) => ({ n: o.n, label: o.label, current: o.n === prompt.highlight_n }));
+  ok(res, { pane_id: paneId, models: models, highlight_n: prompt.highlight_n });
+}
+
+/* POST /api/model {pane_id, n} -> switch to option n: open /model, walk from the highlighted
+   (current) row to n, enter to confirm. */
+async function handleModelPost(req, res, body) {
+  const paneId = requireString(body, 'pane_id');
+  const n = Number(body.n);
+  if (!Number.isInteger(n) || n < 1) throw { code: 'bad_request', message: '"n" must be a positive integer option number' };
+  const prompt = await readModelPicker(paneId);
+  if (!prompt) {
+    await hdr.request('pane.send_keys', { pane_id: paneId, keys: ['esc'] }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    throw { code: 'no_picker', message: 'the /model selector did not appear' };
+  }
+  const target = prompt.options.find((o) => o.n === n);
+  if (!target) {
+    await hdr.request('pane.send_keys', { pane_id: paneId, keys: ['esc'] }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    throw { code: 'bad_request', message: 'no model option numbered ' + n };
+  }
+  const from = (prompt.highlight_n !== null && prompt.highlight_n !== undefined) ? prompt.highlight_n : 1;
+  const delta = n - from;
+  const keys = [];
+  const step = delta >= 0 ? 'down' : 'up';
+  for (let i = 0; i < Math.abs(delta); i++) keys.push(step);
+  keys.push('enter');                                  // one enter both picks and confirms
+  const result = await hdr.request('pane.send_keys', { pane_id: paneId, keys }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+  ok(res, { pane_id: paneId, n: n, label: target.label, result });
+}
+
 // POST /api/rpc {method, params} — raw passthrough for any herdr method.
 async function handleRpc(req, res, body) {
   const method = requireString(body, 'method');
@@ -2353,6 +2411,7 @@ async function handle(req, res) {
     if (pathname === '/api/chat') return handleChat(req, res, url); // §8.2
     if (pathname === '/api/status') return handleStatus(req, res, url); // §12.3
     if (pathname === '/api/prompt') return handlePromptDetect(req, res, url);
+    if (pathname === '/api/model') return handleModelGet(req, res, url);
     // §2 convenience: GET /api/cli?argv=agent+list — same as the POST body, with
     // argv split on whitespace. No quoting support; use POST for arguments that
     // contain spaces.
@@ -2373,6 +2432,7 @@ async function handle(req, res) {
       '/api/pane/keys': handleKeys,
       '/api/pane/text': handleText,
       '/api/prompt/answer': handlePromptAnswer,
+      '/api/model': handleModelPost,
       '/api/rpc': handleRpc,
       '/api/cli': handleCli,
       '/api/fanout': handleFanout,
