@@ -101,6 +101,7 @@
   }
   function kindLabel(kind) {
     if (kind === 'claude_ask') return 'ask';
+    if (kind === 'claude_model') return 'model';
     if (kind === 'hermes_clarify') return 'clarify';
     if (kind === 'pi_picker') return 'picker';
     if (kind === 'yn') return 'yes/no';
@@ -108,6 +109,7 @@
   }
   function agentOf(kind) {
     if (kind === 'claude_ask') return 'claude';
+    if (kind === 'claude_model') return 'claude';
     if (kind === 'hermes_clarify') return 'hermes';
     if (kind === 'pi_picker') return 'pi';
     if (kind === 'yn') return 'yn';
@@ -233,6 +235,7 @@
         options: Array.isArray(prompt.options) ? prompt.options : [],
         free_text: !!prompt.free_text,
         free_text_n: (prompt.free_text_n === undefined || prompt.free_text_n === null) ? null : prompt.free_text_n,
+        highlight_n: (prompt.highlight_n === undefined || prompt.highlight_n === null) ? null : prompt.highlight_n,
         answer_hint: txt(prompt.answer_hint)
       };
     }
@@ -257,20 +260,40 @@
       });
     }
 
-    /* one poll over every blocked pane; panes that stopped being blocked leave the map here */
+    /* panes the reader opened a selector on (e.g. claude /model) sit at agent_status 'done',
+       not 'blocked', so the blocked-only poll never sees them. watch() adds such a pane to the
+       poll set for a while; a pane whose selector is answered or dismissed drops out when its
+       detection resolves to no-prompt. */
+    var watched = {};                              // pane_id -> expiry (clock ms)
+    var WATCH_MS = 120000;
+    function watch(paneId) {
+      if (!paneId) return false;
+      watched[paneId] = clock() + WATCH_MS;
+      poll();                                      // read it at once, not after a full cadence
+      return true;
+    }
+
+    /* one poll over every blocked pane plus every watched pane; panes that stopped being
+       blocked AND are not watched leave the map here */
     function poll() {
       if (unmounted || busy || document.hidden) return Promise.resolve();
       var panes = safePanes();
-      var blocked = [];
-      var blockedIds = {};
+      var now = clock();
+      var target = [];
+      var targetIds = {};
       for (var i = 0; i < panes.length; i++) {
         var p = panes[i];
-        if (p && p.pane_id && p.agent_status === 'blocked') { blocked.push(p); blockedIds[p.pane_id] = true; }
+        if (!p || !p.pane_id) continue;
+        var isBlocked = p.agent_status === 'blocked';
+        var isWatched = watched[p.pane_id] !== undefined && watched[p.pane_id] > now;
+        if (isBlocked || isWatched) { target.push(p.pane_id); targetIds[p.pane_id] = true; }
       }
-      detections.forEach(function (d, id) { if (!blockedIds[id]) detections.delete(id); });
+      /* expire stale watches */
+      for (var w in watched) { if (Object.prototype.hasOwnProperty.call(watched, w) && watched[w] <= now) delete watched[w]; }
+      detections.forEach(function (d, id) { if (!targetIds[id]) detections.delete(id); });
       var jobs = [];
-      for (var j = 0; j < blocked.length; j++) {
-        var id = blocked[j].pane_id;
+      for (var j = 0; j < target.length; j++) {
+        var id = target[j];
         if (sent.has(id)) continue;               // a pane whose answer was just sent is not re-asked mid-fade
         jobs.push(detectPane(id));
       }
@@ -328,6 +351,19 @@
       /* claude maps a typed digit to the numbered item; hermes' clarify and pi's picker are
          arrow-driven and ignore typed digits, so they take a keystroke plan instead */
       if (d.kind === 'claude_ask') { post(d.pane_id, { answer: String(opt.n) }); return; }
+      /* claude's /model picker ignores typed digits and opens with the highlight on the CURRENT
+         model, so the answer is a relative arrow walk from that highlight to the target row,
+         then enter (one enter both picks and confirms — verified live) */
+      if (d.kind === 'claude_model') {
+        var from = (d.highlight_n !== null && d.highlight_n !== undefined) ? d.highlight_n : 1;
+        var delta = (opt.n || 1) - from;
+        var keys = [];
+        var step = delta >= 0 ? 'down' : 'up';
+        for (var k = 0; k < Math.abs(delta); k++) keys.push(step);
+        keys.push('enter');
+        post(d.pane_id, { keys: keys });
+        return;
+      }
       answerByKeys(d.pane_id, (opt.n || 1) - 1);
     }
     function answerByKeys(paneId, downs) {
@@ -656,6 +692,7 @@
           panes: Array.from(detections.keys())
         };
       },
+      watch: function (paneId) { return watch(paneId); },
       __detect: __detect,
       __count: function () { return detections.size + sent.size; },
       __setClock: function (fn) { if (typeof fn === 'function') clock = fn; return true; }
@@ -687,6 +724,7 @@
     mount: function (ctx) { return mod.mount(ctx); },
     instance: function () { return instance; },
     detect: function (paneId) { return instance ? instance.__detect(paneId) : Promise.resolve(null); },
+    watch: function (paneId) { return instance ? instance.watch(paneId) : false; },
     count: function () { return instance ? instance.__count() : 0; },
     state: function () { return instance ? instance.state() : null; },
     unmount: function () { return instance ? instance.unmount() : false; },

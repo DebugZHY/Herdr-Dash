@@ -2810,6 +2810,25 @@ function init() {
   });
   const lsb = $('literalSend');
   if (lsb) lsb.addEventListener('click', sendLiteral);
+
+  /* the model switcher: only meaningful for a claude pane right now. Clicking sends the pane
+     /model (which opens its selector at agent_status 'done'), then asks the prompt module to
+     watch that pane so the selector is answered in a card instead of in the terminal. */
+  const mb = $('agentModelBtn');
+  if (mb) mb.addEventListener('click', async function () {
+    const paneId = state.selected;
+    if (!paneId) { toast('no pane selected', 'info'); return; }
+    const pane = findPane(paneId);
+    const agent = pane && pane.agent;
+    if (agent !== 'claude') { toast('model switching is wired for claude panes only (this pane runs ' + (agent || 'no agent') + ')', 'info'); return; }
+    /* send /model as the pane's command (text + enter), then ask the prompt module to watch
+       the pane — its /model selector sits at agent_status 'done', which the blocked-only poll
+       would never see, so the card only appears because we watch it */
+    await postJSON('/api/pane/text', { pane_id: paneId, text: '/model' });
+    await postJSON('/api/pane/keys', { pane_id: paneId, keys: ['enter'] });
+    const promptMod = state.moduleApi && state.moduleApi.prompt;
+    if (promptMod && typeof promptMod.watch === 'function') promptMod.watch(paneId);
+  });
   const lt = $('literalText');
   if (lt) lt.addEventListener('keydown', function (e) { if (e.key === 'Enter') sendLiteral(); });
 

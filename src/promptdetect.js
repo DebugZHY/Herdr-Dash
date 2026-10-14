@@ -51,7 +51,7 @@ function numberedClean(line) {
   return it ? { n: it.n, label: cleanLabel(it.label) } : it;
 }
 
-const CLAUDE_FOOTER = /enter to select|to navigate|esc to cancel|to select, enter|enter to lock|to lock/i;
+const CLAUDE_FOOTER = /enter to select|to navigate|esc to cancel|to select, enter|enter to lock|to lock|enter to set as default|to use this session only/i;
 const YN = /(\[\s*y\s*\/\s*n\s*\]|\(\s*y(?:es)?\s*\/\s*n(?:o)?\s*\)|\[\s*y\s*\/\s*N\s*\]|\byes\s*\/\s*no\b)\s*[:?]?\s*$/i;
 
 function isMetaOption(label) {
@@ -59,7 +59,17 @@ function isMetaOption(label) {
 }
 /* a "(Recommended)"-style suffix an agent appends to an option label — strip it. */
 function cleanLabel(label) {
-  return String(label).replace(/\s*\((?:recommended|type your answer|type something)\)\s*$/i, '').trim();
+  let t = String(label);
+  /* a trailing "(recommended) ✔"-style marker */
+  t = t.replace(/\s*\((?:recommended|type your answer|type something)\)\s*[✔✓]?\s*$/i, '');
+  /* claude's /model rows read "kimi-k3                  Custom Opus model (1M context) · $5/$25":
+     the model id and its description sit far apart, and the price is noise. Keep "id — desc"
+     but drop the price, the parenthesised context size, and collapse the gap. */
+  t = t.replace(/\s*[·•]\s*\$.*$/, '');                       // drop "· $5/$25 per Mtok"
+  t = t.replace(/\((?:1M|\d+K|\d+M)\s*context\)/i, '');     // drop "(1M context)"
+  t = t.replace(/\s{2,}/, ' — ');                              // first wide gap -> an em dash
+  t = t.replace(/\s{2,}/g, ' ');                               // any remaining gap -> one space
+  return t.trim();
 }
 
 function detectClaude(lines) {
@@ -71,16 +81,23 @@ function detectClaude(lines) {
   if (footerIdx < 0) return null;
 
   const footerText = inner(lines[footerIdx]);
-  const kindName = /enter to lock|to lock/i.test(footerText) ? 'hermes_clarify' : 'claude_ask';
+  /* claude has two numbered selectors: AskUserQuestion answers a typed digit, but /model's
+     picker ignores typed digits and is arrow-driven (verified live). Tell them apart by the
+     footer so the answer goes out as the right kind of input. */
+  const kindName = /enter to lock|to lock/i.test(footerText) ? 'hermes_clarify'
+    : /set as default|use this session only/i.test(footerText) ? 'claude_model'
+    : 'claude_ask';
   const collected = [];
   let firstItemIdx = -1;
   let i = footerIdx - 1;
   let gap = 0;
+  let highlightN = null;                        // the ❯-marked row (claude /model opens on the current model)
   while (i >= 0 && gap < 12) {
     const it = numbered(lines[i]);
     if (it) {
       collected.push({ idx: i, it });
       if (firstItemIdx < 0 || i < firstItemIdx) firstItemIdx = i;
+      if (/❯/.test(lines[i])) highlightN = it.n;
       gap = 0;
     } else {
       gap++;                                    // blank, rule, or option description line
@@ -110,6 +127,7 @@ function detectClaude(lines) {
     options: options,
     free_text: freeText,
     free_text_n: freeText ? meta.n : null,
+    highlight_n: highlightN,
     answer_hint: 'send_text the option number (e.g. "2"); for free text, first send_text the "Type something" number then send_text your text',
     raw: lines.slice(Math.max(0, firstItemIdx - 4), footerIdx + 1),
   };
@@ -125,7 +143,10 @@ function detectPiPicker(lines) {
     const raw = lines[i];
     const t = inner(raw).trim();
     const arrowed = /^\s*[❯›>]/.test(raw) && !/^\s*[❯›>]\s*\d/.test(raw);
-    if (arrowed && t.length > 0 && !/\?/.test(t)) {
+    /* a lone prompt glyph or a "/cmd" echo on the input line (e.g. claude re-printing
+       "❯ /model" after the picker closed) is NOT a picker row */
+    const isInputEcho = /^[❯›>]\s*\//.test(t);
+    if (arrowed && t.length > 0 && !/\?/.test(t) && !isInputEcho) {
       active = true;
       items.push({ n: items.length + 1, label: t.replace(/^[❯›>]\s*/, '') });
       if (firstIdx < 0) firstIdx = i;
