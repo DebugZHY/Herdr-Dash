@@ -132,6 +132,7 @@
 
   function createPrompt(ctx) {
     var events = (ctx && ctx.events) || null;
+    var api = (ctx && ctx.api) || null;
     var container = null;
     var root = null;
     var mounted = false;
@@ -323,33 +324,59 @@
 
     function answerOption(d, opt) {
       if (!opt) return;
-      var answer;
-      if (d.kind === 'yn') answer = /^(y|yes)/i.test(txt(opt.label)) ? 'y' : 'n';
-      else answer = String(opt.n);
-      post(d.pane_id, { answer: answer });
+      if (d.kind === 'yn') { post(d.pane_id, { answer: /^(y|yes)/i.test(txt(opt.label)) ? 'y' : 'n' }); return; }
+      /* claude maps a typed digit to the numbered item; hermes' clarify and pi's picker are
+         arrow-driven and ignore typed digits, so they take a keystroke plan instead */
+      if (d.kind === 'claude_ask') { post(d.pane_id, { answer: String(opt.n) }); return; }
+      answerByKeys(d.pane_id, (opt.n || 1) - 1);
     }
-    function answerPicker(paneId, index) {
+    function answerByKeys(paneId, downs) {
       var keys = [];
-      for (var i = 0; i < index; i++) keys.push('down');
+      for (var i = 0; i < downs; i++) keys.push('down');
       keys.push('enter');
       post(paneId, { keys: keys });
     }
-    /* claude's free-text path is two POSTs: first the option number that opens the box, awaited,
-       then the typed text. Nothing is marked sent until the second one succeeds. */
+    function answerPicker(paneId, index) {
+      answerByKeys(paneId, index);
+    }
+    /* free text takes the path the agent actually supports, per family:
+       - hermes clarify: navigating onto the "Other (type below)" item opens a real text box
+         (verified live) — so: arrow down to the meta item, enter, send_text the text, enter.
+       - claude AskUserQuestion: "Type something" commits the moment it is selected and never
+         opens a box (verified live) — so: esc to release the pane, then a normal agent.prompt.
+       A blocked pane refuses agent.prompt, hence the esc first for claude. */
     function answerFreeText(d, value) {
       var v = txt(value);
       if (!v.trim()) return;
       d._sending = true;
       d._error = null;
       render();
-      var first = (d.free_text_n !== null && d.free_text_n !== undefined)
-        ? postRaw(d.pane_id, { answer: String(d.free_text_n) })
-        : Promise.resolve({ ok: true });
-      first.then(function (res) {
-        if (!res || !res.ok) { if (!unmounted) { setCardError(d.pane_id, res && res.error); render(); } return null; }
-        return postRaw(d.pane_id, { answer: v });
-      }).then(function (res) {
-        if (res === null || unmounted) return;
+      var chain;
+      if (d.kind === 'hermes_clarify') {
+        /* free_text_n is the meta item's number; it sits (free_text_n - 1) downs from the top */
+        var keys = [];
+        var downs = Math.max(0, (d.free_text_n || 1) - 1);
+        for (var i = 0; i < downs; i++) keys.push('down');
+        keys.push('enter');
+        chain = postRaw(d.pane_id, { keys: keys }).then(function (res) {
+          if (!res || !res.ok) return res;
+          return postRaw(d.pane_id, { answer: v });        // type into the box the item opened
+        }).then(function (res) {
+          if (!res || !res.ok) return res;
+          return postRaw(d.pane_id, { keys: ['enter'] });  // submit the box
+        });
+      } else {
+        /* claude (and the safest default): esc, wait for the pane to unblock, then prompt */
+        chain = postRaw(d.pane_id, { cancel: true }).then(function (res) {
+          if (!res || !res.ok) return res;
+          return new Promise(function (resolve) { setTimeout(resolve, 800); }).then(function () {
+            if (!api || typeof api.prompt !== 'function') return { ok: false, error: { code: 'no_prompt_api', message: 'ctx.api.prompt is not available' } };
+            return api.prompt(d.pane_id, v);
+          });
+        });
+      }
+      chain.then(function (res) {
+        if (unmounted) return;
         d._sending = false;
         if (!res || !res.ok) { setCardError(d.pane_id, res && res.error); render(); return; }
         markSent(d.pane_id, 'answer');
@@ -443,13 +470,17 @@
            toggle) — typing an answer is not a command to the dashboard behind the card */
         input.addEventListener('keydown', function (ev) {
           if (ev.stopPropagation) ev.stopPropagation();
-          if (ev.key === 'Enter') { ev.preventDefault(); answerFreeText(d, input.value); }
+          /* Enter does NOT send — an answer goes only through the send button. Enter here is
+             just a keystroke that must not leak to the dashboard behind the card. */
+          if (ev.key === 'Enter') { ev.preventDefault(); }
         }, true);
         input.addEventListener('keydown', function (ev) {
           if (ev.stopPropagation) ev.stopPropagation();
         });
         input.addEventListener('keyup', function (ev) { if (ev.stopPropagation) ev.stopPropagation(); }, true);
         input.addEventListener('keypress', function (ev) { if (ev.stopPropagation) ev.stopPropagation(); }, true);
+        /* a render skipped while this input was focused is made good the moment it blurs */
+        input.addEventListener('blur', function () { render(); });
         var send = el('button', 'hd-prompt-send', 'send');
         send.type = 'button';
         send.disabled = !!sending;
@@ -491,45 +522,20 @@
         root.setAttribute('role', 'region');
         root.setAttribute('aria-label', 'pending agent questions');
       }
-      /* capture each card's free-text draft + focus BEFORE the rebuild wipes the DOM, so a
-         poll that re-renders the stack never throws away what the reader is typing */
-      var drafts = {};
-      if (root) {
-        var oldInputs = root.querySelectorAll('.hd-prompt-card .hd-prompt-input');
-        for (var oi = 0; oi < oldInputs.length; oi++) {
-          var oCard = oldInputs[oi].closest ? oldInputs[oi].closest('.hd-prompt-card') : null;
-          var oPane = oCard ? oCard.getAttribute('data-pane') : null;
-          if (!oPane) continue;
-          drafts[oPane] = {
-            value: oldInputs[oi].value,
-            focused: (document.activeElement === oldInputs[oi]),
-            selStart: oldInputs[oi].selectionStart,
-            selEnd: oldInputs[oi].selectionEnd
-          };
-        }
+      /* IME safety: while the reader is typing into any answer input — above all mid-
+         composition (a Chinese IME holds the text in a composition session that tearing the
+         input out of the DOM would silently drop) — do NOT rebuild the stack. The next render
+         after the input blurs catches the stack up. This replaces an earlier save/restore of
+         the draft text, which kept the value but still killed the composition. */
+      var active = document.activeElement;
+      if (root && active && active.classList && active.classList.contains('hd-prompt-input')) {
+        return;
       }
       clear(root);
       for (var i = 0; i < cards.length; i++) {
         var card = buildCard(cards[i]);
         if (i === 0) card.setAttribute('data-first', '1');
         root.appendChild(card);
-      }
-      /* restore the drafts into the fresh inputs */
-      for (var pane in drafts) {
-        if (!Object.prototype.hasOwnProperty.call(drafts, pane)) continue;
-        var nCard = root.querySelector('.hd-prompt-card[data-pane="' + pane + '"]');
-        if (!nCard) continue;
-        var nInput = nCard.querySelector('.hd-prompt-input');
-        if (!nInput) continue;
-        nInput.value = drafts[pane].value;
-        if (drafts[pane].focused) {
-          try { nInput.focus(); } catch (e) { /* detached */ }
-          try {
-            if (drafts[pane].selStart !== null && drafts[pane].selStart !== undefined) {
-              nInput.setSelectionRange(drafts[pane].selStart, drafts[pane].selEnd);
-            }
-          } catch (e2) { /* a non-text input */ }
-        }
       }
       if (!root.parentNode) container.appendChild(root);
     }
