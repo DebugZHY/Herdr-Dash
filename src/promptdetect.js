@@ -223,6 +223,90 @@ function detectPiModel(lines) {
   };
 }
 
+/* ── /resume pickers ────────────────────────────────────────────────────────
+   Both claude and pi show session lists the dash can switch through, but only the agents'
+   own selectors know which sessions exist, so the list is read from the selector itself and
+   a switch walks it with the arrow keys. Kept out of detect(): these are not questions to
+   answer, and a half-open picker would otherwise surface an unanswerable card. */
+
+/* claude: "Resume session (3 of 49)" then, per session, a title row ("❯ "/"↓ "/indent) and a
+   detail row ("14 minutes ago · main · 669.1KB · D:\\path"). ❯ is the selection, ↓ the
+   scroll affordance on the last visible row; both are real entries. */
+const CLAUDE_RESUME_HEADER = /^\s*Resume session\s*(?:\(\s*(\d+)\s+of\s+(\d+)\s*\))?\s*$/i;
+const RESUME_DETAIL = /^(?:\d+\s+(?:second|minute|hour|day|week|month|year)s?\s+ago|just now|yesterday)\s*·/i;
+const RESUME_FOOTER = /^(?:Ctrl\+[A-Za-z]|Esc to cancel|Type to search|Space to preview|tab scope)/i;
+
+function detectClaudeResume(lines) {
+  let headIdx = -1;
+  let total = null;
+  let cursorAbs = null;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = CLAUDE_RESUME_HEADER.exec(inner(lines[i]));
+    if (m) { headIdx = i; total = m[2] ? Number(m[2]) : null; cursorAbs = m[1] ? Number(m[1]) : null; break; }
+  }
+  if (headIdx < 0) return null;
+
+  for (let i = headIdx; i < lines.length; i++) {
+    if (/Loading conversations/i.test(inner(lines[i]))) {
+      return { kind: 'claude_resume', loading: true, options: [], highlight_n: null, total: null, cursor_abs: null };
+    }
+  }
+
+  const options = [];
+  let hl = null;
+  let pending = null;
+  for (let i = headIdx + 1; i < lines.length; i++) {
+    const raw = lines[i];
+    const t = inner(raw).trim();
+    if (!t) continue;
+    if (/[│╭╰╮╯]/.test(raw)) continue;                 // the search box frame
+    if (RESUME_FOOTER.test(t)) continue;
+    if (/Esc to cancel|Type to search|Space to preview/i.test(t)) continue;   // the footer's second line
+    if (RESUME_DETAIL.test(t)) {                        // belongs to the row above it
+      if (pending && !pending.detail) pending.detail = t;
+      continue;
+    }
+    const label = t.replace(/^[❯↓↑›>]\s*/, '').trim();
+    if (!label) continue;
+    pending = { n: options.length + 1, label: label, detail: null };
+    options.push(pending);
+    if (/^\s*❯\s+/.test(raw)) hl = pending.n;
+  }
+  return { kind: 'claude_resume', options: options, highlight_n: hl, total: total, cursor_abs: cursorAbs };
+}
+
+/* pi: "Resume Session (Current Folder)" … rows "<›| > <preview>  <count> <age>". */
+const PI_RESUME_HEADER = /^\s*Resume Session\b/i;
+const PI_RESUME_ROW = /^\s*([›»>])?\s*(.*?)\s{2,}(\d+)\s+(now|just now|[\d.]+[a-z]+)\s*$/;
+const PI_RESUME_FOOTER = /^(?:tab scope|ctrl\+[a-z]|re:<pattern>)/i;
+
+function detectPiResume(lines) {
+  let headIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (PI_RESUME_HEADER.test(inner(lines[i]))) { headIdx = i; break; }
+  }
+  if (headIdx < 0) return null;
+
+  const scope = /\(([^)]*)\)/.exec(inner(lines[headIdx]));
+  const options = [];
+  let hl = null;
+  for (let i = headIdx + 1; i < lines.length; i++) {
+    const raw = lines[i];
+    const t = inner(raw).trim();
+    if (!t) continue;
+    if (PI_RESUME_FOOTER.test(t)) continue;
+    if (/^[>›»]?$/.test(t)) continue;                   // the empty search input row
+    const m = PI_RESUME_ROW.exec(t);
+    if (!m) continue;
+    const label = (m[2] || '').trim();
+    if (!label) continue;
+    const o = { n: options.length + 1, label: label, detail: (m[3] + ' messages · ' + m[4] + ' ago') };
+    options.push(o);
+    if (m[1] === '›' || m[1] === '»') hl = o.n;
+  }
+  return { kind: 'pi_resume', options: options, highlight_n: hl, total: options.length || null, scope: scope ? scope[1] : null };
+}
+
 function detectYn(lines) {
   for (let i = lines.length - 1; i >= Math.max(0, lines.length - 8); i--) {
     const t = inner(lines[i]).trim();
@@ -247,4 +331,4 @@ function detect(text) {
   return detectClaude(lines) || detectPiModel(lines) || detectPiPicker(lines) || detectYn(lines);
 }
 
-module.exports = { detect, _inner: inner, _numbered: numbered };
+module.exports = { detect, detectClaudeResume, detectPiResume, _inner: inner, _numbered: numbered };

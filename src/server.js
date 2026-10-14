@@ -18,8 +18,10 @@
  */
 
 const http = require('node:http');
+const https = require('node:https');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
+const os = require('node:os');
 const cp = require('node:child_process');
 const hdr = require('./hdr');
 const chatCommon = require('./chat/common');     // §8.2 message shape + caps
@@ -531,13 +533,369 @@ async function agentFamilyOf(paneId) {
   return null;
 }
 
-async function readVisible(paneId) {
+async function readVisible(paneId, lines) {
   const read = await hdr.request(
     'pane.read',
-    { pane_id: paneId, source: 'visible', lines: 60, format: 'text', strip_ansi: true },
+    { pane_id: paneId, source: 'visible', lines: lines || 60, format: 'text', strip_ansi: true },
     { timeoutMs: DEFAULT_TIMEOUT_MS },
   );
   return (read && read.read && read.read.text) || (read && read.text) || '';
+}
+
+/* the scrollback rather than just the viewport: agent banners (a resume, a model switch) are
+   often pushed off-screen by whatever they print underneath them. */
+async function readRecent(paneId, lines) {
+  const read = await hdr.request(
+    'pane.read',
+    { pane_id: paneId, source: 'recent_unwrapped', lines: lines || 200, format: 'text', strip_ansi: true },
+    { timeoutMs: DEFAULT_TIMEOUT_MS },
+  );
+  const text = (read && read.read && read.read.text) || (read && read.text) || '';
+  return text || await readVisible(paneId, lines);
+}
+
+/* ── hermes model switching ───────────────────────────────────────────────
+   hermes takes a slash-command through the message channel: `agent.prompt` with
+   "/model <name>" switches the session model outright (verified live — no picker
+   navigation, so no modal to get stuck in). The list of switchable names is the
+   union of every custom provider's live /v1/models, which is exactly what hermes'
+   own picker shows; the API keys stay server-side and are never returned. */
+
+const HERMES_HOME = process.env.HERMES_HOME || path.join(os.homedir(), '.hermes');
+const HERMES_MODEL_CACHE_MS = 5 * 60 * 1000;
+let hermesModelCache = { at: 0, models: null };
+
+/* the custom_providers block of $HERMES_HOME/config.yaml -> [{name, baseUrl, apiKey}].
+   A hand-rolled reader keeps the server dependency-free; it stops at the first
+   line that returns to column 0 after the block (the next top-level key). */
+async function readHermesProviders() {
+  const file = path.join(HERMES_HOME, 'config.yaml');
+  let text;
+  try { text = await fsp.readFile(file, 'utf8'); } catch (e) { return []; }
+  const lines = text.split(/\r?\n/);
+  const out = [];
+  let inBlock = false;
+  let cur = null;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!inBlock) {
+      if (/^custom_providers:\s*$/.test(line)) inBlock = true;
+      continue;
+    }
+    if (/^\S/.test(line)) break;                        // back to column 0 -> block ended
+    let m = /^\s*-\s+name:\s*(\S+)\s*$/.exec(line);
+    if (m) { cur = { name: m[1], baseUrl: null, apiKey: null }; out.push(cur); continue; }
+    if (!cur) continue;
+    if ((m = /^\s+base_url:\s*(\S+)/.exec(line))) cur.baseUrl = m[1];
+    else if ((m = /^\s+api_key:\s*(\S+)/.exec(line))) cur.apiKey = m[1];
+  }
+  return out.filter((p) => p.name && p.baseUrl);
+}
+
+/* GET a provider's live model ids. base_url may or may not already carry /v1. */
+function fetchProviderModels(prov) {
+  return new Promise((resolve) => {
+    let url;
+    try {
+      const base = String(prov.baseUrl).replace(/\/+$/, '');
+      url = new URL(/\/(v\d+)$/.test(base) ? base + '/models' : base + '/v1/models');
+    } catch (e) { return resolve([]); }
+    const headers = {};
+    if (prov.apiKey) headers.Authorization = 'Bearer ' + prov.apiKey;
+    const mod = url.protocol === 'https:' ? https : http;
+    const req = mod.get(url, { headers: headers }, (r) => {
+      let d = '';
+      r.on('data', (c) => { d += c; if (d.length > 4 * 1024 * 1024) req.destroy(); });
+      r.on('end', () => {
+        try {
+          const j = JSON.parse(d);
+          const arr = j.data || j.models || [];
+          resolve(arr.map((x) => String(x.id || x.name || '')).filter(Boolean));
+        } catch (e) { resolve([]); }
+      });
+    });
+    req.on('error', () => resolve([]));
+    req.setTimeout(8000, () => { req.destroy(); resolve([]); });
+  });
+}
+
+/* the flat, de-duplicated model list every hermes pane can switch to, each entry
+   remembering which providers offer it. The three polyu gateways share one host,
+   so a shared model name resolves to the same endpoint regardless of which of
+   them hermes picks — the model NAME is all `/model` needs. */
+async function hermesModels() {
+  const now = Date.now();
+  if (hermesModelCache.models && (now - hermesModelCache.at) < HERMES_MODEL_CACHE_MS) {
+    return hermesModelCache.models;
+  }
+  const provs = await readHermesProviders();
+  const byName = new Map();
+  // fetch in parallel but merge in config order, so the provider shown for a shared model name
+  // is stable rather than whichever request happened to finish first
+  const lists = await Promise.all(provs.map((p) => fetchProviderModels(p)));
+  for (let i = 0; i < provs.length; i++) {
+    for (const id of lists[i]) {
+      if (!byName.has(id)) byName.set(id, { model: id, providers: [] });
+      byName.get(id).providers.push(provs[i].name);
+    }
+  }
+  const models = Array.from(byName.values())
+    .sort((a, b) => (a.model < b.model ? -1 : a.model > b.model ? 1 : 0))
+    .map((m, i) => ({ n: i + 1, model: m.model, provider: m.providers[0] || null, providers: m.providers }));
+  if (models.length) hermesModelCache = { at: now, models };
+  return models;
+}
+
+/* the pane's current model, read from its own status line (the ☤ bar hermes repaints). */
+async function hermesCurrentModel(paneId) {
+  try {
+    const text = await readVisible(paneId);
+    const view = statusView.interpret({ agent: 'hermes', agent_known: true, text: text, text_error: null });
+    const m = view && view.status && view.status.model;
+    return m ? String(m) : null;
+  } catch (e) { return null; }
+}
+
+// ── session switching ───────────────────────────────────────────────────────
+/* hermes accepts `/resume <id>` through the message channel and keeps its session list in
+   its own sqlite store, so neither listing nor switching disturbs the pane. claude has no
+   such command — its /resume is a search picker — so its list is read from the picker and a
+   switch walks that picker with the arrow keys (the /model path). */
+
+/* which agent owns a pane, which session it is running, and where it is rooted. */
+async function paneSessionInfo(paneId) {
+  const list = await hdr.request('agent.list', {}, { timeoutMs: DEFAULT_TIMEOUT_MS });
+  const agents = (list && (list.agents || (list.result && list.result.agents))) || [];
+  const entry = agents.find((a) => a && a.pane_id === paneId) || null;
+  const session = entry && entry.agent_session;
+  const agent = String((session && session.agent) || (entry && entry.agent) || '');
+  let sessionId = session && session.value != null ? String(session.value) : '';
+  // herdr never publishes a pi session id; the binding this view established for /api/chat is
+  // the only source, and a pane never chatted has none yet.
+  if (!sessionId && agent === 'pi') {
+    const mem = readMemory.get(paneId);
+    if (mem && mem.agent === 'pi' && mem.session_id) sessionId = String(mem.session_id);
+  }
+  const family = agent === 'hermes' ? 'hermes' : agent === 'claude' ? 'claude' : agent === 'pi' ? 'pi' : 'other';
+  return { agent: agent || null, family, sessionId, cwd: (entry && entry.cwd) || null, entry };
+}
+
+/* a coarse "3m ago" for the session rows, so the list reads like the agents' own selectors.
+   hermes' stores its timestamps in epoch SECONDS, not milliseconds. */
+function shortAge(at) {
+  if (!at) return '';
+  const secs = Math.max(0, Math.round(Date.now() / 1000 - Number(at)));
+  if (secs < 60) return secs + 's ago';
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return mins + 'm ago';
+  const hours = Math.round(mins / 60);
+  if (hours < 48) return hours + 'h ago';
+  return Math.round(hours / 24) + 'd ago';
+}
+
+function hermesSessions(currentId) {
+  const rows = chatHermes.listSessions(chatHermes.dbPath(), 60);
+  return rows.map((r) => {
+    const at = r.last_activity_at === null ? r.started_at : r.last_activity_at;
+    const bits = [r.cwd || '(no cwd)'];
+    if (r.message_count !== null && r.message_count !== undefined) bits.push(r.message_count + ' messages');
+    if (at) bits.push(shortAge(at));
+    return {
+      id: r.id,
+      title: r.title || null,
+      cwd: r.cwd || null,
+      model: r.model || null,
+      messages: r.message_count,
+      detail: bits.join(' · '),
+      last_active: at,
+      current: !!currentId && r.id === currentId,
+    };
+  });
+}
+
+/* GET /api/sessions?pane_id=.. -> { ok, agent, current, sessions:[{id,title,cwd,model,messages,last_active,current}] } */
+async function handleSessionsGet(req, res, url) {
+  const paneId = url.searchParams.get('pane_id');
+  if (!paneId) throw { code: 'bad_request', message: '"pane_id" query parameter is required' };
+  const info = await paneSessionInfo(paneId);
+
+  if (info.family === 'hermes') {
+    const sessions = hermesSessions(info.sessionId);
+    if (!sessions.length) throw { code: 'no_sessions', message: 'no sessions in ' + chatHermes.dbPath() };
+    return ok(res, { pane_id: paneId, agent: 'hermes', current: info.sessionId || null, sessions: sessions });
+  }
+
+  if (info.family === 'claude' || info.family === 'pi') {
+    /* claude can only resume a session from the pane's OWN directory — offered a session that
+       belongs elsewhere it answers "This conversation is from a different directory" and stops
+       — so its selector is read in the default project scope, never widened with Ctrl+A.
+       pi's selector lists the current folder and is short enough to read whole. */
+    const prompt = await readResumePicker(paneId, info.family, false);
+    await pressKeys(paneId, ['esc']);
+    if (!prompt || !prompt.options.length) {
+      throw { code: 'no_sessions', message: 'the /resume selector showed no sessions (is this pane at an idle prompt?)' };
+    }
+    return ok(res, {
+      pane_id: paneId, agent: info.family, current: info.sessionId || null,
+      total: prompt.total,
+      sessions: prompt.options.map((o) => ({
+        id: null, n: o.n, title: o.label, detail: o.detail || null, current: false,
+      })),
+    });
+  }
+
+  throw { code: 'unsupported', message: 'session switching is not available for a ' + info.family + ' pane' };
+}
+
+/* POST /api/sessions {pane_id, session_id} — hermes only. */
+async function handleSessionsPost(req, res, body) {
+  const paneId = requireString(body, 'pane_id');
+  const info = await paneSessionInfo(paneId);
+
+  if (info.family === 'hermes') {
+    const id = String(body.session_id == null ? '' : body.session_id).trim();
+    if (!id) throw { code: 'bad_request', message: '"session_id" is required for a hermes pane' };
+    await hdr.request('agent.prompt', { target: paneId, text: '/resume ' + id }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    /* hermes answers with "↻ Resumed session <id> \"<title>\"", but only after it has drawn the
+       restored conversation — which takes a few seconds and pushes its own banner up. Poll for
+       it; the id alone is not proof, because the pane echoes the command that carried it. */
+    const marker = 'Resumed session ' + id;      // indexOf, not a regex: the id needs no escaping
+    let confirmed = false;
+    for (let i = 0; i < 12 && !confirmed; i++) {
+      await sleep(1000);
+      const text = (await readRecent(paneId, 300)).replace(/\r/g, '');
+      confirmed = text.indexOf(marker) >= 0;
+    }
+    return ok(res, { pane_id: paneId, session_id: id, confirmed: confirmed, result: { type: 'ok' } });
+  }
+
+  if (info.family === 'claude' || info.family === 'pi') {
+    const n = Number(body.n);
+    if (!Number.isInteger(n) || n < 1) throw { code: 'bad_request', message: '"n" (the session number from GET) is required' };
+    const first = await openResumePicker(paneId, info.family, false);
+    if (!first) {
+      await pressKeys(paneId, ['esc']);
+      throw { code: 'no_picker', message: 'the /resume selector did not appear' };
+    }
+    const from = (first.highlight_n === null || first.highlight_n === undefined) ? 1 : first.highlight_n;
+    const delta = n - from;
+    const keys = [];
+    const step = delta >= 0 ? 'down' : 'up';
+    for (let i = 0; i < Math.abs(delta); i++) keys.push(step);
+    keys.push('enter');                              // one enter picks the row
+    await pressKeys(paneId, keys);
+    await sleep(1500);
+    const after = (await readRecent(paneId, 300)).replace(/\r/g, '');
+    /* the selector closing is not proof of a resume: claude also closes it to say the session
+       belongs to another directory, and refuses. */
+    const refused = /from a different directory/i.test(after);
+    const stillOpen = /Resume Session|Resume session/i.test(after);
+    return ok(res, { pane_id: paneId, n: n, confirmed: !refused && !stillOpen, refused: refused, result: { type: 'ok' } });
+  }
+
+  throw { code: 'unsupported', message: 'session switching is not available for a ' + info.family + ' pane' };
+}
+
+/* ── /resume pickers ──────────────────────────────────────────────────────
+   Neither agent can be asked for its session list without opening its own selector, so the
+   dash reads the selector and switches by walking it. The cursor's absolute position comes
+   from the header's "(k of N)"; the ❯ row's offset inside the window then gives every
+   visible row's absolute index, which is what lets a scrolled list be collected exactly. */
+
+async function pressKeys(paneId, keys) {
+  return hdr.request('pane.send_keys', { pane_id: paneId, keys: keys }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+}
+
+function parseResume(family, text) {
+  const lines = String(text || '').replace(/\r/g, '').split('\n');
+  return family === 'pi' ? promptdetect.detectPiResume(lines) : promptdetect.detectClaudeResume(lines);
+}
+
+/* Open a /resume selector, let it settle, and read what it shows. `allRepos` presses Ctrl+A on
+   claude so the list is not limited to the pane's own project (its default, often empty) —
+   pressed only once the selector is actually up, because an early key is simply lost. */
+async function openResumePicker(paneId, family, allRepos) {
+  await hdr.request('pane.send_text', { pane_id: paneId, text: '/resume' }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+  await pressKeys(paneId, ['enter']);
+
+  /* Wait for the selector to settle in its DEFAULT scope first — claude opens on the pane's own
+     project, and Ctrl+A sent before that list has drawn is simply lost. */
+  const settle = async (rounds, want) => {
+    let last = null;
+    for (let i = 0; i < rounds; i++) {
+      await sleep(800);
+      const p = parseResume(family, await readVisible(paneId));
+      if (!p) continue;
+      last = p;
+      if (!p.loading && (!want || p.options.length)) return p;
+    }
+    return last;
+  };
+
+  const opened = await settle(8, false);
+  if (!opened) return null;
+
+  if (family === 'claude' && allRepos) {
+    await pressKeys(paneId, ['ctrl+a']);            // "only show current repo" -> every repo
+    return (await settle(12, true)) || opened;
+  }
+  return opened;
+}
+
+/* Read the whole selector, following it down the list so entries past the first window are
+   collected too. Returns { options:[{n,label,detail}], total, highlight_n }. */
+async function readResumePicker(paneId, family, allRepos) {
+  const first = await openResumePicker(paneId, family, allRepos);
+  if (!first) return null;
+  const total = first.total || first.options.length;
+  const CAP = 60;
+  const byIndex = new Map();
+  const merge = (p) => {
+    const selPos = p.options.findIndex((o) => o.n === p.highlight_n);
+    const cursor = cursorIndexOf(p, family);
+    if (selPos < 0 || cursor === null) {            // no cursor to anchor on: take it as-is
+      p.options.forEach((o, i) => { if (!byIndex.has(i + 1)) byIndex.set(i + 1, o); });
+      return;
+    }
+    const firstAbs = cursor - selPos;
+    p.options.forEach((o, i) => {
+      const abs = firstAbs + i;
+      if (abs >= 1 && abs <= Math.min(total, CAP) && !byIndex.has(abs)) byIndex.set(abs, o);
+    });
+  };
+  merge(first);
+  let window = first.options.length;
+  for (let round = 0; round < 10 && byIndex.size < Math.min(total, CAP); round++) {
+    /* move the cursor a whole window on, so the list scrolls instead of landing on the same
+       bottom row again (stepping window-1 leaves the window where it was) */
+    const step = Math.max(1, window);
+    const keys = [];
+    for (let i = 0; i < step; i++) keys.push('down');
+    await pressKeys(paneId, keys);
+    await sleep(700);
+    const p = parseResume(family, await readVisible(paneId));
+    if (!p || !p.options.length) break;
+    if (p.highlight_n === null) break;
+    window = p.options.length;
+    const before = byIndex.size;
+    merge(p);
+    if (byIndex.size === before) break;             // window stopped advancing
+  }
+  /* absolute order, then renumbered: the parser's own `n` counts rows inside one window, so a
+     collected list would repeat it once the selector has scrolled. */
+  const options = Array.from(byIndex.keys()).sort((a, b) => a - b)
+    .map((k, i) => Object.assign({}, byIndex.get(k), { n: i + 1 }));
+  return { options: options, total: total, highlight_n: first.highlight_n };
+}
+
+/* the absolute index of the row under the cursor. claude prints it ("3 of 49"); pi does not, so
+   pi is counted from its window's start (its lists are short enough to show whole). */
+function cursorIndexOf(p, family) {
+  if (family === 'claude' && p.total) {
+    // recompute the header's k: nearest row above the ❯ mark carries it in the last read
+    return p.cursor_abs !== undefined && p.cursor_abs !== null ? p.cursor_abs : p.highlight_n;
+  }
+  return p.highlight_n;
 }
 
 async function readModelPicker(paneId) {
@@ -552,22 +910,56 @@ async function readModelPicker(paneId) {
   return prompt && MODEL_KINDS[prompt.kind] ? prompt : null;
 }
 
-/* GET /api/model?pane_id=.. -> { ok, models:[{n,label,current}], highlight_n } — opens /model,
-   parses it, escs it closed. */
+/* GET /api/model?pane_id=.. -> { ok, agent, models:[{n,label,current,model}], highlight_n }
+   claude: opens its /model picker, parses it, escs it closed.
+   hermes: reads the switchable names from its configured providers (no pane I/O). */
 async function handleModelGet(req, res, url) {
   const paneId = url.searchParams.get('pane_id');
   if (!paneId) throw { code: 'bad_request', message: '"pane_id" query parameter is required' };
+  const family = await agentFamilyOf(paneId);
+
+  if (family === 'hermes') {
+    const models = await hermesModels();
+    if (!models.length) throw { code: 'no_models', message: 'no custom provider models found in ' + path.join(HERMES_HOME, 'config.yaml') };
+    const cur = await hermesCurrentModel(paneId);
+    const marked = models.map((m) => Object.assign({}, m, { current: !!cur && m.model === cur }));
+    return ok(res, { pane_id: paneId, agent: 'hermes', current: cur, models: marked });
+  }
+
+  /* only claude is opened-and-parsed. A pi pane is never touched here: its cancel key kills the
+     process, so the dash must not send it anything while merely reading a model list. */
+  if (family !== 'claude') throw { code: 'no_picker', message: 'the /model selector is only readable on a claude pane (this pane is ' + family + ')' };
+
   const prompt = await readModelPicker(paneId);
   await hdr.request('pane.send_keys', { pane_id: paneId, keys: ['esc'] }, { timeoutMs: DEFAULT_TIMEOUT_MS });
   if (!prompt) throw { code: 'no_picker', message: 'the /model selector did not appear (is this a claude pane at an idle prompt?)' };
-  const models = prompt.options.map((o) => ({ n: o.n, label: o.label, current: o.n === prompt.highlight_n }));
-  ok(res, { pane_id: paneId, models: models, highlight_n: prompt.highlight_n });
+  const models = prompt.options.map((o) => ({ n: o.n, label: o.label, model: o.label, current: o.n === prompt.highlight_n }));
+  ok(res, { pane_id: paneId, agent: 'claude', models: models, highlight_n: prompt.highlight_n });
 }
 
-/* POST /api/model {pane_id, n} -> switch to option n: open /model, walk from the highlighted
-   (current) row to n, enter to confirm. */
+/* POST /api/model
+   claude {pane_id, n} — open /model, walk from the highlighted (current) row to n, enter.
+   hermes {pane_id, model} — send `/model <name>` through the message channel; it switches
+   the session model outright, no picker involved. */
 async function handleModelPost(req, res, body) {
   const paneId = requireString(body, 'pane_id');
+  const family = await agentFamilyOf(paneId);
+
+  if (family === 'hermes') {
+    if (typeof body.model !== 'string' || !body.model.trim()) {
+      throw { code: 'bad_request', message: '"model" (a model name) is required for a hermes pane' };
+    }
+    const model = body.model.trim();
+    await hdr.request('agent.prompt', { target: paneId, text: '/model ' + model }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    await sleep(4000);                                 // hermes answers the command, then repaints its status line
+    const text = await readRecent(paneId, 200);
+    const confirmed = text.indexOf('Model switched: ' + model) >= 0
+      || new RegExp('[\\u263c\\u2e1d\\u25cf]\\s*' + model.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*[\\u2502|]').test(text);
+    return ok(res, { pane_id: paneId, model: model, confirmed: confirmed, result: { type: 'ok' } });
+  }
+
+  if (family !== 'claude') throw { code: 'bad_request', message: 'model switching by option number is claude-only (this pane is ' + family + ')' };
+
   const n = Number(body.n);
   if (!Number.isInteger(n) || n < 1) throw { code: 'bad_request', message: '"n" must be a positive integer option number' };
   const prompt = await readModelPicker(paneId);
@@ -2435,6 +2827,7 @@ async function handle(req, res) {
     if (pathname === '/api/status') return handleStatus(req, res, url); // §12.3
     if (pathname === '/api/prompt') return handlePromptDetect(req, res, url);
     if (pathname === '/api/model') return handleModelGet(req, res, url);
+    if (pathname === '/api/sessions') return handleSessionsGet(req, res, url);
     // §2 convenience: GET /api/cli?argv=agent+list — same as the POST body, with
     // argv split on whitespace. No quoting support; use POST for arguments that
     // contain spaces.
@@ -2456,6 +2849,7 @@ async function handle(req, res) {
       '/api/pane/text': handleText,
       '/api/prompt/answer': handlePromptAnswer,
       '/api/model': handleModelPost,
+      '/api/sessions': handleSessionsPost,
       '/api/rpc': handleRpc,
       '/api/cli': handleCli,
       '/api/fanout': handleFanout,

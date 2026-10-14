@@ -476,6 +476,7 @@ function renderHeader() {
   if (d) d.className = 'dot ' + st;
   renderUsage();                 // §12.2.2: a pane change re-evaluates the chip at once, not in 500ms
   if (typeof window.__hdUpdateModelSel === 'function') window.__hdUpdateModelSel();
+  if (typeof window.__hdSessionFollowSelection === 'function') window.__hdSessionFollowSelection();
 }
 
 function renderAge() {
@@ -2812,20 +2813,21 @@ function init() {
   const lsb = $('literalSend');
   if (lsb) lsb.addEventListener('click', sendLiteral);
 
-  /* the model droplist: shows the selected claude pane's current model and switches it when
-     the reader picks another. The list is fetched lazily (opening /model, parsing, esc-ing it
-     closed) the first time a claude pane is selected, and refetched after every switch. */
+  /* the model droplist: shows the selected pane's current model and switches it when the reader
+     picks another. claude opens /model and parses it; hermes switches by name through its
+     message channel. The list is fetched lazily when a switchable pane is selected and refetched
+     after every switch. */
   const modelSel = $('agentModelSel');
-  let modelCache = { paneId: null, models: null };   // models for the pane the list was built for
-  async function refreshModelList(paneId, force) {
+  let modelCache = { paneId: null, agent: null, models: null };   // models for the pane the list was built for
+  async function refreshModelList(paneId, agent, force) {
     if (!modelSel) return;
-    if (!force && modelCache.paneId === paneId && modelCache.models) { fillModelSel(modelCache.models); return; }
+    if (!force && modelCache.paneId === paneId && modelCache.models) { fillModelSel(modelCache.models, agent); return; }
     modelSel.disabled = true;
     setModelSelPlaceholder('loading…');
     const body = await api('/api/model?pane_id=' + encodeURIComponent(paneId));
-    if (!body || !body.ok) { setModelSelPlaceholder('model: —'); modelSel.disabled = true; modelCache = { paneId: null, models: null }; return; }
-    modelCache = { paneId: paneId, models: body.models || [] };
-    fillModelSel(modelCache.models);
+    if (!body || !body.ok) { setModelSelPlaceholder('model: —'); modelSel.disabled = true; modelCache = { paneId: null, agent: null, models: null }; return; }
+    modelCache = { paneId: paneId, agent: agent, models: body.models || [] };
+    fillModelSel(modelCache.models, agent);
   }
   function setModelSelPlaceholder(text) {
     if (!modelSel) return;
@@ -2834,15 +2836,20 @@ function init() {
     o.textContent = text; o.value = '';
     modelSel.appendChild(o);
   }
-  function fillModelSel(models) {
+  /* what the option carries: hermes switches by model NAME, claude by the numbered row */
+  function optionValue(m, agent) { return agent === 'hermes' ? String(m.model) : String(m.n); }
+  function fillModelSel(models, agent) {
     if (!modelSel) return;
     modelSel.innerHTML = '';
     if (!models.length) { setModelSelPlaceholder('model: —'); modelSel.disabled = true; return; }
+    const cur = currentModelText();
     models.forEach(function (m) {
       const o = document.createElement('option');
-      o.value = String(m.n);
-      o.textContent = m.label;
-      if (m.current) o.selected = true;
+      o.value = optionValue(m, agent);
+      o.textContent = (agent === 'hermes' && m.provider) ? (m.model + ' — ' + m.provider) : m.label;
+      /* claude marks the current row in its picker; hermes has no such mark, so match the pane's
+         own reported model instead */
+      if (m.current || (agent === 'hermes' && cur && m.model === cur)) o.selected = true;
       modelSel.appendChild(o);
     });
     modelSel.disabled = false;
@@ -2862,29 +2869,131 @@ function init() {
     const pane = state.selected ? findPane(state.selected) : null;
     const agent = pane && pane.agent;
     const cur = currentModelText();
-    if (!pane) { setModelSelPlaceholder('model…'); modelSel.disabled = true; modelCache = { paneId: null, models: null }; return; }
-    /* only claude has a dash-driven switcher. hermes/pi show their current model read-only —
-       pi's /model input channel is unreliable and its cancel key (ctrl+c) kills the process, so
-       driving its picker from the dash is not safe to automate */
-    if (agent !== 'claude') {
+    if (!pane) { setModelSelPlaceholder('model…'); modelSel.disabled = true; modelCache = { paneId: null, agent: null, models: null }; return; }
+    /* claude and hermes both switch from the dash; pi does not — its /model input channel is
+       unreliable and its cancel key (ctrl+c) kills the process, so its droplist stays read-only */
+    if (agent !== 'claude' && agent !== 'hermes') {
       setModelSelPlaceholder(cur ? ('model: ' + cur) : 'model: —');
       modelSel.disabled = true;
-      modelCache = { paneId: null, models: null };
+      modelCache = { paneId: null, agent: null, models: null };
       return;
     }
-    refreshModelList(state.selected, false);
+    refreshModelList(state.selected, agent, false);
   }
   window.__hdUpdateModelSel = updateModelSel;
   if (modelSel) modelSel.addEventListener('change', async function () {
     const paneId = state.selected;
-    const n = Number(modelSel.value);
-    if (!paneId || !Number.isInteger(n) || n < 1) return;
+    const agent = modelCache.agent;
+    const val = modelSel.value;
+    if (!paneId || !val) return;
     modelSel.disabled = true;
-    const body = await postJSON('/api/model', { pane_id: paneId, n: n });
-    if (!body || !body.ok) { toast('model switch failed — ' + errText(body), 'error'); }
-    else { toast('model → ' + (body.label || ('option ' + n)), 'ok'); }
-    refreshModelList(paneId, true);                  // refetch so the ✓-marked current row is accurate
+    let body;
+    if (agent === 'hermes') {
+      body = await postJSON('/api/model', { pane_id: paneId, model: val });
+      if (!body || !body.ok) { toast('model switch failed — ' + errText(body), 'error'); }
+      else if (body.confirmed === false) { toast('model → ' + val + ' (unconfirmed — check the pane)', 'error'); }
+      else { toast('model → ' + val, 'ok'); }
+    } else {
+      const n = Number(val);
+      if (!Number.isInteger(n) || n < 1) return;
+      body = await postJSON('/api/model', { pane_id: paneId, n: n });
+      if (!body || !body.ok) { toast('model switch failed — ' + errText(body), 'error'); }
+      else { toast('model → ' + (body.label || ('option ' + n)), 'ok'); }
+    }
+    refreshModelList(paneId, agent, true);            // refetch so the current row is accurate
   });
+
+  /* the session switcher: a side panel listing the selected pane's sessions and resuming the one
+     picked. hermes is asked by id through its message channel; claude and pi have no such
+     command, so the server walks their own /resume selector — which is also where the list comes
+     from, because only the agent knows which sessions exist. */
+  const sessionPanel = $('sessionPanel');
+  const sessionList = $('sessionList');
+  const sessionMeta = $('sessionMeta');
+  const sessionNote = $('sessionNote');
+  const sessionBtn = $('sessionBtn');
+  let sessionCache = { paneId: null, body: null };
+
+  function sessionNoteSet(text) {
+    if (!sessionNote) return;
+    sessionNote.textContent = text || '';
+    sessionNote.classList.toggle('hidden', !text);
+  }
+  function closeSessionPanel() { if (sessionPanel) sessionPanel.classList.add('hidden'); }
+  function sessionOpen() { return !!sessionPanel && !sessionPanel.classList.contains('hidden'); }
+
+  async function loadSessions(paneId, force) {
+    if (!sessionList) return;
+    if (!force && sessionCache.paneId === paneId && sessionCache.body) { renderSessions(sessionCache.body); return; }
+    sessionList.innerHTML = '';
+    sessionCache = { paneId: paneId, body: null };
+    sessionMeta.textContent = 'loading…';
+    sessionNoteSet('');
+    const body = await api('/api/sessions?pane_id=' + encodeURIComponent(paneId));
+    if (!body || !body.ok) { sessionMeta.textContent = ''; sessionNoteSet('no sessions — ' + errText(body)); return; }
+    sessionCache = { paneId: paneId, body: body };
+    renderSessions(body);
+  }
+  function renderSessions(body) {
+    const list = body.sessions || [];
+    sessionMeta.textContent = body.agent + ' · ' + list.length
+      + (body.total && body.total !== list.length ? ' of ' + body.total : '') + ' sessions';
+    sessionList.innerHTML = '';
+    if (!list.length) { sessionNoteSet('the selector listed no sessions'); return; }
+    sessionNoteSet(body.agent === 'claude'
+      ? 'claude only resumes sessions from this pane\'s own directory'
+      : '');
+    list.forEach(function (s) {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'session-row' + (s.current ? ' current' : '');
+      const title = document.createElement('span');
+      title.className = 's-title';
+      title.textContent = s.title || '(untitled)';
+      row.appendChild(title);
+      if (s.detail) {
+        const d = document.createElement('span');
+        d.className = 's-detail';
+        d.textContent = s.detail;
+        row.appendChild(d);
+      }
+      row.addEventListener('click', function () { switchSession(body, s, row); });
+      sessionList.appendChild(row);
+    });
+  }
+  async function switchSession(body, s, row) {
+    const paneId = state.selected;
+    if (!paneId) return;
+    row.classList.add('busy');
+    /* hermes takes a session id; claude and pi are driven by the row number in their selector */
+    const res = body.agent === 'hermes'
+      ? await postJSON('/api/sessions', { pane_id: paneId, session_id: s.id })
+      : await postJSON('/api/sessions', { pane_id: paneId, n: s.n });
+    row.classList.remove('busy');
+    if (!res || !res.ok) { toast('session switch failed — ' + errText(res), 'error'); return; }
+    const name = s.title || 'session';
+    if (res.refused) { toast('claude refused — that session belongs to another directory', 'error'); return; }
+    if (res.confirmed === false) { toast('resumed ' + name + ' (unconfirmed — check the pane)', 'error'); return; }
+    toast('resumed ' + name, 'ok');
+    closeSessionPanel();
+  }
+  if (sessionBtn) sessionBtn.addEventListener('click', async function () {
+    if (!sessionPanel) return;
+    if (sessionOpen()) { closeSessionPanel(); return; }
+    if (!state.selected) { toast('select a pane first', 'info'); return; }
+    sessionPanel.classList.remove('hidden');
+    await loadSessions(state.selected, false);
+  });
+  const sessionCloseBtn = $('sessionClose');
+  if (sessionCloseBtn) sessionCloseBtn.addEventListener('click', closeSessionPanel);
+  const sessionReloadBtn = $('sessionReload');
+  if (sessionReloadBtn) sessionReloadBtn.addEventListener('click', function () {
+    if (state.selected) loadSessions(state.selected, true);
+  });
+  /* the panel belongs to one pane: following the selection with stale rows would be a lie */
+  window.__hdSessionFollowSelection = function () {
+    if (sessionOpen() && sessionCache.paneId && sessionCache.paneId !== state.selected) closeSessionPanel();
+  };
 
   const lt = $('literalText');
   if (lt) lt.addEventListener('keydown', function (e) { if (e.key === 'Enter') sendLiteral(); });

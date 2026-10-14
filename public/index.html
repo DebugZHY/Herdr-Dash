@@ -182,9 +182,11 @@ if (typeof window.HD.register !== 'function') {
         </div>
         <span class="dim small">agent</span>
         <select id="agentModelSel" class="btn" disabled
-                title="the selected claude pane's model — pick another to switch it live">
+                title="the selected pane's model — pick another to switch it live (claude, hermes)">
           <option>model…</option>
         </select>
+        <button id="sessionBtn" class="btn" type="button"
+                title="Browse and switch this pane's sessions">sessions</button>
         <span class="dim small">text</span>
         <input id="literalText" class="mono grow" type="text" placeholder="literal text (sent verbatim, no newline)">
         <button id="literalSend" class="btn" type="button">send text</button>
@@ -256,6 +258,19 @@ if (typeof window.HD.register !== 'function') {
      the hint line lives in the header, the toast is fixed-position -->
 <div id="hdOverlays"></div>
 <div id="hdToast" class="toast hidden"></div>
+
+<!-- the session switcher: a side panel listing the selected pane's sessions. Fixed-position and
+     outside #app, so it floats over the layout instead of taking a grid track. -->
+<div id="sessionPanel" class="session-panel hidden" role="dialog" aria-label="sessions">
+  <div class="session-head">
+    <span class="strong">sessions</span>
+    <span id="sessionMeta" class="dim small"></span>
+    <button id="sessionReload" class="icon-btn" type="button" title="Reload the list">&#8635;</button>
+    <button id="sessionClose" class="icon-btn" type="button" title="Close">&#10005;</button>
+  </div>
+  <div id="sessionList" class="session-list"></div>
+  <div id="sessionNote" class="session-note dim small hidden"></div>
+</div>
 
 </body>
 </html>

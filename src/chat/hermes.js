@@ -136,6 +136,46 @@ function recentSessions(file, limit) {
 }
 
 /**
+ * Every session the store knows, newest activity first — the dash's own session list, so
+ * the picker can be built without making the pane print `/sessions` into its transcript.
+ * @returns [{id, title, cwd, model, message_count, started_at, last_activity_at, ended_at, archived, pinned}]
+ */
+function listSessions(file, limit) {
+  const n = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 60;
+  let db;
+  try {
+    db = openReadOnly(file);
+    try {
+      return db.prepare(
+        `SELECT id, title, cwd, model, message_count, started_at, last_activity_at, ended_at,
+                archived, pinned, hidden
+           FROM sessions
+          ORDER BY COALESCE(last_activity_at, started_at) DESC
+          LIMIT ?`,
+      ).all(n).map((r) => ({
+        id: r.id == null ? '' : String(r.id),
+        title: r.title == null ? null : String(r.title),
+        cwd: r.cwd == null ? null : String(r.cwd),
+        model: r.model == null ? null : String(r.model),
+        message_count: r.message_count == null ? null : Number(r.message_count),
+        started_at: r.started_at == null ? null : Number(r.started_at),
+        last_activity_at: r.last_activity_at == null ? null : Number(r.last_activity_at),
+        ended_at: r.ended_at == null ? null : Number(r.ended_at),
+        archived: r.archived == null ? 0 : Number(r.archived),
+        pinned: r.pinned == null ? 0 : Number(r.pinned),
+        hidden: r.hidden == null ? 0 : Number(r.hidden),
+      })).filter((r) => r.id);
+    } catch (e) {
+      return [];                       // no `sessions` table: nothing to say
+    }
+  } catch (e) {
+    return [];                         // no database at all
+  } finally {
+    if (db) { try { db.close(); } catch (e) { /* already gone */ } }
+  }
+}
+
+/**
  * Does the store know this session at all — a `sessions` row or any message row?
  * §9.1's corroboration for a banner id. Cheap: two indexed lookups, and both are
  * allowed to fail into `false` (an unreadable store cannot corroborate anything).
@@ -516,5 +556,5 @@ function readTail(file, sessionId, limit, opts) {
 
 module.exports = {
   SOURCE_KIND, dbPath, readOnlyUri, openReadOnly, parseToolCalls, parseRow, readWindow, readTail,
-  recentSessions, sessionKnown,
+  recentSessions, listSessions, sessionKnown,
 };
