@@ -562,6 +562,8 @@ async function readRecent(paneId, lines) {
    own picker shows; the API keys stay server-side and are never returned. */
 
 const HERMES_HOME = process.env.HERMES_HOME || path.join(os.homedir(), '.hermes');
+/* pi keeps its model catalogue beside the session directory, which the chat module resolves. */
+const PI_AGENT_HOME = path.dirname(chatPi.sessionsRoot());
 const HERMES_MODEL_CACHE_MS = 5 * 60 * 1000;
 let hermesModelCache = { at: 0, models: null };
 
@@ -761,11 +763,14 @@ async function handleSessionsPost(req, res, body) {
        it; the id alone is not proof, because the pane echoes the command that carried it. */
     const marker = 'Resumed session ' + id;      // indexOf, not a regex: the id needs no escaping
     let confirmed = false;
+    let lastText = '';
     for (let i = 0; i < 12 && !confirmed; i++) {
       await sleep(1000);
-      const text = (await readRecent(paneId, 300)).replace(/\r/g, '');
-      confirmed = text.indexOf(marker) >= 0;
+      lastText = (await readRecent(paneId, 300)).replace(/\r/g, '');
+      confirmed = lastText.indexOf(marker) >= 0;
     }
+    /* The pane is on `id` from here on, whatever herdr keeps publishing. */
+    if (confirmed) rememberSwitch(paneId, id, info.family, 'dash_switch', { noticeCount: noticeCount('', lastText) });
     return ok(res, { pane_id: paneId, session_id: id, confirmed: confirmed, result: { type: 'ok' } });
   }
 
@@ -790,7 +795,11 @@ async function handleSessionsPost(req, res, body) {
        belongs to another directory, and refuses. */
     const refused = /from a different directory/i.test(after);
     const stillOpen = /Resume Session|Resume session/i.test(after);
-    return ok(res, { pane_id: paneId, n: n, confirmed: !refused && !stillOpen, refused: refused, result: { type: 'ok' } });
+    const confirmed = !refused && !stillOpen;
+    /* The new session's id lives inside the agent's own selector, so it cannot be named here —
+       but everything this view remembered about the old binding is wrong now all the same. */
+    if (confirmed) rememberSwitch(paneId, '', info.family, 'dash_switch');
+    return ok(res, { pane_id: paneId, n: n, confirmed: confirmed, refused: refused, result: { type: 'ok' } });
   }
 
   throw { code: 'unsupported', message: 'session switching is not available for a ' + info.family + ' pane' };
@@ -980,6 +989,292 @@ async function handleModelPost(req, res, body) {
   keys.push('enter');                                  // one enter both picks and confirms
   const result = await hdr.request('pane.send_keys', { pane_id: paneId, keys }, { timeoutMs: DEFAULT_TIMEOUT_MS });
   ok(res, { pane_id: paneId, n: n, label: target.label, result });
+}
+
+// ── think effort ────────────────────────────────────────────────────────────
+/* how hard an agent is told to think. Each spells it differently and keeps it somewhere else:
+     hermes  /reasoning <none|minimal|low|medium|high|xhigh|max|ultra>   session-scoped
+     claude  /effort    <low|medium|high|xhigh|max>   a slider: arrows pick, `s` = this session
+     pi      /thinking  <off|..|max>                  only the levels its current model maps
+   pi paints the level in its own status line and its model file says which levels exist, so
+   reading a pi pane writes nothing into it. The other two have to be asked; the ask is a plain
+   command that leaves the pane where it was, with no selector left open. */
+const EFFORT_LEVELS = {
+  hermes: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+  claude: ['low', 'medium', 'high', 'xhigh', 'max'],
+};
+const PI_THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+
+/* what the pane's own agent is doing. A read that writes a command into a busy pane — or that
+   cancels one with esc — can interrupt the turn it is in the middle of, so every write below is
+   held back until the pane is idle. */
+async function paneAgentStatus(paneId) {
+  try {
+    const list = await hdr.request('agent.list', {}, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    const agents = (list && (list.agents || (list.result && list.result.agents))) || [];
+    const entry = agents.find((a) => a && a.pane_id === paneId);
+    return (entry && entry.agent_status) ? String(entry.agent_status) : null;
+  } catch (e) { return null; }
+}
+
+async function paneIsBusy(paneId) {
+  return (await paneAgentStatus(paneId)) === 'working';
+}
+
+/* a pi status line reads `(provider) model • level` */
+function piStatusLine(text) {
+  const lines = String(text || '').split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    /* with reasoning off the line reads `model • thinking off`, otherwise `model • level` */
+    const m = /•\s*(?:thinking\s+)?(off|minimal|low|medium|high|xhigh|max)\s*$/.exec(lines[i].replace(/\s+$/, ''));
+    if (!m) continue;
+    const head = lines[i].slice(0, m.index).trim();
+    const model = (/([A-Za-z0-9._:+-]+)$/.exec(head) || [])[1] || null;
+    return { level: m[1], model: model };
+  }
+  return null;
+}
+
+/* which levels pi's current model maps. A level mapped to null does not exist for that model,
+   and xhigh/max exist only where the model maps them explicitly — the same rule pi applies. */
+async function piThinkingLevels(modelId) {
+  try {
+    const raw = await fsp.readFile(path.join(PI_AGENT_HOME, 'models.json'), 'utf8');
+    const providers = (JSON.parse(raw) || {}).providers || {};
+    for (const name of Object.keys(providers)) {
+      const models = (providers[name] && providers[name].models) || [];
+      const hit = models.find((x) => x && (x.id === modelId || x.name === modelId));
+      if (!hit) continue;
+      if (!hit.reasoning) return ['off'];
+      const map = hit.thinkingLevelMap || {};
+      return PI_THINKING_LEVELS.filter((level) => {
+        const mapped = map[level];
+        if (mapped === null) return false;
+        if (level === 'xhigh' || level === 'max') return mapped !== undefined;
+        return true;
+      });
+    }
+  } catch (e) { /* no catalogue: offer the whole set and let pi refuse what it will not take */ }
+  return PI_THINKING_LEVELS.slice();
+}
+
+/* claude's /effort is a slider: a ruler line carries a ▲ under the level it is set to and the
+   line below lists the levels. The nearest label to the mark is the current level. */
+function claudeEffortLevel(text) {
+  const lines = String(text || '').split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const mark = lines[i].indexOf('▲');
+    if (mark < 0) continue;
+    const row = lines[i + 1] || '';
+    if (!/max/.test(row) || !/(^|\s)low(\s|$)/.test(row)) continue;
+    let best = null;
+    const re = /(low|medium|high|xhigh|max)/g;
+    let m;
+    while ((m = re.exec(row))) {
+      const d = Math.abs(m.index + (m[1].length - 1) / 2 - mark);
+      if (!best || d < best.d) best = { level: m[1], d: d };
+    }
+    if (best) return best.level;
+  }
+  return null;
+}
+
+/* the level claude paints in its own footer once it has one: `● high · /effort` */
+function claudeEffortFooter(text) {
+  const m = lastMatch(/(low|medium|high|xhigh|max)\s*·\s*\/effort/g, String(text || ''));
+  return m ? m[1] : null;
+}
+
+/* claude clears its prompt box on a double escape. Without it a leftover `/effort` is appended to
+   and submitted as a chat message — `/effort/effort`, which costs a real turn. */
+async function clearClaudePrompt(paneId) {
+  const lines = String(await readVisible(paneId) || '').split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].replace(/\s+$/, '');
+    if (/^❯\s*$/.test(line)) return false;             // already empty
+    if (/^❯\s*\S/.test(line)) {
+      await hdr.request('pane.send_keys', { pane_id: paneId, keys: ['esc'] }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+      await sleep(250);
+      await hdr.request('pane.send_keys', { pane_id: paneId, keys: ['esc'] }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+      await sleep(350);
+      return true;
+    }
+  }
+  return false;
+}
+
+async function openClaudeEffort(paneId) {
+  await hdr.request('pane.send_keys', { pane_id: paneId, keys: ['esc'] }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+  await sleep(400);                                    // a selector left open would swallow the command
+  await clearClaudePrompt(paneId);
+  /* the command box offers a completion for whatever is typed: an enter that arrives before that
+     settles accepts the completion instead of running the command, and nothing opens — so a
+     failed attempt is cleared and tried once more. */
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await hdr.request('pane.send_text', { pane_id: paneId, text: '/effort' }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    await sleep(900);
+    await hdr.request('pane.send_keys', { pane_id: paneId, keys: ['enter'] }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    for (let i = 0; i < 5; i++) {                      // the slider takes a moment to paint
+      await sleep(1100);
+      const level = claudeEffortLevel(await readVisible(paneId));
+      if (level) return level;
+    }
+    await clearClaudePrompt(paneId);                   // the text stayed in the box: clear it before retrying
+  }
+  return null;
+}
+
+/* the newest answer in the window, not the first: a pane keeps the output of earlier commands
+   above the one just run, and only the last one describes the state now. */
+function lastMatch(re, text) {
+  let hit = null;
+  let m;
+  while ((m = re.exec(text)) !== null) hit = m;
+  return hit;
+}
+
+/* GET /api/effort?pane_id=.. -> { ok, agent, current, levels:[..] }
+   The current level is read where that agent keeps it: pi's own status line, or the answer to a
+   plain command for hermes and, through its slider, for claude. */
+async function handleEffortGet(req, res, url) {
+  const paneId = url.searchParams.get('pane_id');
+  if (!paneId) throw { code: 'bad_request', message: '"pane_id" query parameter is required' };
+  const family = await agentFamilyOf(paneId);
+
+  if (family === 'pi') {
+    const line = piStatusLine(await readRecent(paneId, 40));
+    return ok(res, {
+      pane_id: paneId, agent: 'pi', current: line ? line.level : null,
+      levels: await piThinkingLevels(line && line.model), source: 'status line',
+    });
+  }
+
+  if (family === 'hermes') {
+    if (await paneIsBusy(paneId)) {
+      return ok(res, {
+        pane_id: paneId, agent: 'hermes', current: null, levels: EFFORT_LEVELS.hermes,
+        source: 'command', note: 'the pane is working — reading its level means asking it, which would interrupt',
+      });
+    }
+    await hdr.request('agent.prompt', { target: paneId, text: '/reasoning' }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    await sleep(2500);
+    const m = lastMatch(/Reasoning effort:\s*([a-z]+)/gi, await readRecent(paneId, 80));
+    return ok(res, {
+      pane_id: paneId, agent: 'hermes', current: m ? m[1].toLowerCase() : null,
+      levels: EFFORT_LEVELS.hermes, source: 'command',
+    });
+  }
+
+  if (family === 'claude') {
+    /* its footer carries the level once it has been set, which costs the pane nothing. The footer
+       sits at the bottom of the viewport: the scrollback window is wrapped differently and can
+       leave it outside. */
+    const foot = claudeEffortFooter(await readVisible(paneId));
+    if (foot) return ok(res, { pane_id: paneId, agent: 'claude', current: foot, levels: EFFORT_LEVELS.claude, source: 'footer' });
+    if (await paneIsBusy(paneId)) {
+      return ok(res, {
+        pane_id: paneId, agent: 'claude', current: null, levels: EFFORT_LEVELS.claude,
+        source: 'slider', note: 'the pane is working, and its level is only visible in a selector it is not showing',
+      });
+    }
+    const level = await openClaudeEffort(paneId);
+    await hdr.request('pane.send_keys', { pane_id: paneId, keys: ['esc'] }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    if (!level) throw { code: 'no_slider', message: 'the /effort slider did not appear (is this claude pane at an idle prompt?)' };
+    return ok(res, { pane_id: paneId, agent: 'claude', current: level, levels: EFFORT_LEVELS.claude, source: 'slider' });
+  }
+
+  throw { code: 'no_effort', message: 'no think-effort control is known for this pane (' + family + ')' };
+}
+
+/* POST /api/effort {pane_id, level}
+   hermes and pi take the level as their command's argument. claude has no argument form, so its
+   slider is opened, walked from the level it is on to the one asked for, and confirmed with `s`
+   — this session only, so the dash never rewrites the reader's own default. */
+async function handleEffortPost(req, res, body) {
+  const paneId = requireString(body, 'pane_id');
+  const level = requireString(body, 'level').trim().toLowerCase();
+  const family = await agentFamilyOf(paneId);
+  if (await paneIsBusy(paneId)) {
+    throw { code: 'pane_busy', message: 'this pane is working — switching its think effort now would interrupt the turn; try again when it is idle' };
+  }
+
+  if (family === 'hermes') {
+    if (EFFORT_LEVELS.hermes.indexOf(level) < 0) {
+      throw { code: 'bad_request', message: 'no hermes reasoning level "' + level + '" (one of ' + EFFORT_LEVELS.hermes.join(', ') + ')' };
+    }
+    await hdr.request('agent.prompt', { target: paneId, text: '/reasoning ' + level }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    await sleep(3000);
+    const text = await readRecent(paneId, 150);
+    return ok(res, { pane_id: paneId, agent: 'hermes', level: level, confirmed: text.indexOf("Reasoning effort set to '" + level + "'") >= 0 });
+  }
+
+  if (family === 'pi') {
+    const before = piStatusLine(await readRecent(paneId, 40));
+    const levels = await piThinkingLevels(before && before.model);
+    if (levels.indexOf(level) < 0) {
+      throw { code: 'bad_request', message: 'this model does not take thinking level "' + level + '" (one of ' + levels.join(', ') + ')' };
+    }
+    await hdr.request('agent.prompt', { target: paneId, text: '/thinking ' + level }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    await sleep(3000);
+    const after = piStatusLine(await readRecent(paneId, 40));
+    return ok(res, { pane_id: paneId, agent: 'pi', level: level, confirmed: !!after && after.level === level });
+  }
+
+  if (family === 'claude') {
+    const from = await openClaudeEffort(paneId);
+    const toIdx = EFFORT_LEVELS.claude.indexOf(level);
+    const fromIdx = from ? EFFORT_LEVELS.claude.indexOf(from) : -1;
+    if (toIdx < 0 || fromIdx < 0) {
+      await hdr.request('pane.send_keys', { pane_id: paneId, keys: ['esc'] }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+      throw toIdx < 0
+        ? { code: 'bad_request', message: 'no claude effort level "' + level + '" (one of ' + EFFORT_LEVELS.claude.join(', ') + ')' }
+        : { code: 'no_slider', message: 'the /effort slider did not appear (is this claude pane at an idle prompt?)' };
+    }
+    const statementsBefore = ((await readRecent(paneId, 60)).match(/Set effort level to /g) || []).length;
+    const step = toIdx >= fromIdx ? 'right' : 'left';
+    /* one key per request, spaced: keys that arrive in the same write are dropped by claude's
+       input loop, which leaves the slider open on a level nobody confirmed. */
+    for (let i = 0; i < Math.abs(toIdx - fromIdx); i++) {
+      await hdr.request('pane.send_keys', { pane_id: paneId, keys: [step] }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+      await sleep(280);
+    }
+    await sleep(600);
+    /* the transcript keeps the wording of every earlier switch, so progress is read from a new
+       statement appearing — or from the slider being gone with the footer naming the level.
+       A key is only pressed again while the slider is still up: `s` into a closed box would be
+       typed into the prompt. */
+    const sliderOpen = async () => !!(claudeEffortLevel(await readVisible(paneId)));
+    const settled = async () => {
+      const text = await readRecent(paneId, 60);
+      const re = /Set effort level to ([a-z]+)/g;
+      const said = [];
+      let m;
+      while ((m = re.exec(text))) said.push(m[1]);
+      if (said.length > statementsBefore && said[said.length - 1] === level) return true;
+      if (await sliderOpen()) return false;
+      return claudeEffortFooter(await readVisible(paneId)) === level;
+    };
+    let confirmed = false;
+    for (let i = 0; i < 3 && !confirmed; i++) {
+      await hdr.request('pane.send_keys', { pane_id: paneId, keys: ['s'] }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+      await sleep(1300);
+      /* dropping to a lower level makes claude ask once more — the switch costs it a re-read of the
+         conversation — and the highlighted answer is the level that was asked for. */
+      const seen = await readVisible(paneId);
+      if (/Change effort level\?/.test(seen)) {
+        await hdr.request('pane.send_keys', { pane_id: paneId, keys: ['enter'] }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+        await sleep(1300);
+      }
+      confirmed = await settled();
+      if (!confirmed && !(await sliderOpen())) break;  // it closed without answering: stop pressing keys
+    }
+    if (!confirmed && await sliderOpen()) {            // never leave a selector open behind us
+      await hdr.request('pane.send_keys', { pane_id: paneId, keys: ['esc'] }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    }
+    return ok(res, { pane_id: paneId, agent: 'claude', level: level, from: from, confirmed: confirmed });
+  }
+
+  throw { code: 'no_effort', message: 'no think-effort control is known for this pane (' + family + ')' };
 }
 
 // POST /api/rpc {method, params} — raw passthrough for any herdr method.
@@ -1699,6 +1994,30 @@ const SCAN_WAIT_MS = (() => {
   return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 900;
 })();
 const readMemory = new Map();           // pane_id -> {agent, session_id, file, cwd, working, live, fields, at}
+
+/* ── the session this view last SWITCHED a pane to ───────────────────────────
+   herdr records a pane's session once per source and accepts every later report
+   without changing what it publishes: a new id sent under the same source, and the
+   same report sent under a fresh source, both answer {"type":"ok"} while
+   `agent_session.value` never moves. So after a /resume
+   inside the pane, herdr keeps naming the session the agent STARTED with, and the
+   pane's own evidence cannot settle it either — hermes' resume banner ("↻ Resumed
+   session <id>") is pushed out of the 200-line scrollback window by the very
+   conversation it restores, and a session hermes STARTS is stored with no cwd at
+   all, so the resolver's cwd filter cannot see it. What IS reliable is the one
+   thing nobody has to infer: this view drove the switch itself. */
+const switchedPanes = new Map();         // pane_id -> {id, agent, at, from}
+const newSessionNotices = new Map();     // pane_id -> when this view FIRST saw the pane's "new session" line
+const SWITCHED_TTL_MS = 12 * 60 * 60 * 1000;
+const NEW_SESSION_SLACK_MS = 180000;     // how far a store row may predate the notice and still be that session
+const NEW_SESSION_NOTICE = /New session started!/i;      // hermes' own line when it starts one
+const NEW_SESSION_NOTICE_G = /New session started!/gi;   // the same line, counted (they accumulate)
+
+/** How many "started a new session" lines the pane is showing: the larger of its two windows. */
+function noticeCount(a, b) {
+  const count = (t) => { const m = String(t || '').match(NEW_SESSION_NOTICE_G); return m ? m.length : 0; };
+  return Math.max(count(a), count(b));
+}
 /** §13.12 item 1's proof hook: makes §9's resolution take at least this long, so the
  *  bound lane 2 gives a tail read can be MEASURED against a scan as slow as the one
  *  seen on the PM's instance (5–9 s) without waiting for herdr to actually be slow.
@@ -2177,6 +2496,10 @@ function refreshFromHerdr(paneId) {
 async function replyFromMemory(res, paneId, limit, mark, clk) {
   const mem = readMemory.get(paneId);
   if (!mem) return null;
+  /* A switch this view performed makes an older memory stale by construction (§9.5): the memory
+     names the session the pane was on before it. */
+  const sw = switchedPanes.get(paneId);
+  if (sw && sw.id !== mem.session_id) return null;
   const reader = fileLogReader(mem.agent);
   if (!reader || !mem.session_id) return null;
   const file = reader.findSessionFile(mem.session_id);
@@ -2218,6 +2541,9 @@ async function replyFromMemory(res, paneId, limit, mark, clk) {
  */
 async function replyFromHerdrRecord(res, paneId, agent, entry, herdrSessionId, limit, scanMs, mark, clk) {
   if (!herdrSessionId) return null;
+  /* A switch this view performed outranks the record: herdr cannot be corrected (see the note on
+     switchedPanes), so what it still publishes is the PREVIOUS session by construction. */
+  if (switchedPanes.has(paneId)) return null;
   const reader = fileLogReader(agent);
   if (!reader) return null;
   const cwd = typeof entry.cwd === 'string' ? entry.cwd.trim() : '';
@@ -2255,6 +2581,80 @@ async function replyFromHerdrRecord(res, paneId, agent, entry, herdrSessionId, l
   chatReply(res, base, { kind: reader.SOURCE_KIND, session_id: herdrSessionId, path: file }, win, true, 0);
   if (clk) clk.done({ lane: 'herdr-record', scan: 'herdr-record', scan_ms: scanMs, messages: win.messages.length, tail_bytes: win.tailBytes, file_size: win.eof });
   return SERVED;
+}
+
+/**
+ * The session this pane is really on, when this view knows better than the pane's own
+ * evidence does. `null` means "ask the resolver" — never "there is no session".
+ */
+async function switchedSessionFor(paneId, agent, entry, agents) {
+  const sw = switchedPanes.get(paneId);
+  if (!sw) return null;
+  if (sw.agent !== agent) { switchedPanes.delete(paneId); return null; }
+  if (Date.now() - sw.at > SWITCHED_TTL_MS) { switchedPanes.delete(paneId); return null; }
+
+  /* A pane that has STARTED a session since the switch is not on the switched one any more.
+     hermes prints "(^_^)v New session started!" and the store gains a row — one with no cwd, so
+     the resolver cannot see it either. That line stays on screen long after the fact, so what
+     decides it is when this view FIRST saw it: a line first seen after the switch belongs to a
+     session started after it. */
+  if (agent === 'hermes') {
+    const texts = await paneTexts(paneId);
+    const count = noticeCount(texts.visible, texts.recent);
+    const prev = newSessionNotices.get(paneId) || null;
+    let noticeAt = prev && prev.at ? prev.at : 0;
+    /* The line accumulates: hermes prints one per session started, and the ones already there
+       when the switch happened belong to the sessions it left. So a RISE in the count is the
+       event, and the count recorded at the switch is the baseline it is measured from. */
+    if (prev && count > prev.count) noticeAt = Date.now();
+    newSessionNotices.set(paneId, { at: noticeAt, count: count });
+    if (noticeAt && noticeAt > sw.at) {
+      const row = newestUnclaimedSession(await storeSessions(), agents, paneId, noticeAt);
+      if (row) {
+        const moved = { id: String(row.id), agent: agent, at: Date.now(), from: 'new_session' };
+        switchedPanes.set(paneId, moved);
+        return moved;
+      }
+      /* The pane started one and the store carries no row this view may claim for it yet (hermes
+         writes the row a moment after the first turn). Nothing is guessed: this poll goes to the
+         resolver, which says what it can prove. */
+      switchedPanes.delete(paneId);
+      return null;
+    }
+  }
+  return sw;
+}
+
+/** The newest store session started around `at` that no other pane has claimed. */
+function newestUnclaimedSession(rows, agents, paneId, at) {
+  const claimed = claimedByOtherPanes(agents, paneId);
+  const min = at - NEW_SESSION_SLACK_MS;
+  let best = null;
+  for (const r of rows || []) {
+    if (!r || !r.id || claimed[r.id]) continue;
+    const started = Number.isFinite(r.started_at) ? r.started_at * 1000 : null;
+    if (started === null || started < min) continue;
+    if (!best || String(r.id) > String(best.id)) best = r;
+  }
+  return best;
+}
+
+/**
+ * Remember a switch this view just performed, and drop everything the old binding lives in.
+ * `id` empty means the new session could not be named (claude/pi keep theirs inside their own
+ * selector): the memory and the caches still have to go, so the next poll resolves afresh.
+ */
+function rememberSwitch(paneId, id, agent, from, seen) {
+  if (id) switchedPanes.set(paneId, { id: String(id), agent: agent, at: Date.now(), from: from || 'dash_switch' });
+  else switchedPanes.delete(paneId);
+  readMemory.delete(paneId);        // it names the session the pane was on BEFORE the switch
+  liveCache.clear();                // keyed on herdr's record, which did not move
+  paneTextCache.clear();
+  storeCache.clear();
+  /* The switch records whether a "started a new session" line is on screen RIGHT NOW: one that is
+     belongs to the session the switch just left, so only a later appearance may move the pane. */
+  if (agent === 'hermes') newSessionNotices.set(paneId, { at: Date.now(), count: (seen && seen.noticeCount) || 0 });
+  else newSessionNotices.delete(paneId);
 }
 
 async function handleChat(req, res, url) {
@@ -2297,6 +2697,11 @@ async function handleChat(req, res, url) {
   mark('agentList');
   const entry = agents.find((a) => a && a.pane_id === paneId);
   if (!entry) {
+    /* The agent is gone from this pane (it exited, or the pane was closed): whatever session this
+       view had bound or switched belongs to a process that is no longer running. */
+    switchedPanes.delete(paneId);
+    newSessionNotices.delete(paneId);
+    readMemory.delete(paneId);
     const known = await paneInSnapshot(paneId);
     if (!known.exists) {
       throw { code: 'pane_not_found', message: `unknown pane_id "${paneId}"` };
@@ -2327,7 +2732,28 @@ async function handleChat(req, res, url) {
   // and the scan finishes behind the reply instead of in front of it. A window
   // read, a reader pick and every hermes pane keep the resolving road below.
   let live = null;
-  if (tail && fileLogReader(agent) && !readerPick) {
+  /* The switch this view performed, when there is one: it outranks the record, the remembered
+     read and the scan (see the note on switchedPanes). A reader's pick still wins over it — the
+     pick is the reader speaking, and §9.5 lets them choose. */
+  const switched = readerPick ? null : await switchedSessionFor(paneId, agent, entry, agents);
+  if (switched) {
+    live = {
+      res: {
+        resolved: true,
+        session_id: switched.id,
+        detected_by: switched.from,
+        corroborated: true,
+        reason: null,
+        candidates: [],
+        note: switched.from === 'new_session'
+          ? 'this pane started a new session after the one this view switched it to'
+          : 'this view switched the pane to this session (herdr cannot be told about it)',
+      },
+      texts: {},
+      cwd: entry.cwd,
+      scan: 'dash-switch',
+    };
+  } else if (tail && fileLogReader(agent) && !readerPick) {
     const job = liveSessionFor(paneId, entry, agent, herdrSessionId, agents, null, mark);
     const raced = await raceDeadline(job, SCAN_WAIT_MS);
     if (raced === SCAN_TIMEOUT) {
@@ -2828,6 +3254,7 @@ async function handle(req, res) {
     if (pathname === '/api/prompt') return handlePromptDetect(req, res, url);
     if (pathname === '/api/model') return handleModelGet(req, res, url);
     if (pathname === '/api/sessions') return handleSessionsGet(req, res, url);
+    if (pathname === '/api/effort') return handleEffortGet(req, res, url);
     // §2 convenience: GET /api/cli?argv=agent+list — same as the POST body, with
     // argv split on whitespace. No quoting support; use POST for arguments that
     // contain spaces.
@@ -2850,6 +3277,7 @@ async function handle(req, res) {
       '/api/prompt/answer': handlePromptAnswer,
       '/api/model': handleModelPost,
       '/api/sessions': handleSessionsPost,
+      '/api/effort': handleEffortPost,
       '/api/rpc': handleRpc,
       '/api/cli': handleCli,
       '/api/fanout': handleFanout,

@@ -937,7 +937,11 @@
              `nextTryAt` is when the next automatic attempt is due, and `sizeBytes`/`sizeSrc` are the
              session's size and where it came from ('server' | 'tail-cursor') — knowledge, not a guess */
           stall: null, stalls: 0, stallRun: 0, backoffMs: 0, nextTryAt: 0, sizeBytes: null, sizeSrc: '',
-          pending: [], lastQuery: '', lastFetchAt: 0, fetches: 0, errors: 0
+          pending: [], lastQuery: '', lastFetchAt: 0, fetches: 0, errors: 0,
+          /* the session this pane's state belongs to, and a generation counter that the reads
+             carry: an answer asked for BEFORE a reset belongs to the session the reset left, so
+             it is dropped rather than merged into the new one (see resetForSession). */
+          session: '', gen: 0
         };
       }
       return st;
@@ -945,6 +949,37 @@
     function currentPaneId() {
       if (paneOverride) return paneOverride;
       try { return ctx.state.selectedPaneId || null; } catch (e) { return null; }
+    }
+
+    /* The pane's session changed under this view: a session switch, a session the agent started,
+       or an agent that was restarted. Every byte of the pane's state belongs to the session we
+       just left — the messages, the byte/id cursor into its log, the DOM — so keeping any of it
+       would mix two conversations and leave the cursor pointing into a session nobody reads.
+       `gen` is how a read that was already in flight is recognised as belonging to the old one. */
+    function resetForSession(st, sessionId) {
+      st.messages = []; st.keys = {}; st.msgByKey = {}; st.foldedKeys = {}; st.openKeys = {}; st.openScroll = {};
+      st.rendered = []; st.renderedTo = 0; st.workingNode = null; st.workingSince = 0;
+      st.openBig = null; st.reclose = null; st.expanded = false; st.loadingOlder = false; st.olderNote = '';
+      /* `gotCursor: false` is what makes the next poll a TAIL read (§8.2), which is exactly how a
+         session is opened in the first place. */
+      st.cursor = 0; st.gotCursor = false;
+      st.tailChecked = false; st.tailMode = null; st.verifyTail = false; st.tailCursor = 0;
+      st.sizeBytes = null; st.sizeSrc = '';
+      st.empties = 0; st.emptiesServer = 0; st.unknown = 0; st.skipped = 0; st.truncated = false;
+      st.empty = false; st.error = null; st.stall = null; st.stalls = 0; st.stallRun = 0;
+      st.backoffMs = 0; st.nextTryAt = 0; st.follow = true;
+      st.pending = [];                       // cards sent into the session this pane just left
+      st.session = sessionId || '';
+      /* the source too: it still names the session this pane left, and the change detection reads
+         it back as "the session we hold", which would re-trigger the reset on every reply */
+      st.source = null;
+      st.gen = (st.gen || 0) + 1;
+      if (currentPaneId() === st.id) {
+        if (listEl) listEl.innerHTML = '';
+        follow = true; newCount = 0;
+        renderAll();
+      }
+      return st.gen;
     }
 
     /* ---------------- data ---------------- */
@@ -1100,7 +1135,7 @@
           (nowMs - lastAsk.at) < REQ_DEDUP_MS) {
         return;
       }
-      var req = { id: id, startedAt: nowMs, cursor: tailFirst ? null : since, ctrl: null };
+      var req = { id: id, startedAt: nowMs, cursor: tailFirst ? null : since, ctrl: null, gen: st.gen || 0 };
       try { if (window.AbortController) req.ctrl = new AbortController(); } catch (e) { req.ctrl = null; }
       inflight = req;
       lastAsk = { id: id, since: sigSince, tail: tailFirst, at: nowMs };
@@ -1119,17 +1154,20 @@
         b.__stall = null;
         /* meta.tail MUST travel with the body: it is how ingest knows this was a tail page and not a
            head page (the two are identical on the wire — that is the whole §8.2 verification) */
-        ingest(id, b, { tail: !!req.tail });
+        ingest(id, b, { tail: !!req.tail, gen: req.gen });
       }, function (e) {
         if (inflight === req) { inflight = null; clearReqTimer(); }
         if (req.ctrl && req.ctrl.signal && req.ctrl.signal.aborted) return;   // the abort we asked for
-        ingest(id, { ok: false, error: { code: 'network', message: String(e && e.message ? e.message : e) } });
+        ingest(id, { ok: false, error: { code: 'network', message: String(e && e.message ? e.message : e) } }, { gen: req.gen });
       });
     }
 
     /** feed one §8.2 body through the same path a network response takes */
     function ingest(id, body, meta) {
       var st = paneState(id);
+      /* an answer to a read that was asked for BEFORE a reset describes the session that reset
+         left; merging it would put the old conversation back under the new session's header */
+      if (meta && meta.gen !== undefined && meta.gen !== (st.gen || 0)) return;
       st.fetches++;
       st.lastFetchAt = Date.now();
       st.stall = null;                               // a body arrived: nothing is stalled any more
@@ -1150,11 +1188,36 @@
         } else {
           st.error = (body && body.error) ? body.error : { code: 'bad_response', message: 'the server sent no JSON body' };
           st.errors++;
+          /* The server's verdict is that this pane runs no agent any more (it exited, or the pane
+             was closed): the transcript on screen belongs to a process that is gone, so it is
+             dropped and the reason is what the panel shows. The verdict is deliberate server-side
+             (`agent.list` has no entry AND the pane still exists), not a transient read failure. */
+          if ((code === 'unsupported_agent' || code === 'pane_not_found') && st.messages.length) {
+            var why = st.error;
+            resetForSession(st, '');
+            /* the reset clears the error with everything else, and the reader is owed the reason
+               their transcript just disappeared: put it back (the next poll re-sets it anyway) */
+            st.error = why;
+          }
           if (id === currentPaneId()) { renderState(st); renderStatus(st); }
           return;
         }
       } else {
         st.error = null;
+        /* The reply names a DIFFERENT session than this pane's state belongs to: the pane was
+           switched, or the agent started (or resumed) another one. Everything held for the old
+           session is dropped BEFORE this body is merged, so the two are never mixed. */
+        var incoming = (body && body.session_id != null) ? String(body.session_id) : '';
+        var held = st.session || (st.source && st.source.session_id ? String(st.source.session_id) : '');
+        if (held && incoming && incoming !== held) {
+          resetForSession(st, incoming);
+          /* This body belongs to the session the pane just left — its cursor is an offset in a
+             conversation this view no longer reads, so it is dropped rather than merged. Asking
+             again immediately is what opens the new session, from its tail. */
+          retryNow();
+          return;
+        }
+        if (!st.session && incoming) st.session = incoming;
         if (body.agent) st.agent = body.agent;
         if (body.source) st.source = body.source;
         if (body.cursor !== undefined && body.cursor !== null) { st.cursor = body.cursor; st.gotCursor = true; }
@@ -2738,6 +2801,16 @@
       viewMode: function () { return mode; },
       state: state,
       notePending: notePending,            // app.js integration hook (successful prompt send)
+      /* the pane's session changed from outside this view — the dash switched it. Drop the
+         transcript the old session owns and open the new one from its tail, now rather than on the
+         next tick: the reader should never see the old conversation under the new session's name. */
+      resetPane: function (id, why) {
+        var pid = id || currentPaneId();
+        if (!pid || !panes[pid]) return false;
+        resetForSession(panes[pid], '');
+        retryNow();
+        return true;
+      },
       /* §10: the composer's attachments. app.js owns the input paths (picker / drop / paste) and the
          send button; the chat view owns the chips, the uploads and the §10.4 block, so the outgoing
          text can only be built in one place. Every method is safe to call before any pane exists. */
@@ -2815,6 +2888,16 @@
       /* the panel scroller's remembered position for this pane, or null when there is none */
       __panelTop: function (id) { return paneState(id || currentPaneId()).panelTop; },
       __messages: function (id) { return paneState(id || currentPaneId()).messages.slice(); },
+      /* the pane's session changed from OUTSIDE this view — the dash switched it, or the agent
+         started another one. Drop everything the old session owns and open the new one from its
+         tail; `gen` makes any read already in flight land nowhere. */
+      __resetPane: function (id, reason) {
+        var pid = id || currentPaneId();
+        if (!pid || !panes[pid]) return false;
+        resetForSession(panes[pid], '');
+        lastAsk = null;                          // the dedup window must not swallow the re-read
+        return true;
+      },
       __tick: function (nowMs) { return pendingTick(typeof nowMs === 'number' ? nowMs : Date.now()); },
       /* DEFECT-12 seams: the latch is an object with a clock, so a test can age it and watch the
          timeout path run for real (no fetch is stubbed anywhere in this module) */
@@ -3006,6 +3089,9 @@
       setReqTimeoutMs: function (ms) { return handle ? handle.__setReqTimeoutMs(ms) : 0; },
       reqTimerArmed: function () { return handle ? handle.__reqTimerArmed() : false; },
       retry: function () { return handle ? handle.__retry() : false; },
+      /* §…: the pane's session changed outside this view (the dash switched it) — drop the state
+         the old session owns and re-open the pane from the tail of the new one */
+      resetPane: function (id, reason) { return handle ? handle.__resetPane(id, reason) : false; },
       /* §13.12 item 2 */
       stateText: function (id, nowMs) { return handle ? handle.__stateText(id, nowMs) : ''; },
       slowTick: function () { return handle ? handle.__slowTick() : false; },

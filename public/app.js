@@ -476,6 +476,7 @@ function renderHeader() {
   if (d) d.className = 'dot ' + st;
   renderUsage();                 // §12.2.2: a pane change re-evaluates the chip at once, not in 500ms
   if (typeof window.__hdUpdateModelSel === 'function') window.__hdUpdateModelSel();
+  if (typeof window.__hdUpdateEffortSel === 'function') window.__hdUpdateEffortSel();
   if (typeof window.__hdSessionFollowSelection === 'function') window.__hdSessionFollowSelection();
 }
 
@@ -2903,6 +2904,90 @@ function init() {
     refreshModelList(paneId, agent, true);            // refetch so the current row is accurate
   });
 
+  /* the think-effort droplist: the same shape as the model one — it shows the selected pane's
+     current level and switches when the reader picks another. All three agents can be switched
+     from here: hermes and pi take the level as their command's argument, claude is walked along
+     its own slider. The current level comes from the agent itself (see GET /api/effort). */
+  const effortSel = $('agentEffortSel');
+  let effortCache = { paneId: null, agent: null, levels: null, current: null };
+  function setEffortSelPlaceholder(text) {
+    if (!effortSel) return;
+    effortSel.innerHTML = '';
+    const o = document.createElement('option');
+    o.textContent = text; o.value = '';
+    effortSel.appendChild(o);
+  }
+  function fillEffortSel(levels, current) {
+    if (!effortSel) return;
+    const list = (levels || []).slice();
+    /* an agent can sit on a level its own list does not carry (hermes' `ultra`): show it rather
+       than displaying a level the pane is not on */
+    if (current && list.indexOf(current) < 0) list.unshift(current);
+    effortSel.innerHTML = '';
+    if (!list.length) { setEffortSelPlaceholder('think: \u2014'); effortSel.disabled = true; return; }
+    if (!current) setEffortSelPlaceholder('think: \u2014');
+    list.forEach(function (lv) {
+      const o = document.createElement('option');
+      o.value = lv; o.textContent = lv;
+      if (current && lv === current) o.selected = true;
+      effortSel.appendChild(o);
+    });
+    effortSel.disabled = false;
+  }
+  async function refreshEffortList(paneId, agent, force) {
+    if (!effortSel) return;
+    if (!force && effortCache.paneId === paneId && effortCache.levels) {
+      fillEffortSel(effortCache.levels, effortCache.current);
+      return;
+    }
+    effortSel.disabled = true;
+    setEffortSelPlaceholder('loading\u2026');
+    const body = await api('/api/effort?pane_id=' + encodeURIComponent(paneId));
+    if (!body || !body.ok) {
+      setEffortSelPlaceholder('think: \u2014');
+      effortSel.disabled = true;
+      effortCache = { paneId: null, agent: null, levels: null, current: null };
+      return;
+    }
+    effortCache = { paneId: paneId, agent: agent, levels: body.levels || [], current: body.current || null };
+    /* the server hedges when it cannot read the level without disturbing the pane: say so rather
+       than passing a blank off as "unknown" */
+    effortSel.title = body.note
+      ? ('think effort \u2014 ' + body.note)
+      : "the selected pane's think effort \u2014 pick another level to switch it live (claude, hermes, pi)";
+    fillEffortSel(effortCache.levels, effortCache.current);
+  }
+  function updateEffortSel() {
+    if (!effortSel) return;
+    const pane = state.selected ? findPane(state.selected) : null;
+    const agent = pane && pane.agent;
+    if (!pane) {
+      setEffortSelPlaceholder('think\u2026');
+      effortSel.disabled = true;
+      effortCache = { paneId: null, agent: null, levels: null, current: null };
+      return;
+    }
+    if (agent !== 'claude' && agent !== 'hermes' && agent !== 'pi') {
+      setEffortSelPlaceholder('think: \u2014');
+      effortSel.disabled = true;
+      effortCache = { paneId: null, agent: null, levels: null, current: null };
+      return;
+    }
+    refreshEffortList(state.selected, agent, false);
+  }
+  window.__hdUpdateEffortSel = updateEffortSel;
+  if (effortSel) effortSel.addEventListener('change', async function () {
+    const paneId = state.selected;
+    const val = effortSel.value;
+    if (!paneId || !val) return;
+    effortSel.disabled = true;
+    const body = await postJSON('/api/effort', { pane_id: paneId, level: val });
+    if (!body || !body.ok) { toast('think effort failed \u2014 ' + errText(body), 'error'); }
+    else if (body.confirmed === false) { toast('think \u2192 ' + val + ' (unconfirmed \u2014 check the pane)', 'error'); }
+    else { toast('think \u2192 ' + val, 'ok'); }
+    refreshEffortList(paneId, effortCache.agent, true);
+  });
+
   /* the session switcher: a side panel listing the selected pane's sessions and resuming the one
      picked. hermes is asked by id through its message channel; claude and pi have no such
      command, so the server walks their own /resume selector — which is also where the list comes
@@ -2976,6 +3061,17 @@ function init() {
     if (res.confirmed === false) { toast('resumed ' + name + ' (unconfirmed — check the pane)', 'error'); return; }
     toast('resumed ' + name, 'ok');
     closeSessionPanel();
+    /* the conversation on screen is the one we just left: drop it now rather than on the next
+       poll, so the reader never sees the old transcript under the new session's name. The poll
+       would catch it anyway (the reply names a different session), this only makes it immediate. */
+    resetChatPane(paneId, 'session-switch');
+  }
+
+  /* the chat view owns the per-pane transcript; it resets it and re-opens from the tail */
+  function resetChatPane(paneId, why) {
+    const cv = state.moduleApi.chatview || (window.HD && window.HD.chatview) || null;
+    if (!cv || typeof cv.resetPane !== 'function') return false;
+    try { return !!cv.resetPane(paneId, why); } catch (e) { return false; }
   }
   if (sessionBtn) sessionBtn.addEventListener('click', async function () {
     if (!sessionPanel) return;
