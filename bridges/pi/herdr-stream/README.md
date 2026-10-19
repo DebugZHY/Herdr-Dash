@@ -1,6 +1,6 @@
-# herdr-stream (pi bridge) — wave 1
+# herdr-stream (pi bridge)
 
-A pi extension that observes pi's real token stream and appends CONTRACT.md §3
+A pi extension that observes pi's real token stream and appends it to the Herdr-Dash NDJSON sink.
 envelopes to the local NDJSON sink, so Herdr-Dash can render assistant text/reasoning
 while it is generated instead of waiting for the final `/api/chat` record.
 
@@ -44,7 +44,7 @@ Required environment for the pane pi runs in (**nothing is written without both*
 
 Back out by removing the directory again; there is no config to edit.
 
-## What it writes (§2/§3)
+## What it writes
 
 ```
 <root>/<safe(pane_id)>/<safe(session_id)>__<safe(turn_id)>.ndjson     one file per turn
@@ -54,13 +54,13 @@ Back out by removing the directory again; there is no config to edit.
 
 - One JSON object per line, UTF-8, no BOM, append-only, ≤ 64 KiB per line.
 - `seq` is monotonic per process and never reused; `ts` is epoch ms.
-- §2 bounding: `args`, `result`, `partial`, `text` (i.e. `final_text`) cap at 16 KiB with
+- Bounding: `args`, `result`, `partial`, `text` (i.e. `final_text`) cap at 16 KiB with
   the tail replaced by `…[truncated]`; token deltas are never truncated (a single delta
   that would push its line past 64 KiB is dropped and counted instead of corrupted).
 - Cleanup on turn start: newest 20 turn files per pane stay, files older than 2 hours
   go, the open file is never deleted, `__control.ndjson` is never counted or deleted.
 
-## Mapping (§4)
+## Mapping
 
 | pi event | envelope |
 |---|---|
@@ -81,22 +81,22 @@ Back out by removing the directory again; there is no config to edit.
 
 `message_update` `start`, `text_start`, `thinking_start`, `done` have no envelope of
 their own (they carry no delta and no text): the file describes the message through its
-deltas plus `message_end.text`, which §3 says is authoritative.
+deltas plus `message_end.text`, which is authoritative.
 
-`message_start`/`message_end` for `toolResult` and `custom` messages are skipped (§3 only
+`message_start`/`message_end` for `toolResult` and `custom` messages are skipped (only
 names `assistant`/`user`).
 
 ## Decisions worth knowing about
 
 1. **One turn file per agent RUN, not per pi `turn_start`.** pi emits `turn_start` once
-   per LLM request, so a run with tool calls emits several. §3 says a turn may contain
-   several assistant messages, and §4 closes the file on `agent_settled`, so the second
+   per LLM request, so a run with tool calls emits several. A turn may contain
+   several assistant messages, and the bridge closes the file on `agent_settled`, so the second
    and later `turn_start` events of a run keep the open file (they are not written as
    extra `turn_start` lines either: the client opens a live turn per `turn_start`, and a
    mid-run `turn_start` would clear the bubbles it is still filling). A `turn_start`
    with `turn_index === 0` while a later iteration is open means the previous run never
    settled — that file is closed with `turn_end status="aborted"` and a new one starts.
-2. **`turn_end` status `error`.** §4 says "aborted, else complete"; §3 allows `error` and
+2. **`turn_end` status `error`.** The contract says "aborted, else complete"; `error` is also
    pi reports provider failures as an assistant message with `stopReason === "error"`
    (not `aborted`). Reporting those runs as `complete` would tell the UI a broken turn
    finished, so the status is `aborted` → `aborted`, last `stopReason === "error"` →
@@ -109,7 +109,7 @@ names `assistant`/`user`).
    `assistantMessageEvent.partial.content[contentIndex].id`. Some OpenAI-compatible
    endpoints send `id: ""` at first and only reveal it later; the first id seen is
    pinned, and `tool_execution_*` ids are aliased onto the pinned value, so the UI shows
-   one card per call instead of two (§3 "UI keys both by `tool_call_id`"). A provider
+   one card per call instead of two (UI keys both by `tool_call_id`). A provider
    that never exposes an id falls back to `<message_id>:c<contentIndex>`.
 5. **`parent_tool_call_id`** is in pi's `ToolExecutionStartEvent` type but pi 1.2.0 does
    not forward it from the agent event (`core/agent-session.js` builds the extension
@@ -147,7 +147,7 @@ and a dry run into a temp `HD_STREAM_DIR`.
 
 ## Not verified here (needs the manager's live pane)
 
-- That pi emits these events in this order for a real provider turn (§9 item 5). The
+- That pi emits these events in this order for a real provider turn. The
   shapes are taken from `dist/core/extensions/types.d.ts`, `pi-ai/dist/types.d.ts` and
   the emitters in `core/agent-session.js`; the whole path was exercised through the real
   `index.ts` + jiti loader with synthetic events only.

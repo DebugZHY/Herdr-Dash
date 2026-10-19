@@ -93,41 +93,33 @@ function sessionsRoot() {
  * evidence the cwd scan cannot reproduce: six pi panes can share one cwd while
  * only a handful of logs exist, so mtime/rank assignment mis-binds the extras.
  *
- * §2 rules are mirrored from src/stream-hub.js (`safe`, root resolution, the
+ * rules are mirrored from src/stream-hub.js (`safe`, root resolution, the
  * `__control` exclusion) so the route that tails the sink and the resolver that
  * trusts it agree on which file is the pane's own.
  */
 const SINK_SAFE_RE = /[^A-Za-z0-9_.-]/g;
-const SINK_SAFE_LEN = 80;                       // §2 safe() truncates to 80 chars
+const SINK_SAFE_LEN = 80;                       // safe() truncates to 80 chars
 const SINK_SUFFIX = '.ndjson';
-const SINK_CONTROL_SUFFIX = '__control.ndjson'; // §4 out-of-turn settings file
-const SINK_LINE_MAX = 64 * 1024;                // §2 one envelope line is <= 64 KiB
+const SINK_CONTROL_SUFFIX = '__control.ndjson'; // out-of-turn settings file
+const SINK_LINE_MAX = 64 * 1024;                // one envelope line is <= 64 KiB
 
-/** §2 `safe(s)`: every character outside `[A-Za-z0-9_.-]` becomes `-`, then 80 chars. */
+/** `safe(s)`: every character outside `[A-Za-z0-9_.-]` becomes `-`, then 80 chars. */
 function sinkSafeSegment(value) {
   return String(value === undefined || value === null ? '' : value)
     .replace(SINK_SAFE_RE, '-')
     .slice(0, SINK_SAFE_LEN);
 }
 
-/** The sink root, resolved exactly like src/stream-hub.js: HD_STREAM_DIR, else
- *  %LOCALAPPDATA%\herdr-dash\streams, else ~/.herdr-dash/streams. Reuses the
- *  hub's export when present so the two cannot drift; the inline copy is only a
- *  fallback for a tree where the hub has not been released yet. */
+/** The sink root, resolved exactly like src/stream-hub.js. */
 function sinkStreamRoot(opts) {
   const o = opts || {};
   if (typeof o.streamRoot === 'string' && o.streamRoot.trim()) return path.resolve(o.streamRoot.trim());
-  try {
-    const hub = require('../stream-hub');
-    if (hub && typeof hub.resolveStreamRoot === 'function') return hub.resolveStreamRoot(process.env);
-  } catch (e) { /* fall through to the identical rule below */ }
-  const local = typeof process.env.LOCALAPPDATA === 'string' ? process.env.LOCALAPPDATA.trim() : '';
-  if (local) return path.join(local, 'herdr-dash', 'streams');
-  return path.join(os.homedir(), '.herdr-dash', 'streams');
+  const hub = require('../stream-hub');
+  return hub.resolveStreamRoot(process.env);
 }
 
 /** The first COMPLETE line of a sink file, or null when there is not one yet.
- *  Reads at most one contract line; never the rest of the file. */
+ * Reads at most one line; never the rest of the file. */
 async function firstSinkLine(file) {
   let fh;
   try {
@@ -170,7 +162,7 @@ async function sinkSessionForPane(paneId, opts) {
 
     const root = path.resolve(sinkStreamRoot(o));
     const dir = path.resolve(root, safe);
-    // §2 defence in depth: a pane id that resolves outside the root is a path,
+    // defence in depth: a pane id that resolves outside the root is a path,
     // not a pane. `safe()` maps separators to '-', but '.' survives it.
     if (dir === root || !dir.startsWith(root + path.sep)) return null;
 
@@ -182,7 +174,7 @@ async function sinkSessionForPane(paneId, opts) {
     let best = null;
     for (const name of names) {
       if (typeof name !== 'string' || !name.endsWith(SINK_SUFFIX)) continue;
-      if (name.endsWith(SINK_CONTROL_SUFFIX)) continue;                  // §4: never the main stream
+      if (name.endsWith(SINK_CONTROL_SUFFIX)) continue;                  // never the main stream
       const file = path.join(dir, name);
       let st;
       try { st = await fsp.stat(file); } catch (e) { continue; }
@@ -213,7 +205,7 @@ async function sinkSessionForPane(paneId, opts) {
  * The newest `<session>__control.ndjson` in a pane's sink directory, or null.
  *
  * Shared by the model reader and the queue reader: both answer with the LAST line of the
- * newest control file. Path handling mirrors `sinkSessionForPane` (§2 `safe()` + a
+ * newest control file. Path handling mirrors `sinkSessionForPane` (`safe()` + a
  * root-prefix check), so a pane id can never escape the stream root. Never throws.
  *
  * @param {string} paneId
@@ -244,43 +236,6 @@ async function newestControlFile(paneId, opts) {
       }
     }
     return best;
-  } catch (e) {
-    return null;
-  }
-}
-
-/**
- * The last model recorded by this pane's own bridge. The extension writes a `settings`
- * envelope (with `model`) to the per-session control file after `/herdr-model`; reading
- * it is the quietest way to mark the current row without typing into pi. Only the newest
- * control file is opened, and only its last complete lines are parsed.
- *
- * @param {string} paneId
- * @param {{streamRoot?: string}} [opts]
- * @returns {Promise<string|null>}
- */
-async function sinkModelForPane(paneId, opts) {
-  try {
-    const best = await newestControlFile(paneId, opts);
-    if (!best) return null;
-    const rawPane = String(paneId === undefined || paneId === null ? '' : paneId);
-    let text;
-    try {
-      const st = await fsp.stat(best.file);
-      if (st.size > SINK_LINE_MAX * 20) return null;
-      text = await fsp.readFile(best.file, 'utf8');
-    } catch (e) { return null; }
-    const lines = String(text).split(/\r?\n/);
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (!lines[i]) continue;
-      let env;
-      try { env = JSON.parse(lines[i]); } catch (e) { continue; }
-      if (!env || env.v !== 1 || env.pane_id !== rawPane) continue;
-      if (env.type !== 'settings') continue;
-      const model = env.model || (env.data && env.data.model);
-      if (typeof model === 'string' && model.trim()) return model.trim();
-    }
-    return null;
   } catch (e) {
     return null;
   }
@@ -377,7 +332,7 @@ async function bridgeStateForPane(paneId, opts) {
       let env;
       try { env = JSON.parse(lines[i]); } catch (e) { continue; }
       if (!env || (env.type !== 'settings' && env.type !== 'queue')) continue;
-      if (typeof env.pane_id === 'string' && env.pane_id !== rawPane) continue;
+      if (env.pane_id !== rawPane) continue;
       const protocol = Number(env.protocol);
       if (env.bridge === PI_BRIDGE_ID && Number.isFinite(protocol) && protocol >= PI_BRIDGE_PROTOCOL) {
         return { ready: true, protocol: protocol, file: best.file, note: '' };
@@ -1012,10 +967,10 @@ async function readTail(file, limit, opts) {
   }
 }
 
-/* ── wave 2: the pi control plane (sessions, model catalogue, commands) ────────
+/* ── the pi control plane (sessions, model catalogue, commands) ────────
  *
  * Herdr-Dash used to read pi's `/resume` selector out of the pane. That disturbs the
- * composer and fails while the pane is busy, so wave 2 moves the control plane into the
+ * composer and fails while the pane is busy, so moves the control plane into the
  * pi extension (bridges/pi/herdr-stream): the dashboard only ever sends a slash command
  * the extension owns. Nothing in this block touches a pane.
  *
@@ -1244,29 +1199,29 @@ async function listSessionsForCwd(paneCwd, opts) {
   return out;
 }
 
-/* ── wave 3: the queued tray (QUEUE-CONTRACT §A/§B/§C/§D) ────────────────────
+/* ── the queued tray (///) ────────────────────
  *
  * The composer-side control plane: the dashboard writes ONE extension command for a steer
  * or follow-up message, and reads back the bridge's own queue record. Nothing here types
  * into a pane, and nothing here reads pi's internal queue — the tray is explicitly the
- * bridge-visible queue (§C.5).
+ * bridge-visible queue.
  *
- * The command strings live here so the route and the tests share one builder (§B), and the
+ * The command strings live here so the route and the tests share one builder, and the
  * control-file reader lives here so a malformed line answers empty lists, never a throw.
  */
 
-/** The two commands the extension registers for queued delivery (§B). */
+/** The two commands the extension registers for queued delivery (). */
 const PI_STEER_COMMAND = '/herdr-steer';
 const PI_FOLLOWUP_COMMAND = '/herdr-followup';
 
-/** §D: bounded reads/rows. The control file is append-only and may be long; only its tail
+/** bounded reads/rows. The control file is append-only and may be long; only its tail
  *  is inspected, and one row's text is cut for the tray (never for delivery). */
 const QUEUE_ID_MAX = 200;
 const QUEUE_ITEM_TEXT_MAX = 4096;
 const QUEUE_ITEMS_MAX = 100;
 const QUEUE_TAIL_BYTES = 256 * 1024;
 
-/** §A.4: an opaque item id, unique per pane/process (no counter the UI may arithmetic on). */
+/** an opaque item id, unique per pane/process (no counter the UI may arithmetic on). */
 function queueItemId(nowMs) {
   const at = Number.isFinite(nowMs) ? Math.floor(nowMs) : Date.now();
   let rnd = '';
@@ -1279,7 +1234,7 @@ function queueItemId(nowMs) {
 }
 
 /**
- * §B: one command line. `JSON.stringify` is the escaping — quotes, backslashes, newlines,
+ * one command line. `JSON.stringify` is the escaping — quotes, backslashes, newlines,
  * control characters and any unicode text survive; the line itself stays one line.
  *
  * @param {'steer'|'followup'} kind
@@ -1296,7 +1251,7 @@ function queueCommand(kind, id, text) {
 }
 
 /**
- * §A.1–A.3: the pure decision for a `mode:"steer"|"followup"` prompt. The route resolves
+ * –A.3: the pure decision for a `mode:"steer"|"followup"` prompt. The route resolves
  * the pane's agent family and live `agent_status` first, then obeys this — so the frozen
  * error codes (`unsupported_mode`, `bad_request`, `not_streaming`) and their HTTP statuses
  * are testable without a herdr connection.
@@ -1357,7 +1312,7 @@ function normalizeQueueItems(list) {
 }
 
 /**
- * §D: the last `type:"queue"` envelope of the pane's newest control file.
+ * the last `type:"queue"` envelope of the pane's newest control file.
  *
  * Answers with empty lists + a short `note` when there is no control file, no queue line,
  * or a malformed record; never throws, never types into the pane. Only the file's tail is
@@ -1410,7 +1365,7 @@ async function readQueueState(paneId, opts) {
       if (!env || typeof env !== 'object' || Array.isArray(env)) continue;
       if (env.type !== 'queue') continue;
       // A control file is per session, but a mis-copied line must not bind this pane.
-      if (typeof env.pane_id === 'string' && env.pane_id !== rawPane) continue;
+      if (env.pane_id !== rawPane) continue;
       const steering = normalizeQueueItems(env.steering);
       const followUp = normalizeQueueItems(env.followUp);
       if (!steering || !followUp) return empty('the queue record for this pane is malformed', best.file);
@@ -1439,14 +1394,14 @@ function fits(messages, plan, limit, bytes) {
 module.exports = {
   SOURCE_KIND, EXCLUDED_TYPES, KNOWN_TYPES, MESSAGE_TYPES, sessionsRoot, findSessionFile,
   verifyCwd, sameCwd, parseRecord, readWindow, readTail, candidatesForCwd,
-  sinkSessionForPane, sinkModelForPane, sinkSettingsForPane, sinkSafeSegment, sinkStreamRoot, bridgeStateForPane,
-  /* wave 2 control plane (pure helpers; the routes only send these strings) */
+  sinkSessionForPane, sinkSettingsForPane, sinkSafeSegment, sinkStreamRoot, bridgeStateForPane,
+  /* control plane (pure helpers; the routes only send these strings) */
   PI_RESUME_COMMAND, PI_MODEL_COMMAND, PI_ABORT_COMMAND, PI_NEW_COMMAND,
   resumeCommand, modelCommand, safeCommandToken,
   piAgentDir, piModelsFile, listModelCatalogue,
   PI_THINKING_LEVELS, modelThinkingLevels,
   firstUserTitle, listSessionsForCwd,
-  /* wave 3 queue control plane (pure builders + a bounded control-file reader) */
+  /* queue control plane (pure builders + a bounded control-file reader) */
   PI_STEER_COMMAND, PI_FOLLOWUP_COMMAND, QUEUE_ITEM_TEXT_MAX, QUEUE_ITEMS_MAX,
   queueItemId, queueCommand, planQueuePrompt, readQueueState, newestControlFile,
   normalizeQueueItems,

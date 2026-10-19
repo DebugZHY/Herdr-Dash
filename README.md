@@ -1,9 +1,8 @@
 # herdr-dash
 
 A local web dashboard for the **herdr** terminal multiplexer: see every agent pane as a structured conversation or as
-its raw terminal transcript, drive panes and run native `herdr` commands from one page, and read each pane's own usage
-figures and background processes. The server binds `127.0.0.1` only and spawns `herdr` directly — no shell, nothing
-leaves your machine.
+its raw terminal transcript, and drive panes from one page. The server binds `127.0.0.1` only and spawns `herdr`
+directly — no shell, nothing leaves your machine.
 
 > Windows-only for now: herdr's API is a local named pipe (`\\.\pipe\...\herdr\herdr.sock`).
 
@@ -67,24 +66,18 @@ herdr itself from a NON-elevated terminal and nothing needs elevation anywhere.
 
 ## Usage
 
-Three columns: the workspace / tab / pane tree on the left, the selected pane in the middle, and a **side dock** on the
-right showing that pane's own usage and background processes.
+Two columns: the workspace / tab / pane tree on the left and the selected pane's conversation on the right, with the
+composer pinned below it.
 
-- **Panes** (`Ctrl+1..9` or `j` / `k`): pick the pane shown in the terminal, chat or raw view.
-- **Views**: the selected pane opens in the live **terminal** by default. `t` cycles terminal → **chat** (the
-  structured history) → raw transcript → terminal; the header view chip does the same (in chat it toggles chat ↔ raw).
-  The terminal streams the pane's screen (~150 ms cadence), while the chat view reads the agent's own log. Add
-  `?perf=1` to the URL for a small header HUD (`read 14ms · 6.7/s · 3200 rows`) refreshed twice a second.
+- **Panes** (`Ctrl+1..9` or `j` / `k`): pick the pane shown in the conversation.
+- **Views**: `t` cycles terminal → **chat** (the structured history) → raw transcript → terminal; the header view chip
+  does the same. The terminal streams the pane's screen (~150 ms cadence), while the chat view reads the agent's own
+  log. Add `?perf=1` to the URL for a small header HUD refreshed twice a second.
 - **Prompts**: `Enter` sends, `Shift+Enter` adds a newline, *wait for idle* queues until the pane is free, and *send
   text* sends the text verbatim (what menus and REPLs expect).
 - **Attachments**: paperclip, drag-and-drop, or paste. The file is copied to
   `<app>\_cache\attachments\<pane>\<utc>-name` (`HD_ATTACH_ROOT` moves it) and sent to the agent as an absolute path.
   Failures show the server's own reason; they are never silently dropped.
-- **Console** (bottom): run native `herdr` commands server-side (`cli` mode) or raw RPC — for what the GUI does not
-  expose.
-- **Dock** (`d`): the pane's own status line (model, tokens, percentage, elapsed) and its background processes. Where
-  the agent elided something with `…`, the dock says so instead of guessing.
-- **Changes** (`g g`): read-only git status/diff for the directories herdr has panes in.
 - **Copy** (`⧉` on every message, thinking block and tool card): that block's **verbatim** text on the clipboard —
   including text a fold is hiding — with the true character count. If the browser refuses, it says so; it never
   pretends to have copied.
@@ -96,7 +89,7 @@ right showing that pane's own usage and background processes.
   records are added in order. A slow read says what it is waiting for ("still reading … 4s so far"), reports a timeout
   as a timeout, and retries on its own.
 - **Keys**: `Ctrl+K` palette · `?` shortcuts · `Ctrl+1..9` / `j`,`k` panes · `/` prompt · `Esc` closes overlays ·
-  `g b` board, `g i` inbox, `g p` palette, `g f` fan-out, `g s` search, `g g` changes · `\` collapse the sidebar.
+  `g p` palette, `g f` fan-out, `g s` search · `\` collapse the sidebar.
 
 ## Stream bridges (optional)
 

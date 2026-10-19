@@ -19,7 +19,6 @@
 
   --mono: ui-monospace, "Cascadia Mono", "JetBrains Mono", Consolas, "Courier New", monospace;
   --sidebar-w: 300px;
-  --dock-w: 320px;
 
   /* every scroll region: a slim, dark thumb that sits on the surface instead of a
      light OS stripe. WebKit uses the pseudo-elements below; Firefox gets the same
@@ -77,21 +76,14 @@ html, body {
 
 #app {
   display: grid;
-  grid-template-columns: auto 6px 1fr 6px auto;   /* §12.2.1: the fourth track is the dock's */
+  grid-template-columns: auto 6px minmax(0, 1fr);
   height: 100vh; width: 100vw;
   overflow: hidden;
 }
 
-/* DEFECT-16 — place the five tracks explicitly. With auto-placement, `.hidden` on a resize handle
-   (display:none) removed that grid item, so #main slid into the 6px track: collapsing the sidebar
-   left a 6px-wide main area (a blank page) whose own restore button could not be clicked, and the
-   state persisted in localStorage, so a reload came back broken too. The rule is unchanged by the
-   dock's arrival — it is what makes a collapsed dock a 0-width track instead of a moved #main. */
 #sidebar { grid-column: 1; }
 #sidebarResize { grid-column: 2; }
 #main { grid-column: 3; }
-#dockResize { grid-column: 4; }
-#dock { grid-column: 5; }
 
 /* ---------------- sidebar ---------------- */
 
@@ -111,46 +103,6 @@ html, body {
 #sidebarResize { background: transparent; cursor: col-resize; }
 #sidebarResize:hover { background: var(--accent); opacity: .35; }
 #sidebarResize.hidden { display: none !important; }
-
-/* ---------------- side dock (CONTRACT-v2 §12.2) ---------------- */
-
-#dockResize { background: transparent; cursor: col-resize; }   /* mirror of #sidebarResize */
-#dockResize:hover { background: var(--accent); opacity: .35; }
-#dockResize.hidden { display: none !important; }
-
-#dock {
-  width: var(--dock-w);
-  min-width: 260px;                        /* §12.2.1's clamp floor, applied by CSS and by the drag */
-  background: var(--bg-panel);
-  border-left: 1px solid var(--line);
-  display: flex; flex-direction: column;
-  min-height: 0;
-  overflow: hidden;
-}
-#dock.collapsed { width: 0 !important; min-width: 0; border-left: none; }
-#dock.collapsed .dock-head,
-#dock.collapsed .dock-host { display: none; }
-
-.dock-head {
-  flex: 0 0 auto;
-  display: flex; align-items: center; gap: 8px;
-  padding: 4px 10px;
-  background: var(--bg-panel2);
-  border-bottom: 1px solid var(--line);
-}
-.dock-host { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 6px 10px 8px; }
-
-/* the §12.2.2 usage chip: an em dash (never a zero, never a guess) when there is no current value */
-#hUsage { flex: 0 0 auto; max-width: 340px; }
-
-/* the dock's toggle is a real target, not a 17.6x19 px dot: the same >=20x20 the source/attachment
-   buttons already meet (§10.9). Only the box grows — the glyph, the click and `d` are unchanged. */
-#dockToggle {
-  flex: 0 0 auto;
-  min-width: 20px; min-height: 20px;
-  display: inline-flex; align-items: center; justify-content: center;
-  padding: 0;
-}
 
 .side-head {
   display: flex; align-items: center; gap: 8px;
@@ -205,11 +157,7 @@ html, body {
 #main {
   display: flex; flex-direction: column;
   min-width: 0; min-height: 0; height: 100vh;
-  /* DEFECT-21's backstop. The composer's cap now leaves room for the console (app.js promptFitCap), so
-     in any normal window this column does not overflow. It can still overflow when the window is too
-     short for the composer's own content floor plus everything else — §12.1.3 makes the floor win, and
-     a floor that wins must not brick the console. `auto` is `hidden` until that happens: no scrollbar,
-     no layout change, and then a way down to the console. */
+  /* The composer's floor wins on short windows; the column can scroll rather than clip it. */
   overflow-x: hidden; overflow-y: auto;
 }
 
@@ -220,14 +168,6 @@ html, body {
   background: var(--bg-panel2);
   border-bottom: 1px solid var(--line);
 }
-.hdr-main { flex: 1 1 auto; min-width: 0; }
-.hdr-row { display: flex; align-items: center; gap: 10px; min-width: 0; flex-wrap: nowrap; }
-/* The header's height is part of the layout everything below it is measured against (§12.1: the
-   composer's bottom edge is the drag's datum), so its rows must never re-flow when a field's text
-   gets longer — a wrapped "495 ms ago" pushed the whole page down 16px mid-drag. Fields keep their
-   own line (nowrap, unsquashed); the hint is the one item allowed to shrink, and it ellipsizes. */
-.hdr-row > * { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 0 0 auto; }
-#hHint { flex: 0 1 auto; min-width: 0; }
 .hdr-status { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; }
 .full { overflow: hidden; text-overflow: ellipsis; }
 
@@ -239,7 +179,7 @@ html, body {
 
 #transcriptWrap {
   position: relative;
-  /* §12.1 item 6: the composer may take up to 60% of the main area, so the transcript is what gives
+  /* the composer may take up to 60% of the main area, so the transcript is what gives
      the last px — its floor is the smallest sliver of chat that still reads as one, not 120 */
   flex: 1 1 auto; min-height: 96px;
   display: flex;
@@ -258,7 +198,7 @@ html, body {
 }
 #transcript:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
 
-/* §13.2.1: HD.pathlink's mount host, declared inside #chatHost (index.html). The module puts exactly
+/* HD.pathlink's mount host, declared inside #chatHost (index.html). The module puts exactly
    one thing in here — the in-page file menu, which pathlink.css positions FIXED at the link — so the
    host must not take a row in the chat host's column, and `display: contents` is the way to say that:
    the host has no box of its own, its children belong to the chat host's formatting context, and the
@@ -273,10 +213,8 @@ html, body {
   font-size: 11.5px; font-weight: 600;
 }
 
-.sep { color: var(--st-unknown); }
-
 /* ---------------- terminal-first view ----------------
-   #terminalHost is the W2 engine's mount box; it fills the same transcript track as
+   #terminalHost is the engine's mount box; it fills the same transcript track as
    #transcript/#chatHost. When terminal is not the active view it must take no space at
    all (terminal.css gives .hd-term-host display:flex, which would otherwise beat the
    hidden attribute's UA rule). `.terminal-active` on #transcriptWrap is what swaps the
@@ -293,16 +231,16 @@ html, body {
 
 #promptBox {
   flex: 0 0 auto;
-  display: flex; flex-direction: column;      /* §12.1.2: the panel is sized from its top edge */
+  display: flex; flex-direction: column;      /* sized from its top edge */
   height: var(--prompt-h, auto);
-  min-height: 120px;                          /* §12.1.2's floor — the JS clamp can never go below it */
+  min-height: 120px;                          /* the JS clamp never goes below this */
   padding: 6px 10px 8px;
   background: var(--bg-panel);
   border-bottom: 1px solid var(--line);
   overflow: hidden;                           /* capped: at --prompt-h the content never spills */
 }
 
-/* §12.1.2 — the composer's own top edge. One mechanism only: the textarea's native corner grip is
+/* the composer's own top edge. One mechanism only: the textarea's native corner grip is
    gone (below). It mirrors #sidebarResize (same hover, same body cursor while dragging). */
 #promptResize {
   flex: 0 0 auto;
@@ -311,16 +249,14 @@ html, body {
   cursor: row-resize;
   border-radius: 3px;
   /* no bottom margin: the handle is 6px of the vertical budget the transcript and the chat view own
-     (§12.1.1 fixes the height). Four pixels more was enough to leave the chat scroller 1px into its
+     (fixes the height). Four pixels more was enough to leave the chat scroller 1px into its
      own scroll, where A3 (g2)'s "a toggle must not move the view" caught it — the frozen 6px does not
-     tip it, but there is no reason to spend more than the contract asks for. */
+     tip it, but there is no reason to spend more than the asks for. */
   margin: 0;
 }
 #promptResize:hover, #promptResize:focus { background: var(--accent); opacity: .35; outline: none; }
 #promptResize:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
 
-.prompt-line { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 6px; }
-.prompt-line.wrap { flex-wrap: wrap; align-items: center; }
 /* the row that carries the textarea takes the panel's spare height, so dragging the top edge up
    gives the space to the composer itself (and stops at #promptText's own min-height) */
 #promptTextRow { flex: 1 1 auto; min-height: 0; align-items: stretch; }
@@ -374,22 +310,6 @@ html, body {
 }
 .icon-btn:hover { color: var(--fg); border-color: var(--line); }
 
-.keys { display: flex; gap: 4px; flex-wrap: wrap; }
-.key {
-  background: #1b2330; color: var(--fg); border: 1px solid var(--line);
-  border-radius: 3px; padding: 2px 7px; cursor: pointer;
-  font-family: var(--mono); font-size: 11px;
-}
-.key:hover { background: #26313f; border-color: var(--accent); }
-
-/* DEFECT-3(b): the esc→pane arming toggle. A live toggle, not a key send: it has no
-   data-key, and when armed it turns red because Esc then interrupts the agent's turn. */
-.key.arm-toggle { color: var(--fg-dim); }
-.key.arm-toggle.arm-on {
-  color: var(--st-blocked); border-color: var(--st-blocked); background: #2a1618;
-}
-.key.arm-toggle.arm-on:hover { background: #3a1b1e; border-color: var(--st-blocked); }
-
 input[type=text], .sel {
   background: var(--bg-input); color: var(--fg);
   border: 1px solid var(--line); border-radius: 4px;
@@ -401,72 +321,6 @@ input[type=text]:focus, .sel:focus { outline: none; border-color: var(--accent);
 .result { font-family: var(--mono); font-size: 11.5px; padding: 4px 8px; border-radius: 4px; margin-top: 2px; }
 .result.ok  { color: #9fd6a8; background: #10231a; border: 1px solid #1e4630; }
 .result.err { color: #ffb4b4; background: #2a1416; border: 1px solid #5c2326; }
-
-/* ---------------- console ---------------- */
-
-#consolePanel {
-  flex: 0 0 auto;
-  display: flex; flex-direction: column;
-  /* §12.1 item 6: the console keeps a strip — its header plus at least one line — and its own content
-     (`#consoleBody .out`, which already scrolls) takes the loss, rather than being pushed off screen by
-     a tall composer. `flex-shrink: 1` is what lets the column take the strip down to that floor
-     instead of overflowing; in a roomy window nothing shrinks and the console stays at its 30%. */
-  height: 30%; min-height: 64px; flex-shrink: 1;
-  background: var(--bg-panel);
-  overflow: hidden;
-}
-#consolePanel.collapsed { height: auto; min-height: 0; }
-#consolePanel.collapsed #consoleBody { display: none; }
-
-/* §12.1 item 6 — the strip, measured and marked by syncConsoleStrip() in app.js. The console is at the
-   height where its command row and a line of output cannot both fit, so the strip promises the line:
-   the body scrolls its own content (`overflow: auto`), the output is ordered above the command row, and
-   its own padding gives way to the line it has to show. Nothing here is a state the user has to leave
-   by hand — the class follows the console's measured height, so the ordinary console is one drag away. */
-#consolePanel.strip #consoleBody { padding: 0 6px 2px; gap: 4px; overflow: auto; }
-#consolePanel.strip .out { order: -1; padding: 1px 6px; min-height: 24px; }
-
-.console-head {
-  flex: 0 0 auto;
-  display: flex; align-items: center; gap: 8px;
-  padding: 4px 10px; cursor: pointer;
-  background: var(--bg-panel2);
-  border-top: 1px solid var(--line);
-  user-select: none;
-}
-.console-head .caret { transition: transform .12s ease; }
-#consolePanel.collapsed .console-head .caret { transform: rotate(-90deg); }
-
-#consoleBody {
-  flex: 1 1 auto; min-height: 0;
-  display: flex; flex-direction: column;
-  padding: 6px 10px 8px;
-  gap: 6px;
-}
-.cmd-row { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
-.prompt-caret { color: var(--st-done); }
-
-.history { display: flex; gap: 4px; flex-wrap: wrap; flex: 0 0 auto; max-height: 44px; overflow: auto; }
-.hist {
-  font-family: var(--mono); font-size: 10.5px;
-  color: var(--fg-dim); background: #171e27;
-  border: 1px solid var(--line-soft); border-radius: 3px;
-  padding: 1px 6px; cursor: pointer;
-}
-.hist:hover { color: var(--fg); border-color: var(--accent); }
-
-.out {
-  flex: 1 1 auto; min-height: 0; overflow: auto;
-  background: var(--bg-input); border: 1px solid var(--line-soft);
-  border-radius: 4px; padding: 6px 8px;
-  font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere;
-}
-.blk { margin-bottom: 8px; }
-.blk-cmd { color: var(--accent); }
-.blk-meta { color: var(--fg-dim); }
-.blk-exit-bad { color: var(--st-blocked); }
-.blk-exit-ok { color: var(--st-done); }
-.blk-err { color: #ffb4b4; }
 
 /* ---------------- errors ---------------- */
 
@@ -482,10 +336,8 @@ input[type=text]:focus, .sel:focus { outline: none; border-color: var(--accent);
   box-shadow: 0 4px 14px rgba(0,0,0,.5);
 }
 
-/* ================= integration (W2, round 2) =================
-   Styles for the W2 modules (lib/palette.js, lib/search.js, lib/fanout.js, lib/keys.js)
-   and the app-level pieces they attach to. Same palette and variables as above;
-   W3's view modules carry their own lib/*.css. */
+/* Integration styles for the shell modules (lib/palette.js, lib/search.js,
+   lib/fanout.js, lib/keys.js) and the pieces they attach to. */
 
 /* ---------------- hint line + toast ---------------- */
 .hint { color: var(--fg-dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

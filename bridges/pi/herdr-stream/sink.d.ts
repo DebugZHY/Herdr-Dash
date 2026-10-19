@@ -16,6 +16,17 @@ export interface WriterStats {
   sessionId: string;
 }
 
+export interface QueueItem {
+  id?: string;
+  kind?: string;
+  text: string;
+}
+
+export interface QueueSnapshot {
+  steering: QueueItem[];
+  followUp: QueueItem[];
+}
+
 /** The raw writer: one turn file per run, an async FIFO, no synchronous I/O. */
 export interface HerdrStreamWriter {
   readonly enabled: boolean;
@@ -35,6 +46,10 @@ export interface HerdrStreamWriter {
   shutdown(event: unknown, ctx?: unknown): unknown;
   flush(timeoutMs?: number): Promise<void>;
   stats(): WriterStats;
+  queueAdd(entry: QueueItem): unknown;
+  queueRemoveText(messageText: string): unknown;
+  queueClear(reason?: string, force?: boolean): unknown;
+  queueSnapshot(): QueueSnapshot;
 }
 
 /** What `index.ts` consumes: the writer plus the total, never-throwing handlers. */
@@ -46,6 +61,10 @@ export interface PiBridge {
   readonly writer: HerdrStreamWriter;
   stats(): WriterStats;
   flush(timeoutMs?: number): Promise<void>;
+  queueAdd(entry: QueueItem): unknown;
+  queueRemoveText(messageText: string): unknown;
+  queueClear(reason?: string, force?: boolean): unknown;
+  queueSnapshot(): QueueSnapshot;
   turnStart(event: unknown, ctx?: unknown): void;
   messageStart(event: unknown, ctx?: unknown): void;
   messageUpdate(event: unknown, ctx?: unknown): void;
@@ -73,6 +92,7 @@ export interface BridgeOptions {
 export declare function createWriter(opts?: BridgeOptions): HerdrStreamWriter;
 export declare function createPiBridge(opts?: BridgeOptions): PiBridge;
 export declare function sessionOf(ctx: unknown): string;
+export declare function parseQueueArgument(argument: string): QueueItem | null;
 
 declare const herdrStream: {
   VERSION: number;
@@ -83,6 +103,7 @@ declare const herdrStream: {
   createWriter: typeof createWriter;
   createPiBridge: typeof createPiBridge;
   sessionOf: typeof sessionOf;
+  parseQueueArgument: typeof parseQueueArgument;
 };
 
 export default herdrStream;

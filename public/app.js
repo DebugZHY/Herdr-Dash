@@ -1,9 +1,6 @@
 /* herdr-dash frontend — vanilla ES2020, no imports, no build step.
- * Data sources: the HTTP API in CONTRACT.md §4 / CONTRACT-v2 §2 and the SSE stream in §5.
- * Every failure is rendered inline in the panel that failed; nothing is thrown to the console.
- *
- * Round 2 (W2): DEFECT-1 (advanceBuffer, 1200-line window, reset marker, revision skip),
- * DEFECT-2, window.HD (CONTRACT-v2 §3) + defensive module mounting + the module events.
+ * Data sources: the HTTP API and the SSE stream. Every failure is rendered inline in the
+ * panel that failed; nothing is thrown to the console.
  */
 'use strict';
 
@@ -31,18 +28,13 @@ function setText(el, t) { if (el) el.textContent = t; }
 
 const LS = {
   selected: 'herdrDash.selectedPane',
-  history: 'herdrDash.cmdHistory',
   trees: 'herdrDash.collapsedTrees',
   sidebar: 'herdrDash.sidebarCollapsed',
-  console: 'herdrDash.consoleCollapsed',
   width: 'herdrDash.sidebarWidth',
   templates: 'herdrDash.templates',         // owned by lib/fanout.js
-  /* §12: the round-8 keys are named literally in the contract (`hd.*`), unlike the v1 `herdrDash.*`
-     ones above, so they are written exactly as specified rather than in the older house style. */
-  promptH: 'hd.promptH',                    // §12.1.4 — the composer's height
+  /* the detail keys are named literally as `hd.*`, unlike the `herdrDash.*` keys above. */
+  promptH: 'hd.promptH',                    // the composer's height
   queueH: 'hd.queueH',                      // the queued-messages panel's share of the composer
-  dockW: 'hd.dockW',                        // §12.2.1 — the dock's width
-  dockOpen: 'hd.dockOpen'                   // §12.2.1 — '1' open, anything else closed
 };
 
 function lsGet(key, dflt) {
@@ -67,7 +59,7 @@ function lsSetJSON(key, obj) {
 }
 
 /* ------------------------------------------------------------------ *
- * CONTRACT.md §7 — transcript merge rule (v1, frozen; kept for compatibility
+ * transcript merge rule (v1, frozen; kept for compatibility
  * and exercised by the self-test next to its replacement)
  * ------------------------------------------------------------------ */
 
@@ -84,14 +76,11 @@ function mergeStream(prevLines, nextLines) {
 }
 
 /* ------------------------------------------------------------------ *
- * CONTRACT-v2 §0.1 — advanceBuffer.
+ * advanceBuffer.
  *
- * The algorithm lives in exactly one place now: public/lib/advance-buffer.js, loaded before
- * this file (index.html) so that it is the implementation this page polls with, the copy
- * public/lib/grid.js picks up as ctx.util.advanceBuffer, and the file the local test suite can
- * require() in Node next to the server twin src/hdr.js (W1). Its header documents the rules,
- * the 1r/1s improvements the round-2 DEFECT-1 fix needs, and why rule 2 appends
- * `next.slice(prev.length - p)` rather than the literal `next.slice(anchor.length)`.
+ * The algorithm lives in exactly one place: public/lib/advance-buffer.js, loaded before
+ * this file so the page polls with the same copy the local test suite can require() in Node
+ * next to the server twin src/hdr.js.
  * ------------------------------------------------------------------ */
 
 const advanceBuffer = (window.HD && typeof window.HD.advanceBuffer === 'function')
@@ -108,19 +97,13 @@ const advanceBuffer = (window.HD && typeof window.HD.advanceBuffer === 'function
 
 const POLL_MS = 1000;
 const SNAPSHOT_MS = 5000;
-const TRANSCRIPT_LINES = 1200;   // §0.1: was 400; the window must cover a realistic burst
+const TRANSCRIPT_LINES = 1200;   // was 400; the window must cover a realistic burst
 const MAX_DOM_LINES = 2000;      // lines rendered into <pre>
 const BUFFER_MAX = 20000;        // lines kept per pane in memory
-const HISTORY_MAX = 50;
-const MAX_OUT_BLOCKS = 200;
 const TOAST_MS = 4200;
-/* §3 load order, mirrored from index.html; gitview (round 5, §7.2, W3) is appended last.
-   A module in this list that never loaded is simply skipped, so the missing file cannot break
-   the page — and mountModules() reports what actually mounted in the header tag. */
-const MODULE_ORDER = ['palette', 'search', 'fanout', 'keys', 'board', 'inbox', 'grid', 'timebar', 'gitview'];
-/* The chat-first shell is the whole page: these older views stay in the bundle but are
-   not mounted, so they cannot add chrome, timers or a second column to the landing view. */
-const SHELL_SKIP_MODULES = { board: true, inbox: true, grid: true, timebar: true, gitview: true, dock: true };
+/* Load order, mirrored from index.html. A module in this list that never loaded is simply
+   skipped, so a missing file cannot break the page; mountModules() reports what mounted. */
+const MODULE_ORDER = ['palette', 'search', 'fanout', 'keys'];
 const STATUSES = ['working', 'blocked', 'idle', 'done', 'unknown'];
 const ROLLUP_PRIORITY = ['blocked', 'working', 'unknown', 'done', 'idle'];
 const STATUS_RANK = { blocked: 0, working: 1, done: 2, idle: 3, unknown: 4 };
@@ -141,8 +124,6 @@ const state = {
   sseLive: false,
   herdrStatus: '',
   collapsed: lsGetJSON(LS.trees, { workspaces: {}, tabs: {} }),
-  history: [],
-  histIdx: -1,
   snapTimer: null,
   booted: false,
   mods: {},                  // id -> module object
@@ -152,11 +133,6 @@ const state = {
   keys: {},                  // id -> [{key, help}]
   seenPanes: {}              // paneId -> true (every pane this session has buffered)
 };
-
-try {
-  const h = lsGetJSON(LS.history, []);
-  if (Array.isArray(h)) state.history = h.filter(function (x) { return typeof x === 'string'; }).slice(0, HISTORY_MAX);
-} catch (e) { state.history = []; }
 
 /* ------------------------------------------------------------------ *
  * HTTP helper — never throws; always returns {ok:...}
@@ -278,7 +254,7 @@ function seenPaneIds() {
 function currentBuffer() { return state.selected ? state.buffers[state.selected] : null; }
 
 /* ------------------------------------------------------------------ *
- * tiny event bus (CONTRACT-v2 §3: snapshot | select | buffer | status | sse + module types)
+ * tiny event bus (snapshot | select | buffer | status | sse + module types)
  * ------------------------------------------------------------------ */
 
 const listeners = {};
@@ -587,14 +563,11 @@ function pickDefaultPane() {
 function renderHeader() {
   const p = findPane(state.selected);
   setText($('hPane'), state.selected || 'no pane selected');
-  setText($('hLabel'), p ? paneName(p) : '');
   setText($('hAgent'), p ? (p.agent || '-') : '-');
-  setText($('hCwd'), p ? (p.cwd || p.foreground_cwd || '-') : '-');
   const st = p ? statusOf(p) : 'unknown';
   setText($('hStatus'), state.selected ? (p ? st : 'not in snapshot') : 'unknown');
   const d = $('hStatusDot');
   if (d) d.className = 'dot ' + st;
-  renderUsage();                 // §12.2.2: a pane change re-evaluates the chip at once, not in 500ms
   if (typeof window.__hdUpdateModelSel === 'function') window.__hdUpdateModelSel();
   if (typeof window.__hdUpdateEffortSel === 'function') window.__hdUpdateEffortSel();
   if (typeof window.__hdSessionFollowSelection === 'function') window.__hdSessionFollowSelection();
@@ -605,15 +578,6 @@ function renderHeader() {
      status change re-opens (or retires) it right here */
   try { updateApprovalControls(); } catch (e) { /* the approval banner is additive */ }
 }
-
-function renderAge() {
-  const b = currentBuffer();
-  setText($('hAge'), b ? fmtAge(b.lastPollAt) : '-');
-}
-
-/* ------------------------------------------------------------------ *
- * transcript
- * ------------------------------------------------------------------ */
 
 function renderTranscript(force) {
   const pre = $('transcript');
@@ -664,13 +628,12 @@ async function pollPane() {
   const text = (typeof body.text === 'string') ? body.text : '';
   const revision = (body.revision === undefined || body.revision === null) ? null : String(body.revision);
 
-  // §0.1 "skip the merge when revision is unchanged". Measured against the live server:
+  // "skip the merge when revision is unchanged". Measured against the live server:
   // /api/pane reports revision 0 on every read (even while the text changes), so gating on the
   // revision alone would freeze the transcript. Gate on revision AND byte-identical text:
   // an unchanged revision with changed text still merges; identical text never merges.
   if (b.reads > 0 && b.revision === revision && b.lastText === text) {
     b.lastPollAt = Date.now();
-    if (paneId === state.selected) renderAge();
     return;
   }
 
@@ -694,7 +657,6 @@ async function pollPane() {
   if (paneId !== state.selected) return;    // its buffer is updated; the view moved on
   if (firstLoad || cleared || adv.newLines.length) renderTranscript(true);
   else updateJumpButton();
-  renderAge();
 }
 
 function updateJumpButton() {
@@ -864,7 +826,6 @@ function connectEvents() {
   let es;
   try { es = new window.EventSource('/api/events'); }
   catch (e) { setLive(false, 'cannot open stream'); return; }
-  state.es = es;
   es.onopen = function () { setLive(true); };
   es.onerror = function () { setLive(false, 'reconnecting…'); };  // EventSource retries on its own
   es.addEventListener('dash', onDash);
@@ -900,7 +861,7 @@ function needPane() {
   return false;
 }
 
-/* CONTRACT-v2 §8.3: a sent prompt shows up in the chat view immediately as a PENDING bubble, and
+/* a sent prompt shows up in the chat view immediately as a PENDING bubble, and
    the structured log replaces it (with its real timestamp) when the record appears. The chat view
    owns that state; the send path only reports it — and never fails because of a module. */
 function noteChatSend(paneId, text) {
@@ -914,7 +875,7 @@ async function sendPrompt() {
   const ta = $('promptText');
   if (!ta || !needPane()) return;
   const typed = ta.value;
-  /* CONTRACT-v2 §10.4/§10.5: the chat view owns the chips, so it owns the composed text. The send
+  /* the chat view owns the chips, so it owns the composed text. The send
      path never builds a block of its own, and a blocked send sends NOTHING — the reason is the
      module's own sentence, shown in the composer's result line and in its note beside the chips. */
   const cv = attachApi();
@@ -941,12 +902,12 @@ async function sendPrompt() {
   const r = body.result || {};
   flashResult(true, 'ok · ' + (r.type || 'prompted') +
     (r.agent && r.agent.agent_status ? ' · status: ' + r.agent.agent_status : ''));
-  /* §8.3 + §10.4: the bubble carries what was SENT — the typed text and the attachment block — so the
+  /* the bubble carries what was SENT — the typed text and the attachment block — so the
      reader sees the paths the agent was given, in their own message, until the log confirms it. */
   noteChatSend(state.selected, text);
   ta.value = '';
   /* the chips are cleared only after the prompt really went out: an attachment that failed to send
-     must never look sent, and the uploaded files stay on disk (§10.7: no cleanup this round) */
+     must never look sent, and the uploaded files stay on disk (no cleanup this round) */
   if (plan.paths && plan.paths.length && cv && typeof cv.clearAttachments === 'function') {
     try { cv.clearAttachments(); } catch (e) { /* a broken chat view must not break sending */ }
   }
@@ -968,9 +929,7 @@ let queueTimer = null;       // 1.2 s refresh interval while a run or queue row 
 let queueSig = null;         // the last rendered rows (kind/id/text)
 let queueInFlight = false;   // one GET /api/queue at a time
 let queueAgain = false;      // a forced refresh arrived while one was in flight
-let queueDone = new Set();    // rows this composer sent; hidden until a queue read has shown them
-let queueSeen = new Set();    // …and then stops naming them (so a slow bridge cannot make one reappear)
-let queueHasRows = false;     // the last queue read had at least one row
+let queueHasRows = false;    // the last queue read had at least one row
 let queueHPref = (function () {   // the tray's chosen height, restored across reloads
   const v = parseInt(lsGet(LS.queueH, ''), 10);
   return (isFinite(v) && v > 0) ? v : null;
@@ -1136,7 +1095,7 @@ function updateQueueControls() {
 
   if (!trayPane) {
     stopQueueTimer();
-    if (queuePaneId !== null) { queuePaneId = null; queueSig = null; queueDone.clear(); queueSeen.clear(); }
+    if (queuePaneId !== null) { queuePaneId = null; queueSig = null; }
     queueHasRows = false;
     showQueueTray([], []);
     return;
@@ -1145,8 +1104,6 @@ function updateQueueControls() {
   if (queuePaneId !== trayPane.pane_id) {
     queuePaneId = trayPane.pane_id;
     queueSig = null;
-    queueDone.clear();
-    queueSeen.clear();
     queueHasRows = false;
     showQueueTray([], []);          // do not show the previous pane's rows while the new read lands
     refreshQueue(true);            // immediate read on pane change, working or not
@@ -1170,18 +1127,7 @@ function queueItems(list, kind) {
 /* Rebuild the tray only when the visible rows changed; a malformed/missing array simply
    contributes no rows — never an exception. */
 function showQueueTray(steering, followUp, note) {
-  const all = queueItems(steering, 'steer').concat(queueItems(followUp, 'followup'));
-  /* A row this composer just sent is no longer a queued row. Keep it out until the
-     bridge's own list stops naming it; prune the buried id as soon as it does. */
-  const present = {};
-  for (let i = 0; i < all.length; i++) present[all[i].id] = true;
-  if (queueDone.size) {
-    Array.from(queueDone).forEach(function (id) {
-      if (present[id]) queueSeen.add(id);
-      else if (queueSeen.has(id)) { queueDone.delete(id); queueSeen.delete(id); }
-    });
-  }
-  const rows = all.filter(function (row) { return !queueDone.has(row.id); });
+  const rows = queueItems(steering, 'steer').concat(queueItems(followUp, 'followup'));
   const noteText = String(note == null ? '' : note).trim();
   const visible = rows.length > 0;
   queueHasRows = visible;
@@ -1217,28 +1163,6 @@ function showQueueTray(steering, followUp, note) {
      composer even when the agent has a note to explain what the echo means. */
   tray.classList.toggle('hidden', !visible);
   if (visible) applyQueueH();
-}
-
-/* Remove one row from the tray as soon as its send was accepted; the next queue read
-   supplies the truth. This is a display update only — it never changes what was sent. */
-function forgetQueuedRow(id) {
-  const key = String(id == null ? '' : id);
-  if (!key) return;
-  queueDone.add(key);
-  queueSeen.delete(key);
-  const list = $('queueList');
-  if (list) {
-    const rows = list.querySelectorAll('.queue-row');
-    for (let i = 0; i < rows.length; i++) {
-      if (rows[i].dataset.id === key) rows[i].remove();
-    }
-    const tray = $('queueTray');
-    if (tray) tray.classList.toggle('hidden', !list.querySelector('.queue-row'));
-    queueHasRows = !!list.querySelector('.queue-row');
-    const note = $('queueNote');
-    if (note && !list.querySelector('.queue-row')) { note.textContent = ''; note.classList.add('hidden'); }
-  }
-  queueSig = null;
 }
 
 async function refreshQueue(force) {
@@ -1303,7 +1227,6 @@ async function sendQueued(mode) {
   flashResult(true, (kind === 'steer' ? 'steer queued' : 'follow-up queued') +
     (item.id ? ' · ' + item.id : ''));
   ta.value = '';                                     // only after the queue accepted it
-  forgetQueuedRow(item.id);                          // sent means gone from the tray now
   if (plan.paths && plan.paths.length && cv && typeof cv.clearAttachments === 'function') {
     try { cv.clearAttachments(); } catch (e) { /* a broken chat view must not break sending */ }
   }
@@ -1514,10 +1437,10 @@ function handlePromptKeydown(ev) {
 }
 
 /* ------------------------------------------------------------------ *
- * CONTRACT-v2 §10 attachments — the composer's three input paths
+ * attachments — the composer's three input paths
  * ------------------------------------------------------------------ */
 
-/* The chat view is the attachment engine (it owns the chips and the §10.4 block). It is reachable
+/* The chat view is the attachment engine (it owns the chips and the block). It is reachable
    two ways: app.js's own moduleApi map and the handle the module publishes as window.HD.chatview. */
 function attachApi() {
   try {
@@ -1548,7 +1471,7 @@ function attachAccept(files, source) {
     flashResult(false, refused.length + ' file(s) refused — ' + refused[0].why +
       (refused.length > 1 ? ' (and ' + (refused.length - 1) + ' more)' : ''));
   } else if (added) {
-    flashResult(true, added + ' file(s) sent to the app store — they upload now (§10.5: the send is ' +
+    flashResult(true, added + ' file(s) sent to the app store — they upload now (the send is ' +
       'blocked until every chip is ready)' + (refused.length ? ' · ' + refused.length + ' refused' : ''));
   }
   return r;
@@ -1622,7 +1545,7 @@ function wireAttachComposer() {
     if (!files.length) { flashResult(false, 'the drop carried no file'); return; }
     attachAccept(files, 'drop');
   });
-  /* §10.1: a paste of files (a screenshot, a copied file) is the third way in. Text pastes are left
+  /* a paste of files (a screenshot, a copied file) is the third way in. Text pastes are left
      completely alone — this only acts when the clipboard really carries file items. */
   box.addEventListener('paste', function (e) {
     const dt = e.clipboardData;
@@ -1631,7 +1554,7 @@ function wireAttachComposer() {
     if (!files.length) return;
     attachAccept(files, 'paste');
   });
-  /* the send button follows the chips: §10.5 says a send is blocked while any chip is uploading or
+  /* the send button follows the chips: says a send is blocked while any chip is uploading or
      has failed, so the button is disabled with the module's own reason as its tooltip — and the send
      path checks again for real (a disabled button is an affordance, not the rule) */
   on('attach', function (info) {
@@ -1639,7 +1562,7 @@ function wireAttachComposer() {
     if (!btn) return;
     btn.disabled = !!(info && info.blocked);
     btn.title = (info && info.reason) ? info.reason : '';
-    /* §10.5: the moment a chip turns failed, the composer's own line must say so — it used to keep
+    /* the moment a chip turns failed, the composer's own line must say so — it used to keep
        the acceptance sentence it flashed when the file was taken ("they upload now") while the
        server had already refused it (measured live 2026-09-25: a 26 MiB drop answered 413 while the
        line still read "they upload now"). The sentence is the module's own, so it carries the
@@ -1663,179 +1586,8 @@ async function sendKeys(keys) {
   flashResult(true, 'ok · ' + (r.type || ('keys ' + keys.join(' '))));
 }
 
-async function sendLiteral() {
-  const inp = $('literalText');
-  if (!inp || !needPane()) return;
-  const text = inp.value;
-  if (!text.length) { flashResult(false, 'nothing to send (empty text)'); return; }
-  const body = await postJSON('/api/pane/text', { pane_id: state.selected, text: text });
-  if (!body.ok) { flashResult(false, 'text failed — ' + errText(body)); return; }
-  const r = body.result || {};
-  flashResult(true, 'ok · ' + (r.type || 'text sent'));
-  noteChatSend(state.selected, text);          // §8.3: literal text is a send too
-  inp.value = '';
-}
-
-/* ------------------------------------------------------------------ *
- * console panel
- * ------------------------------------------------------------------ */
-
-/* Shell-like splitter, deliberately simple and documented:
- *   - whitespace separates arguments
- *   - '...' and "..." group one argument; both quote styles are stripped
- *   - inside "..." a backslash escapes the next character; outside quotes a
- *     backslash escapes the next character too
- *   - no globbing, no variable expansion, no pipes/redirection (there is no shell:
- *     the argv array goes straight to spawn) */
-function splitArgs(line) {
-  const out = [];
-  let cur = '';
-  let quote = null;
-  let has = false;
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i];
-    if (quote) {
-      if (c === quote) { quote = null; }
-      else if (c === '\\' && quote === '"' && i + 1 < line.length) { cur += line[++i]; }
-      else { cur += c; }
-    } else if (c === ' ' || c === '\t') {
-      if (has) { out.push(cur); cur = ''; has = false; }
-    } else if (c === '\'' || c === '"') {
-      quote = c; has = true;
-    } else if (c === '\\' && i + 1 < line.length) {
-      cur += line[++i]; has = true;
-    } else {
-      cur += c; has = true;
-    }
-  }
-  if (has) out.push(cur);
-  return out;
-}
-
-function outBlock(cmdLine, exitCode, stdout, stderr, extra) {
-  const host = $('consoleOut');
-  if (!host) return;
-  const blk = document.createElement('div');
-  blk.className = 'blk';
-
-  const h = document.createElement('div');
-  h.className = 'blk-cmd';
-  h.textContent = '$ ' + cmdLine;
-  blk.appendChild(h);
-
-  if (extra) {
-    const m = document.createElement('div');
-    m.className = 'blk-meta';
-    m.textContent = extra;
-    blk.appendChild(m);
-  }
-  if (exitCode !== null && exitCode !== undefined) {
-    const e = document.createElement('div');
-    e.className = (exitCode === 0) ? 'blk-exit-ok' : 'blk-exit-bad';
-    e.textContent = 'exit ' + exitCode;
-    blk.appendChild(e);
-  }
-  if (stdout) {
-    const so = document.createElement('div');
-    so.textContent = stdout.replace(/\s+$/, '');
-    blk.appendChild(so);
-  }
-  if (stderr) {
-    const se = document.createElement('div');
-    se.className = 'blk-err';
-    se.textContent = stderr.replace(/\s+$/, '');
-    blk.appendChild(se);
-  }
-  host.appendChild(blk);
-  while (host.children.length > MAX_OUT_BLOCKS) host.removeChild(host.firstChild);
-  host.scrollTop = host.scrollHeight;
-}
-
-function outError(cmdLine, message) {
-  outBlock(cmdLine, null, '', message);
-}
-
-function pushHistory(line) {
-  state.history = state.history.filter(function (x) { return x !== line; });
-  state.history.unshift(line);
-  if (state.history.length > HISTORY_MAX) state.history = state.history.slice(0, HISTORY_MAX);
-  lsSetJSON(LS.history, state.history);
-  renderHistory();
-  state.histIdx = -1;
-}
-
-function renderHistory() {
-  const host = $('cmdHistoryList');
-  if (!host) return;
-  host.textContent = '';
-  state.history.forEach(function (line) {
-    const b = document.createElement('span');
-    b.className = 'hist';
-    b.textContent = line;
-    b.title = 'click to run again';
-    b.addEventListener('click', function () { runCliLine(line); });
-    host.appendChild(b);
-  });
-}
-
-async function runCliLine(line) {
-  const raw = String(line || '').trim();
-  if (!raw) return;
-  let argv = splitArgs(raw);
-  if (!argv.length) return;
-  if (argv[0] === 'herdr') argv = argv.slice(1);
-  if (!argv.length) return;
-
-  const shown = '$ herdr ' + argv.join(' ');
-  pushHistory(raw);
-  outBlock(shown, null, '', '', 'running…');
-  const placeholder = $('consoleOut') ? $('consoleOut').lastChild : null;
-  if (placeholder && placeholder.parentNode) placeholder.parentNode.removeChild(placeholder);
-
-  const body = await postJSON('/api/cli', { argv: argv, timeout_ms: 15000 });
-  if (!body.ok) {
-    outError(shown, 'cli failed — ' + errText(body) +
-      (body.stdout ? '\nstdout:\n' + body.stdout : '') +
-      (body.stderr ? '\nstderr:\n' + body.stderr : ''));
-    return;
-  }
-  outBlock(shown, body.exit_code, body.stdout || '', body.stderr || '',
-    (typeof body.duration_ms === 'number') ? ('took ' + body.duration_ms + ' ms') : '');
-}
-
-async function runRpc() {
-  const inp = $('rpcInput');
-  if (!inp) return;
-  const raw = inp.value.trim();
-  if (!raw) return;
-  let parsed;
-  try { parsed = JSON.parse(raw); }
-  catch (e) { outError('$ rpc (raw)', 'invalid JSON: ' + (e && e.message ? e.message : String(e))); return; }
-  if (!parsed || typeof parsed !== 'object' || typeof parsed.method !== 'string') {
-    outError('$ rpc (raw)', 'JSON must be {"method":"...","params":{...}}');
-    return;
-  }
-  const params = (parsed.params && typeof parsed.params === 'object') ? parsed.params : {};
-  const shown = '$ rpc ' + parsed.method;
-  outBlock(shown, null, '', '', 'sending…');
-  if ($('consoleOut') && $('consoleOut').lastChild) $('consoleOut').removeChild($('consoleOut').lastChild);
-
-  const body = await postJSON('/api/rpc', { method: parsed.method, params: params });
-  if (!body.ok) { outError(shown, 'rpc failed — ' + errText(body)); return; }
-  let pretty;
-  try { pretty = JSON.stringify(body.result, null, 2); }
-  catch (e) { pretty = String(body.result); }
-  outBlock(shown, null, pretty, '');
-}
-
-/* ------------------------------------------------------------------ *
- * panel chrome: sidebar width/collapse, console collapse
- * ------------------------------------------------------------------ */
-
-/* DEFECT-16 — the invariant is not "the restore button exists" (it did) but "a real click at its
-   centre reaches it". This is that test, and applySidebar() refuses to stay collapsed without it. */
 function restoreReachable() {
-  return hitReachable($('sidebarToggleOpen'));   // hitReachable is defined below, in the §12 block
+  return hitReachable($('sidebarToggleOpen'));   // hitReachable is defined below, in the block
 }
 function applySidebar(forceOpen) {
   const sb = $('sidebar');
@@ -1860,27 +1612,12 @@ function toggleSidebar() {
   lsSet(LS.sidebar, collapsed ? '0' : '1');
   applySidebar();
 }
-function applyConsole() {
-  const collapsed = lsGet(LS.console, '0') === '1';
-  const p = $('consolePanel');
-  if (p) p.classList.toggle('collapsed', collapsed);
-}
-function toggleConsole() {
-  const collapsed = lsGet(LS.console, '0') === '1';
-  lsSet(LS.console, collapsed ? '0' : '1');
-  applyConsole();
-}
-
 /* ------------------------------------------------------------------ *
- * CONTRACT-v2 §12.1 — the composer resizes from its TOP edge
+ * the composer resizes from its TOP edge
  * ------------------------------------------------------------------ */
 
-const PROMPT_MIN = 120;            // §12.1.2's floor, in px
-const PROMPT_MAX_FRACTION = 0.6;   // §12.1.2's ceiling: 60% of the main area's height
-/* §12.1 item 6 (frozen): the console has to be REACHABLE, not fully visible. What that buys is the
-   console's own header plus at least one line of output, and its content then scrolls inside it —
-   hence a strip of at most this many px may be reserved below the composer. */
-const CONSOLE_STRIP = 64;
+const PROMPT_MIN = 120;            // 's floor, in px
+const PROMPT_MAX_FRACTION = 0.6;   // 's ceiling: 60% of the main area's height
 let promptHPref = (function () {   // the height the user last chose (null = never chosen: auto)
   const v = parseInt(lsGet(LS.promptH, ''), 10);
   return (isFinite(v) && v > 0) ? v : null;
@@ -1888,7 +1625,7 @@ let promptHPref = (function () {   // the height the user last chose (null = nev
 let promptDragging = false;        // while the top edge is under the pointer, the drag rules — not the
                                    // stored preference (the layout watcher below must not fight it)
 
-/* The panel may never be dragged shorter than its own content. §12.1.3 requires a drag with
+/* The panel may never be dragged shorter than its own content. requires a drag with
    attachment chips present to leave every chip uncovered, and a chip clipped by the panel's own
    overflow is a covered chip. `scrollHeight` cannot answer this: it never reports less than the
    current client height, so while the panel is tall it reports the tall height. The height has to be
@@ -1902,16 +1639,10 @@ function promptContentFloor(box) {
   return h;
 }
 
-/* §12.1.2's ceiling is 60% of the main area, but the composer is not the only thing #main holds: the
-   console sits BELOW the panel and #main is a fixed-height flex column, so a height that leaves the
-   console no room at all pushes it past the viewport's bottom edge (DEFECT-21: at a 622px viewport,
-   --prompt-h 373 put the console at y=645 — off screen, and nothing could scroll to it).
-
-   What fits is measured the same way as before — a sibling that cannot shrink keeps its own height, a
-   sibling that can shrink is counted at its min-height — but the console now counts at its min-height
-   too, because §12.1 item 6 lets it be reduced to a strip and scroll its own content (DEFECT-25: the
-   first version reserved the console's FULL height, which at 1000x620 left the panel a range of
-   163..163 — travel zero — and gutted the feature the user asked for). */
+/* The composer's ceiling is 60% of the main area, but the composer is not the only thing
+   #main holds. `promptFitCap` measures what the panel can take without pushing its siblings
+   past the viewport; non-shrinking siblings keep their height, shrinking ones count at their
+   min-height. */
 function promptFitCap(box) {
   const main = $('main');
   if (!main || !box) return Infinity;
@@ -1934,33 +1665,12 @@ function promptLimits() {
   const main = $('main');
   const mainH = main ? main.getBoundingClientRect().height : 0;
   const cap60 = Math.round(mainH * PROMPT_MAX_FRACTION);
-  /* §12.1 item 6 — the 60% ceiling stands. What fits is preferred; where that would cost the panel
-     more than the console's own strip, the ceiling gives up the strip's 64px and no more (the column
-     scrolls the rest of the way, which is #main's own backstop). `ceil` so the guarantee is the rule
-     as written: the ceiling is never below 0.6 x the main area minus the strip. */
-  const cap = Math.max(PROMPT_MIN, Math.min(cap60, promptFitCap($('promptBox'))),
-    Math.ceil(mainH * PROMPT_MAX_FRACTION) - CONSOLE_STRIP);
+  /* The 60% ceiling stands; the measured fit can only make it smaller. */
+  const cap = Math.max(PROMPT_MIN, Math.min(cap60, promptFitCap($('promptBox'))));
   const floor = Math.max(PROMPT_MIN, promptContentFloor($('promptBox')));
-  /* the content floor wins over the cap: an out-of-range value here would cover a chip, and §12.1.3
-     forbids that outright — so in a window too short for both, the panel keeps its floor and #main
-     (which may scroll, see #main's own rule) is what gives the console back. */
+  /* The content floor wins over the cap: in a window too short for both, the panel keeps its
+     floor and #main scrolls. */
   return { min: floor, max: Math.max(cap, floor) };
-}
-
-const CONSOLE_STRIP_AT = 100;   // below this the console cannot hold its command row AND a line of output
-
-/* §12.1 item 6 again, from the console's side: when the composer has taken the room the console needs,
-   the console IS the strip — its header plus one line of its output, which is what the ruling calls
-   "reachable". Two things follow, and both are the console's own height deciding them, never the
-   composer's: the class below, and `#consoleBody`'s strip rules in style.css, where the body scrolls
-   and the output is ordered to the top so the line on screen is output rather than the command row
-   (the command row is then one scroll away, not gone). Drag the composer back down and the class
-   drops off on the same measurement. */
-function syncConsoleStrip() {
-  const cons = $('consolePanel');
-  if (!cons) return;
-  const h = Math.ceil(cons.getBoundingClientRect().height);
-  cons.classList.toggle('strip', h > 0 && h <= CONSOLE_STRIP_AT);
 }
 
 /* apply a height that is already the user's intent; returns what the panel actually got */
@@ -1971,12 +1681,11 @@ function setPromptH(px, remember) {
   const h = Math.max(lim.min, Math.min(lim.max, Math.round(px)));
   box.style.setProperty('--prompt-h', h + 'px');
   if (remember) { promptHPref = h; lsSet(LS.promptH, h); }
-  syncConsoleStrip();
   applyQueueH();
   return h;
 }
 
-/* §12.1.4 — restored on load and re-clamped whenever the window changes size, so a smaller window
+/* restored on load and re-clamped whenever the window changes size, so a smaller window
    can never leave an out-of-range height applied. The stored preference is NOT rewritten by the
    clamp: shrink the window and grow it again and the user's own height comes back. */
 function applyPromptH() {
@@ -1985,14 +1694,10 @@ function applyPromptH() {
 }
 
 /* ------------------------------------------------------------------ *
- * CONTRACT-v2 §12.2 — the side dock's shell (the content inside it is W3's `dock` module)
+ * hit-testing for the sidebar restore control
  * ------------------------------------------------------------------ */
 
-const DOCK_MIN = 260;              // §12.2.1's clamp
-const DOCK_MAX = 640;
-const DOCK_W_DEFAULT = 320;
-
-/* DEFECT-16's invariant, generalised: "a way back that a REAL click can reach". Not "the button
+/* 's invariant, generalised: "a way back that a REAL click can reach". Not "the button
    exists" — the button existed all along. */
 function hitReachable(el) {
   if (!el) return false;
@@ -2003,197 +1708,8 @@ function hitReachable(el) {
   return !!hit && (hit === el || el.contains(hit));
 }
 
-function applyDockWidth() {
-  const w = parseInt(lsGet(LS.dockW, ''), 10);
-  if (isFinite(w) && w >= DOCK_MIN && w <= DOCK_MAX) {
-    document.documentElement.style.setProperty('--dock-w', w + 'px');
-  }
-}
-
-function applyDock(forceOpen) {
-  const dock = $('dock');
-  const handle = $('dockResize');
-  const t = $('dockToggle');
-  /* the chat-first shell has no dock: no elements, no stored-state self-heal */
-  if (!dock && !handle && !t) return;
-  if (forceOpen) lsSet(LS.dockOpen, '1');
-  /* closed unless the user opened it: the default layout is the one every other check measures */
-  const open = lsGet(LS.dockOpen, '0') === '1';
-  if (dock) dock.classList.toggle('collapsed', !open);
-  if (handle) handle.classList.toggle('hidden', !open);
-  if (t) {
-    t.textContent = open ? '❯' : '❮';   // ❯ / ❮, like the sidebar's pair
-    t.title = open ? 'd — collapse the dock'
-                   : 'd — open the dock (the selected pane\'s usage + background processes)';
-    t.setAttribute('aria-expanded', open ? 'true' : 'false');
-  }
-  applyDockWidth();
-  /* the sidebar's self-heal, mirrored: a stored "closed" with no reachable way back must not
-     survive the page load */
-  if (!open && !hitReachable(t)) {
-    lsSet(LS.dockOpen, '1');
-    applyDock(true);
-    if (ctx.ui && ctx.ui.setHint) ctx.ui.setHint('the dock was stored as closed with no way back — opened it for you');
-  }
-}
-
-function toggleDock() {
-  if (!$('dock') && !$('dockResize') && !$('dockToggle')) return;
-  const open = lsGet(LS.dockOpen, '0') === '1';
-  lsSet(LS.dockOpen, open ? '0' : '1');
-  applyDock();
-}
-
 /* ------------------------------------------------------------------ *
- * CONTRACT-v2 §12.2.2 — the usage chip in the header
- * ------------------------------------------------------------------ */
-
-/* Four times the dock module's §12.2.3 cadence (2s): an answer the module has not replaced in that
-   long is not "current" and must not be shown as if it were. */
-const USAGE_STALE_MS = 6000;
-const USAGE_DASH = '—';       // —
-let usageSeen = null;              // { answer, at } — the last answer the chip accepted, and when
-let usageSummary = null;           // the module's own one-line summary for its newest answer
-
-/* DEFECT-23: the chip's number must be the dock's number and the endpoint's number for the SAME
-   answer. The endpoint answers in exact integers (87357, 144384), the dock prints them grouped
-   (87,357) — the chip used to print them in a 1024-base bucket (85K), so the same live answer read
-   85K in the header and 87,357 in the dock, and a chip that rounds to the nearest K looks frozen
-   next to a dock that counts single tokens. These two formatters are dock.js's own group()/pcts()
-   kept character-for-character identical on purpose: a reading aid must never become a second,
-   disagreeing reading. */
-/* dock.js's num(), guard for guard: `null` means "the agent printed nothing here" and must never
-   become the number 0 — `Number(null)` is 0, so an absent `until_auto_compact_pct` would otherwise
-   reach the chip as a confident "0% until auto-compact". */
-function usageNum(v) {
-  if (v === undefined || v === null || v === '' || typeof v === 'boolean') return null;
-  const n = Number(v);
-  return isFinite(n) ? n : null;
-}
-function group3(n) {
-  const v = usageNum(n);
-  return v === null ? null : String(Math.round(v)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-}
-function pct1(v) {
-  const n = usageNum(v);
-  return n === null ? null : (Math.round(n * 10) / 10) + '%';
-}
-
-/* the chip's own text for an answer, or null when the answer carries no usage to show. The two
-   families are deliberately NOT rendered in the same shape: hermes prints used/limit and a bar
-   percentage, claude prints a context size and its own "until auto-compact" figure, and §12.3.2
-   says those two denominators must never be shown as if they were the same number.
-
-   The shape mirrors the module's own summary (dock.js's summarize(), the one the dock paints from)
-   so that the header and the panel cannot disagree about the same answer. */
-function usageTextOf(ans) {
-  const st = ans && ans.status;
-  const cx = ans && ans.context;
-  if (st && (st.model || st.used_tokens != null)) {
-    const out = [];
-    if (st.model) out.push(String(st.model));
-    const u = group3(st.used_tokens), l = group3(st.limit_tokens);
-    if (u !== null && l !== null) out.push(u + '/' + l);
-    const p = pct1(st.used_pct);
-    if (p !== null) out.push((st.approx ? '~' : '') + p);
-    if (out.length) return out.join(' · ');
-  }
-  if (cx && cx.tokens != null) {
-    const out = [];
-    if (cx.model) out.push(String(cx.model));
-    /* the `~` is the module's own mark on a count computed from claude's jsonl rather than printed
-       by the agent (§12.3.2) — §12.3.1 forbids dropping it */
-    out.push('~' + group3(cx.tokens) + ' tokens');
-    const up = pct1(cx.until_auto_compact_pct);
-    if (up !== null) out.push(up + ' until auto-compact');
-    return out.join(' · ');
-  }
-  return null;
-}
-
-function usageAbsentReasons(ans) {
-  const a = ans && ans.absent;
-  if (!a || typeof a !== 'object') return '';
-  const parts = [];
-  for (const k in a) if (Object.prototype.hasOwnProperty.call(a, k)) parts.push(k + ': ' + a[k]);
-  return parts.join('; ');
-}
-
-/* called on a timer, on every header render, and on every answer the module emits (DEFECT-23).
-   Never innerHTML: the module's strings (model names, and the agent's own verbatim source lines)
-   are data.
-
-   The module's `latest()` is the last /api/status ANSWER (§12.2.3): `{ok, pane_id, at, body}` — the
-   §12.3 body under `.body`, the arrival stamp under `.at` — or `{ok:false, pane_id, at, error}` when
-   the read itself failed. A plain §12.3 body is accepted too, so the chip cannot be broken by a
-   module that hands back the response unwrapped. */
-function renderUsage() {
-  const el = $('hUsage');
-  if (!el) return null;
-  const put = function (text, title, cls) {
-    if (el.textContent !== text) el.textContent = text;
-    if (el.title !== title) el.title = title;
-    if (el.className !== cls) el.className = cls;
-    return text;
-  };
-  const api = (ctx.modules && ctx.modules.api) ? ctx.modules.api('dock') : null;
-  if (!api || typeof api.latest !== 'function') {
-    usageSeen = null;
-    usageSummary = null;
-    return put(USAGE_DASH, 'usage: the dock module (id "dock") is not mounted — nothing is reading /api/status', 'mono dim');
-  }
-  let ans = null;
-  try { ans = api.latest(); } catch (e) { ans = null; }
-  if (!ans || typeof ans !== 'object') {
-    usageSeen = null;
-    usageSummary = null;
-    return put(USAGE_DASH, 'usage: the dock module has no /api/status answer yet' +
-      (state.selected ? ' for ' + state.selected : ''), 'mono dim');
-  }
-  /* the age of this ANSWER, not of the chip: an answer object that has not been replaced since the
-     last tick is the same answer, however often it is read. The module stamps its answers, so the
-     stamp is used when it is there; the fallback only covers a shape that does not carry one. */
-  const at = (typeof ans.at === 'number' && isFinite(ans.at)) ? ans.at
-    : ((usageSeen && usageSeen.answer === ans) ? usageSeen.at : Date.now());
-  const age = Date.now() - at;
-  usageSeen = { answer: ans, at: at };
-  const ageS = Math.round(age / 1000);
-  const sel = state.selected || '';
-  if (ans.ok === false) {
-    const err = ans.error || {};
-    return put(USAGE_DASH, 'usage: the read for ' + (ans.pane_id || sel || 'the selected pane') + ' failed' +
-      (err.message ? ' — ' + err.message : '') + (ageS ? ' (' + ageS + 's ago)' : '') +
-      '; nothing is shown as current', 'mono dim');
-  }
-  if (ans.pane_id && ans.pane_id !== sel) {
-    return put(USAGE_DASH, 'usage: the last answer is for ' + ans.pane_id + ', the selected pane is ' +
-      (sel || 'none') + ' — not shown as current', 'mono dim');
-  }
-  if (age > USAGE_STALE_MS) {
-    return put(USAGE_DASH, 'usage: the last answer for ' + (ans.pane_id || sel) + ' is ' + ageS +
-      's old and has not been replaced within ' + (USAGE_STALE_MS / 1000) + 's — not shown as current', 'mono dim');
-  }
-  const body = (ans.body && typeof ans.body === 'object') ? ans.body : ans;
-  /* DEFECT-23: the module hands a one-line summary over with every answer (the `dock` event) and
-     paints the dock from that same summary. When the summary on hand belongs to THIS answer, its
-     text is what the chip shows — chip ≡ dock then holds by construction rather than by two
-     formatters happening to agree. The fallback below renders the same numbers the same way for a
-     module that has not emitted (or a summary that predates this answer). */
-  const sum = usageSummary;
-  const text = (sum && sum.text && sum.at === at && (!sum.pane_id || sum.pane_id === ans.pane_id))
-    ? String(sum.text)
-    : usageTextOf(body);
-  if (!text) {
-    const why = usageAbsentReasons(body);
-    return put(USAGE_DASH, 'usage: ' + (why || 'the answer carries neither a status line nor a context block'), 'mono dim');
-  }
-  const src = (body.status && body.status.source_line) || (body.context && body.context.source_line) || '';
-  return put(text, 'usage: ' + (body.pane_id || ans.pane_id) + (src ? ' — ' + src : '') +
-    '  (answer ' + ageS + 's old, ' + (body.family || 'unknown') + ')', 'mono');
-}
-
-/* ------------------------------------------------------------------ *
- * window.HD — the frozen module API (CONTRACT-v2 §3)
+ * window.HD — the frozen module API
  * ------------------------------------------------------------------ */
 
 const HD = (window.HD = window.HD || {});
@@ -2213,19 +1729,19 @@ const ctx = {
          rpc(method, params?)           -> POST /api/rpc
          fanout(paneIds, text, opts?)   -> POST /api/fanout
          broadcast(paneIds, keys)       -> POST /api/keys-broadcast
-         git(opts?)                     -> GET /api/git          (CONTRACT-v2 §7.1, read-only)
+         git(opts?) -> GET /api/git (, read-only)
            opts = {pane_id?, mode?, file?, max_lines?}
              pane_id    defaults to ctx.state.selectedPaneId; the SERVER takes the working
                         directory from herdr's own pane record, never from the client
              mode       'status' (default) | 'diff' — anything else is rejected by the server
              file       repo-relative path, diff mode only
              max_lines  diff mode only, default 400, hard cap 2000
-           Resolves to the §7.1 body: {ok:true, pane_id, cwd, is_repo, repo:{toplevel,branch,head},
+           Resolves to the body: {ok:true, pane_id, cwd, is_repo, repo:{toplevel,branch,head},
            files:[{path,status,staged,unstaged,untracked,added,deleted}], totals:{…}, truncated}
            — or, for a cwd that is not a repo / git missing, {ok:true, is_repo:false, error:{code,
            message}}, which is a described state and not a transport failure.
            With no pane selected nothing is fetched: {ok:false, error:{code:'no_pane', …}}.
-         chat(opts?)                   -> GET /api/chat        (CONTRACT-v2 §8.2, read-only)
+         chat(opts?) -> GET /api/chat (, read-only)
            opts = {pane_id?, since?, limit?}
              pane_id  defaults to ctx.state.selectedPaneId; the SERVER resolves the pane to its
                       agent session (claude jsonl / hermes sqlite) — the client never sends paths
@@ -2234,7 +1750,7 @@ const ctx = {
            Resolves to {ok:true, pane_id, agent, source:{kind, session_id, path}, cursor,
            messages:[{key, ts, role, kind, text, tool:{name, call_key, input, input_truncated,
            result, result_truncated, is_error, pending}, sidechain}], truncated, skipped,
-           unknown_records} — or {ok:false, error:{code, …}} for every §8.1 failure
+           unknown_records} — or {ok:false, error:{code, …}} for every failure
            (unsupported_agent, session_file_missing, session_db_missing, session_cwd_mismatch,
            pane_not_found, bad_request) and for a missing route, exactly like the other helpers.
            An empty session is a SUCCESS with messages: [] (code no_messages_yet). */
@@ -2253,7 +1769,7 @@ const ctx = {
       return postJSON('/api/pane/prompt', payload);
     },
     keys: function (paneId, keys) { return postJSON('/api/pane/keys', { pane_id: paneId, keys: keys }); },
-    /* CONTRACT-v2 §10.1: the one request whose body is not JSON — the body IS the file's bytes, its
+    /* the one request whose body is not JSON — the body IS the file's bytes, its
        name travels in x-hd-name (already made header-safe by the caller: verbatim when ASCII,
        percent-encoded UTF-8 otherwise) and the destination pane in x-hd-pane. The client can never
        choose a path: the server answers with the absolute path it wrote, which is what gets sent to
@@ -2293,14 +1809,14 @@ const ctx = {
       }
       const q = ['pane_id=' + encodeURIComponent(paneId)];
       /* `since` is the previous cursor; it is omitted (not sent as empty) when the caller wants the
-         whole session, which is how §8.3's "load older" re-request is expressed */
+         whole session, which is how 's "load older" re-request is expressed */
       if (o.since !== undefined && o.since !== null && o.since !== '') q.push('since=' + encodeURIComponent(o.since));
       if (o.limit !== undefined && o.limit !== null) q.push('limit=' + encodeURIComponent(o.limit));
-      /* round 7.1: `tail=1` asks for the LAST `limit` records with the cursor at EOF, so a first
-         load is one request instead of a walk from the beginning (§8.2 tail mode, W1). */
+      /* `tail=1` asks for the LAST `limit` records with the cursor at EOF, so a first
+         load is one request instead of a walk from the beginning (tail mode, ). */
       if (o.tail) q.push('tail=1');
       /* an AbortSignal is passed straight through: chatview aborts a request the server never
-         answered so that one stalled response cannot freeze the view (DEFECT-12) */
+         answered so that one stalled response cannot freeze the view () */
       return api('/api/chat?' + q.join('&'), o.signal ? { signal: o.signal } : undefined);
     },
     fanout: function (paneIds, text, opts) {
@@ -2323,10 +1839,10 @@ const ctx = {
       return b ? b.lines : null;           // live reference
     },
     sse: { connected: false },             // live reference; kept in step by setLive()
-    seenPanes: function () { return seenPaneIds(); }   // W2 extra: every pane buffered this session
+    seenPanes: function () { return seenPaneIds(); }   // every pane buffered this session
   },
   events: { on: on, emit: emit },
-  modules: {                             // W2 extra: call into a mounted module (palette/keys use it)
+  modules: {                             // call into a mounted module (palette/keys use it)
     ids: function () { return Object.keys(state.moduleApi); },
     api: function (id) { return state.moduleApi[id] || null; },
     toggle: function (id) {
@@ -2340,7 +1856,7 @@ const ctx = {
     toast: toast,
     setHint: setHint,
     container: overlayContainer,
-    highlightLine: highlightLine,          // W2 extra: used by the cross-pane search
+    highlightLine: highlightLine,          // used by the cross-pane search
     clearHighlight: clearHighlight
   },
   util: {
@@ -2349,13 +1865,12 @@ const ctx = {
     fmtAge: fmtAge,
     escapeHtml: escapeHtml,
     now: function () { return Date.now(); },
-    advanceBuffer: advanceBuffer,          // W2 extra: public/lib/grid.js prefers this copy
+    advanceBuffer: advanceBuffer,
     fmtClock: fmtClock,
     toast: toast
   }
 };
 HD.ctx = ctx;
-ctx.state.sse = { get connected() { return state.sseLive; } };
 
 /* modules call this; registrations from before app.js ran are already in HD.modules */
 function register(mod) {
@@ -2385,8 +1900,7 @@ function mountModule(id, mod) {
     const r = mod.mount(ctx);
     if (r && typeof r === 'object') state.moduleApi[id] = r;
     if (r && typeof r.unmount === 'function') state.unmounts[id] = r.unmount;
-    /* DEFECT-3(c): the module handle is also reachable as window.HD.<id> — W3's modules (and the
-       console) call window.HD.board.toggle() / .open() / .close(). A null return stays null-ish
+    /* The module handle is also reachable as window.HD.<id>. A null return stays null-ish
        rather than clobbering a handle the module itself published under that name. */
     if (r !== undefined && (!(id in HD) || HD[id] == null || r)) HD[id] = r;
     /* a module that registers after boot (a late script, or a test) still shows up in the header
@@ -2404,9 +1918,7 @@ function mountModule(id, mod) {
   }
 }
 
-/* the header module tag: the ids that actually mounted, in the §3 order. gitview (§7.2) is in
-   MODULE_ORDER, so it appears here the moment public/lib/gitview.js lands — and its absence
-   before that is simply not claimed. */
+/* the header module tag: the ids that actually mounted. */
 function updateModuleTag() {
   const ids = MODULE_ORDER.slice();
   for (const id in HD.modules) {
@@ -2417,7 +1929,7 @@ function updateModuleTag() {
   return present;
 }
 
-/* mount every module present, in the §3 order; missing files are simply skipped */
+/* mount every module present, in the module order; missing files are simply skipped */
 function mountModules() {
   const ids = MODULE_ORDER.slice();
   for (const id in HD.modules) {
@@ -2425,7 +1937,6 @@ function mountModules() {
   }
   state.booted = true;              // set before the loop so a module that mounts late is still tagged
   for (let i = 0; i < ids.length; i++) {
-    if (SHELL_SKIP_MODULES[ids[i]]) continue;
     const mod = HD.modules[ids[i]];
     if (mod && typeof mod.mount === 'function') mountModule(ids[i], mod);
   }
@@ -2433,8 +1944,7 @@ function mountModules() {
 }
 
 /* ------------------------------------------------------------------ *
- * self-test (?selftest=1) — CONTRACT-v2 §0.1
- * Runs the five v1 §7 expectations, the four advanceBuffer rules and the
+ * self-test (?selftest=1) — runs the five v1 expectations, the four advanceBuffer rules and the
  * scrolling regression in the browser and prints PASS/FAIL into #transcript.
  * ------------------------------------------------------------------ */
 
@@ -2449,8 +1959,7 @@ function runSelfTest() {
   function eq(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
 
   line('herdr-dash self-test — ?selftest=1');
-  line('checks: five CONTRACT.md §7 merge expectations, the CONTRACT-v2 §0.1 advanceBuffer');
-  line('        rules (the shipped /lib/advance-buffer.js copy), and the scrolling regression');
+  line('checks: transcript merge, the shipped advanceBuffer rules, and the scrolling regression');
   line('        (5,000-line stream, 400- and 1,200-line windows)');
   line('');
 
@@ -2463,8 +1972,8 @@ function runSelfTest() {
     ctx.util.advanceBuffer === window.HD.advanceBuffer,
     'ctx.util.advanceBuffer === ' + (ctx.util.advanceBuffer === window.HD.advanceBuffer));
 
-  /* ---- five v1 §7 expectations ---- */
-  line('-- CONTRACT.md §7 mergeStream: five expectations --');
+  /* ---- five v1 expectations ---- */
+  line('-- mergeStream: five expectations --');
   const merge = [
     ['(i)   [A,B,C]+[A,B,C,D] -> newLines [D], overlapped true', ['A', 'B', 'C'], ['A', 'B', 'C', 'D'], ['D'], true],
     ['(ii)  [A,B,C]+[B,C,D]   -> newLines [D], overlapped true', ['A', 'B', 'C'], ['B', 'C', 'D'], ['D'], true],
@@ -2482,7 +1991,7 @@ function runSelfTest() {
 
   /* ---- the advanceBuffer rules ---- */
   line('');
-  line('-- CONTRACT-v2 §0.1 advanceBuffer: rules 4 / 1 / 1r / 1s / 2 / 3 --');
+  line('-- advanceBuffer: rules 4 / 1 / 1r / 1s / 2 / 3 --');
   const K = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'];
   const fillers = [];
   for (let i = 0; i < 5000; i++) fillers.push('filler-' + i + ' ' + (i * 7919 % 9973));
@@ -2509,7 +2018,7 @@ function runSelfTest() {
 
   /* ---- the scrolling regression ---- */
   line('');
-  line('-- CONTRACT-v2 §0.1 scrolling regression: 5,000-line stream --');
+  line('-- scrolling regression: 5,000-line stream --');
   const SRC_N = 5000;
   const LVL = ['info', 'warn', 'debug'];
   const SRC = [];
@@ -2567,7 +2076,7 @@ function runSelfTest() {
       'src=' + src.length + '/' + expected.length + ' distinct=' + distinct + ' repeats=' + (src.length - distinct));
     const v1 = accumulate(v1Rule, w.windows).filter(isSrc);
     if (tui) {
-      check('walk ' + label + ': the v1 rule reproduces DEFECT-1 on the same windows (' +
+      check('walk ' + label + ': the v1 rule inflates the same windows (' +
             v1.length + ' lines for ' + expected.length + ')', v1.length > expected.length * 2,
         'v1 produced ' + v1.length + ' lines');
     }
@@ -2577,14 +2086,14 @@ function runSelfTest() {
   // plain walks: the whole 5,000-line stream, both window sizes
   const rPlain = regression('400-line window, plain appending pane (whole stream)', 400, 1, false);
   const rPlain1200 = regression('1,200-line window, plain appending pane (whole stream)', 1200, 1, false);
-  // TUI walks: pinned chrome + in-place repaints (the DEFECT-1 shape), 700 polls each
+  // TUI walks: pinned chrome + in-place repaints (the shape), 700 polls each
   const r400 = regression('400-line window, scrolling TUI pane', 400, 1, true, 700);
   const r1200 = regression('1,200-line window, scrolling TUI pane', 1200, 1, true, 700);
   const rStep = regression('400-line window, TUI pane scrolling 7 rows/poll', 400, 7, true, 700);
 
-  /* idle TUI pane: the window must not inflate (measured DEFECT-1 shape) */
+  /* idle TUI pane: the window must not inflate (measured shape) */
   line('');
-  line('-- DEFECT-1 shape measured on the live server: an idle TUI repaints one row per poll --');
+  line('-- idle TUI repaint: measured on the live server --');
   const idle = walk(400, 0, true, 120);
   const idleBuf = accumulate(advanceBuffer, idle.windows);
   const v1Idle = accumulate(v1Rule, idle.windows);
@@ -2599,12 +2108,12 @@ function runSelfTest() {
        'TUI 400-window ' + r400.ours + '/' + r400.expected + ' (v1 rule ' + r400.v1 + '), ' +
        'TUI 1200-window ' + r1200.ours + '/' + r1200.expected + ' (v1 rule ' + r1200.v1 + '), ' +
        'TUI step7 ' + rStep.ours + '/' + rStep.expected + ' (v1 rule ' + rStep.v1 + ')');
-  /* ---- CONTRACT-v2 §8.3: the chat view (pending sends, honest states, the `t` toggle) ----
+  /* ---- the chat view (pending sends, honest states, the `t` toggle) ----
      The cases drive the SHIPPED module through window.HD.chatviewTest, which feeds the very same
      functions the network path calls (ingest / notePending / the pending clock). Polling is turned
      off for the run (setAuto(false)) so nothing here depends on the server having /api/chat yet. */
   line('');
-  line('-- CONTRACT-v2 §8.3 chat view: pending sends, honest states, the t toggle --');
+  line('-- chat view: pending sends, honest states, the t toggle --');
   const CHAT_LS = 'herdrDash.transcriptView';
   const promo = state.selected;
   try {
@@ -2708,7 +2217,7 @@ function runSelfTest() {
         chat.ingest('selftest:p1', { ok: false, error: { code: codes[i], message: 'server said ' + codes[i] } });
         seen.push(chat.dom().state.textContent);
       }
-      check('(e) all ' + codes.length + ' §8.1 errors render a non-empty explanation',
+      check('(e) all ' + codes.length + ' errors render a non-empty explanation',
         seen.every(function (s) { return s && s.length > 20; }),
         JSON.stringify(seen.map(function (s) { return s.slice(0, 24); })));
       check('(e) the explanations are distinct (no catch-all text)',
@@ -2724,7 +2233,7 @@ function runSelfTest() {
         JSON.stringify(chat.dom().state.textContent));
       check('(e) the view is not an overlay (keys.js never sees it as one: Esc containment unaffected)',
         !document.querySelector('#chatHost').matches(
-          '#hdPalette, #hdHelp, #hdSearch, #hdFanout, .hd-board, .hd-inbox, .hd-grid, [data-hd-overlay]'),
+          '#hdPalette, #hdHelp, #hdSearch, #hdFanout, [data-hd-overlay]'),
         'classes=' + document.querySelector('#chatHost').className);
 
       /* (f) A1 — a turn renders as ONE group: the prompt at its head, the agent's records as
@@ -2797,7 +2306,7 @@ function runSelfTest() {
         'tail=' + (workingEl() ? workingEl().textContent : 'gone') + ' replytags=' +
         document.querySelectorAll('#hdChatScroll .hd-cv-replytag').length);
 
-      /* (h) DEFECT-10 — an empty text/thinking record is never a blank row, and never silent */
+      /* (h) an empty text/thinking record is never a blank row, and never silent */
       chat.setPane('selftest:p4');
       chat.setStatus('selftest:p4', 'idle');
       chat.ingest('selftest:p4', { ok: true, pane_id: 'selftest:p4', agent: 'claude', cursor: 70,
@@ -2817,7 +2326,7 @@ function runSelfTest() {
         dom.status.textContent.indexOf('2 empty records (no text) hidden') >= 0,
         JSON.stringify(dom.status.textContent));
 
-      /* (i) DEFECT-12 — the in-flight latch carries a clock and an owner. This is the decision that
+      /* (i) the in-flight latch carries a clock and an owner. This is the decision that
          froze the panel: with a boolean latch the answer was ALWAYS 'wait', for every pane, forever. */
       const latch = chat.latch, TMO = chat.reqTimeoutMs();
       const nowT = Date.now();
@@ -2861,7 +2370,7 @@ function runSelfTest() {
         chat.inflight() === null && chat.abandon('test') === false,
         'inflight=' + JSON.stringify(chat.inflight()) + ' abandonWithNothingInFlight=' + chat.abandon('test'));
 
-      /* (j) §8.2 tail mode — the FIRST load is one tail request (§8.3/DEFECT-9) */
+      /* (j) tail mode — the FIRST load is one tail request (/) */
       chat.setPane('selftest:p5');
       chat.setStatus('selftest:p5', 'idle');
       const long = [];
@@ -2902,7 +2411,7 @@ function runSelfTest() {
       check('(j) nothing came back → the cursor really was at EOF, and no page is fetched again',
         chat.state().tailMode === true, 'tailMode=' + chat.state().tailMode);
 
-      /* (k) DEFECT-13 — the palette offers the chat view and the raw terminal.
+      /* (k) the palette offers the chat view and the raw terminal.
          ?selftest=1 skips init(), so no module is mounted yet: mount the palette here (twice-mount
          is a no-op) and drive it the way Ctrl+K does. */
       let palApi = (state.moduleApi && state.moduleApi.palette) || null;
@@ -2931,7 +2440,7 @@ function runSelfTest() {
           false, 'moduleApi.palette=' + typeof palApi);
       }
 
-      /* (l) §8.3 amendment A2 — the reader's own prompt bubble and the agent's reply bubble both
+      /* (l) amendment A2 — the reader's own prompt bubble and the agent's reply bubble both
          fold, on a reader's click only, and the fold is in-memory UI state of ONE pane. The fold
          marker is read wherever the drawing renderer puts it: A2.4 puts `hd-cv-folded` on the
          bubble's own row, this module's fallback puts it on the message node — both are "the row". */
@@ -2998,7 +2507,7 @@ function runSelfTest() {
         foldDom('f1').indexOf('SELFTEST-FOLD-FIRST-SENTINEL') >= 0 && chat.foldKeys('selftest:p8').length === 0,
         'marks=' + foldMarks('f1') + ' map=' + JSON.stringify(chat.foldKeys('selftest:p8')));
 
-      /* (m) §8.3 amendment A3 — the reader's OPEN BLOCKS (a thinking head, a tool card's expand, a
+      /* (m) amendment A3 — the reader's OPEN BLOCKS (a thinking head, a tool card's expand, a
          long-text "show all") live in a per-pane map that every render path consults, so a turn that
          is re-rendered while the reader watches it cannot collapse what they just opened. The defect
          this pins down: expand the newest turn's block, a record arrives, A1 redraws that turn — and
@@ -3268,7 +2777,7 @@ function runSelfTest() {
     }
   } catch (e) {
     fail++;
-    line('FAIL  §8.3 chat self-test threw  -> ' + (e && e.message ? e.message : e));
+    line('FAIL  chat self-test threw  -> ' + (e && e.message ? e.message : e));
   }
   state.selected = promo;
 
@@ -3287,19 +2796,16 @@ function runSelfTest() {
  * init
  * ------------------------------------------------------------------ */
 
-/* DEFECT-21 (cont.) — the ceiling is measured from the panel's siblings, and those are not all final
-   when `init` runs: the modules mount during boot and the time strip grows as status events arrive.
-   A height restored against a stale layout can leave the console below the fold with no window resize
-   to correct it, so the clamp is re-applied whenever a sibling changes size (or #main gains one). It
-   can only ever bring the panel back into what the layout now holds: the preference itself is not
-   rewritten, exactly like the window-resize clamp. */
+/* The ceiling is measured from the panel's siblings, which are not all final when `init` runs:
+   modules mount during boot and status events can grow the layout. Re-apply the clamp whenever
+   a sibling changes size; the stored preference itself is not rewritten. */
 function watchMainLayout(box) {
   const main = $('main');
   if (!main) return;
   /* Not while the top edge is under the pointer: a drag sets the height per move from the pointer's
      own position, and a sibling growing mid-drag would otherwise yank the panel back to the stored
      preference for a frame. The drag re-measures its own limits on every move anyway. */
-  const apply = function () { if (!promptDragging) applyPromptH(); syncConsoleStrip(); };
+  const apply = function () { if (!promptDragging) applyPromptH(); };
   if (typeof ResizeObserver === 'function') {
     const ro = new ResizeObserver(apply);
     const attach = function () {
@@ -3314,7 +2820,7 @@ function watchMainLayout(box) {
 /* ------------------------------------------------------------------ *
  * Terminal-first view integration
  *
- * Three views share #transcriptWrap: the live terminal (#terminalHost, W2's engine),
+ * Three views share #transcriptWrap: the live terminal (#terminalHost, 's engine),
  * the structured chat (#chatHost, chatview.js) and the raw transcript (#transcript).
  * The terminal is the default; `t` cycles terminal -> chat -> raw -> terminal. Chat's
  * own chat -> raw `t` stays chatview's, so the cycle is shared rather than duplicated.
@@ -3619,21 +3125,15 @@ function wireViewSwitching() {
 
 function init() {
   applySidebar();
-  applyConsole();
-  applyDock();          // §12.2.1 — the dock is closed unless hd.dockOpen says otherwise
-  applyPromptH();       // §12.1.4 — the composer's stored height, re-clamped for this window
+  applyPromptH();       // the composer's stored height, re-clamped for this window
   watchMainLayout($('promptBox'));
-  /* the console's strip state is the console's own height, so it also has to follow a bare window
-     resize — one where no stored composer height exists to re-apply and move it on its own */
-  window.addEventListener('resize', syncConsoleStrip);
-  syncConsoleStrip();
 
   const S = $('sidebarToggle');
   if (S) S.addEventListener('click', toggleSidebar);
   const SO = $('sidebarToggleOpen');
   if (SO) SO.addEventListener('click', toggleSidebar);
 
-  /* DEFECT-16: a keyboard way back, so a hidden panel can never trap the page again. `\` (like the
+  /* a keyboard way back, so a hidden panel can never trap the page again. `\` (like the
      chat view's `t`) is a view key: it never reaches an agent. */
   window.addEventListener('keydown', function (e) {
     try {
@@ -3654,45 +3154,11 @@ function init() {
       }
     } catch (err) { /* a shortcut must never break the page */ }
   }, true);
-  const DT = $('dockToggle');
-  if (DT) DT.addEventListener('click', toggleDock);
-
-  /* §12.2.1 — `d` toggles the dock. Registered like every other view key: guarded on modifiers, on
-     the typing targets (so a `d` typed into the composer is a `d`, not a layout change) and on an
-     open overlay; it never reaches a pane and never claims a key something else already has (the
-     `?` overlay is fed by the keys.register below). */
-  window.addEventListener('keydown', function (e) {
-    try {
-      if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
-      if (e.key !== 'd') return;
-      const t = e.target || {};
-      const tag = t.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || t.isContentEditable) return;
-      const k = ctx.modules && ctx.modules.api ? ctx.modules.api('keys') : null;
-      if (k && typeof k.overlayOpen === 'function' && k.overlayOpen()) return;
-      e.preventDefault();
-      if (e.stopPropagation) e.stopPropagation();
-      toggleDock();
-      const dEl = $('dock');
-      const open = !!(dEl && !dEl.classList.contains('collapsed'));
-      if (ctx.ui && ctx.ui.setHint) {
-        ctx.ui.setHint(open ? 'dock shown — press d to collapse it' : 'dock collapsed — press d to bring it back');
-      }
-    } catch (err) { /* a shortcut must never break the page */ }
-  }, true);
-
-  /* §12.1.4 — both panels' stored sizes are re-clamped when the window changes: a smaller window
+  /* both panels' stored sizes are re-clamped when the window changes: a smaller window
      must not be left holding an out-of-range value, and growing it again restores the user's own */
   window.addEventListener('resize', function () {
     applyPromptH();
     applyQueueH();
-    applyDockWidth();
-  });
-
-  const CT = $('consoleToggle');
-  if (CT) CT.addEventListener('click', function (ev) {
-    if (ev.target && ev.target.id === 'consoleMode') return;   // don't fold when using the select
-    toggleConsole();
   });
 
   // sidebar resize
@@ -3718,16 +3184,16 @@ function init() {
     });
   }
 
-  // CONTRACT-v2 §12.1 — the composer's TOP edge (the same shape as the sidebar drag above; the
+  // the composer's TOP edge (the same shape as the sidebar drag above; the
   // panel's bottom edge is what stands still, so the drag reads the panel, not the window)
   const pHandle = $('promptResize');
   if (pHandle) {
     let dragging = false;
     let base = 0;                       // the panel's bottom edge, measured once per drag: re-reading
                                         // it per move would feed the drag its own result once the
-                                        // transcript reaches its floor and the console is pushed down
+                                        // transcript reaches its floor and the panel is pushed down
     let pressY = 0;                     // where the press landed…
-    let moved = false;                  // …and whether the pointer ever actually moved (DEFECT-22)
+    let moved = false;                  // …and whether the pointer ever actually moved
     pHandle.addEventListener('mousedown', function (e) {
       const box = $('promptBox');
       if (!box) return;
@@ -3750,14 +3216,14 @@ function init() {
       dragging = false;
       promptDragging = false;
       document.body.style.cursor = '';
-      /* DEFECT-22: the handle's centre sits a few px inside the panel's top edge, so a plain CLICK
+      /* the handle's centre sits a few px inside the panel's top edge, so a plain CLICK
          (press + release with no pointer movement) used to snap the edge onto the pointer and shorten
          the panel by exactly that offset. A gesture that never moved is not a drag: leave both the
          applied height and the stored preference untouched. */
       if (!moved && e.clientY === pressY) return;
       setPromptH(base - e.clientY, true);
     });
-    /* §12.1.5 — the same four keys on the focused handle. Every other key is left alone, so the
+    /* the same four keys on the focused handle. Every other key is left alone, so the
        handle never swallows anything meant for the composer, and nothing here touches a pane. */
     pHandle.addEventListener('keydown', function (e) {
       const box = $('promptBox');
@@ -3773,29 +3239,6 @@ function init() {
       e.preventDefault();
       if (e.stopPropagation) e.stopPropagation();
       setPromptH(next, true);
-    });
-  }
-
-  // CONTRACT-v2 §12.2.1 — the dock's left edge; the mirror of #sidebarResize, read from the right
-  const dHandle = $('dockResize');
-  if (dHandle) {
-    let dragging = false;
-    dHandle.addEventListener('mousedown', function (e) {
-      dragging = true;
-      e.preventDefault();
-      document.body.style.cursor = 'col-resize';
-    });
-    window.addEventListener('mousemove', function (e) {
-      if (!dragging) return;
-      const w = Math.max(DOCK_MIN, Math.min(DOCK_MAX, window.innerWidth - e.clientX));
-      document.documentElement.style.setProperty('--dock-w', w + 'px');
-    });
-    window.addEventListener('mouseup', function (e) {
-      if (!dragging) return;
-      dragging = false;
-      document.body.style.cursor = '';
-      const w = Math.max(DOCK_MIN, Math.min(DOCK_MAX, window.innerWidth - e.clientX));
-      lsSet(LS.dockW, w);
     });
   }
 
@@ -3831,7 +3274,7 @@ function init() {
   wireApprovals();                               // the Claude approval banner above the queue tray
   const resultClose = $('promptResultClose');
   if (resultClose) resultClose.addEventListener('click', clearResult);
-  wireAttachComposer();                          // CONTRACT-v2 §10: picker, drop and paste
+  wireAttachComposer();                          // picker, drop and paste
   const kr = $('keysRow');
   if (kr) kr.addEventListener('click', function (e) {
     const t = e.target;
@@ -3849,9 +3292,6 @@ function init() {
     if (!res || !res.ok) toast('stop failed — ' + errText(res), 'error');
     else toast('stop requested — the pi run should end without killing the pane', 'info');
   });
-  const lsb = $('literalSend');
-  if (lsb) lsb.addEventListener('click', sendLiteral);
-
   /* the model droplist: shows the selected pane's current model and switches it when the reader
      picks another. claude opens /model and parses it; hermes switches by name through its
      message channel. The list is fetched lazily when a switchable pane is selected and refetched
@@ -3901,7 +3341,7 @@ function init() {
       if (note) modelSel.title = 'model — ' + note;   // pi: the extension says why nothing is listed
       return;
     }
-    const cur = currentModelText();
+    const cur = null;
     models.forEach(function (m) {
       const o = document.createElement('option');
       o.value = optionValue(m, agent);
@@ -3915,21 +3355,11 @@ function init() {
     });
     modelSel.disabled = false;
   }
-  /* the model the pane is currently running, read from the dock module's last /api/status answer
-     (the same source the usage chip paints from) — available for every agent, not just claude */
-  function currentModelText() {
-    const dockApi = (ctx.modules && ctx.modules.api) ? ctx.modules.api('dock') : null;
-    if (!dockApi || typeof dockApi.latest !== 'function') return null;
-    let ans = null;
-    try { ans = dockApi.latest(); } catch (e) { ans = null; }
-    const st = ans && ans.status, cx = ans && ans.context;
-    return (st && st.model) || (cx && cx.model) || null;
-  }
   function updateModelSel() {
     if (!modelSel) return;
     const pane = state.selected ? findPane(state.selected) : null;
     const agent = pane && pane.agent;
-    const cur = currentModelText();
+    const cur = null;
     if (!pane) { setModelSelPlaceholder('model…'); modelSel.disabled = true; modelCache = { paneId: null, agent: null, models: null }; return; }
     /* claude and hermes both switch from the dash; pi switches through its extension's
        /herdr-model command, so its list comes from GET /api/model and the control stays disabled
@@ -4220,52 +3650,6 @@ function init() {
     if (sessionOpen() && sessionCache.paneId && sessionCache.paneId !== state.selected) closeSessionPanel();
   };
 
-  const lt = $('literalText');
-  if (lt) lt.addEventListener('keydown', function (e) { if (e.key === 'Enter') sendLiteral(); });
-
-  // console
-  const mode = $('consoleMode');
-  if (mode) mode.addEventListener('change', function () {
-    const rpc = mode.value === 'rpc';
-    const cli = $('cliRow'), rr = $('rpcRow');
-    if (cli) cli.classList.toggle('hidden', rpc);
-    if (rr) rr.classList.toggle('hidden', !rpc);
-    const focus = rpc ? $('rpcInput') : $('cmdInput');
-    if (focus) focus.focus();
-  });
-  const ci = $('cmdInput');
-  if (ci) ci.addEventListener('keydown', function (e) {
-    if (e.key === 'Enter') { e.preventDefault(); runCliLine(ci.value); return; }
-    if (e.key === 'ArrowUp') {
-      if (!state.history.length) return;
-      e.preventDefault();
-      state.histIdx = Math.min(state.history.length - 1, state.histIdx + 1);
-      ci.value = state.history[state.histIdx];
-      return;
-    }
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      state.histIdx = state.histIdx - 1;
-      if (state.histIdx < 0) { state.histIdx = -1; ci.value = ''; return; }
-      ci.value = state.history[state.histIdx];
-    }
-  });
-  const cr = $('cmdRun');
-  if (cr) cr.addEventListener('click', function () { const i = $('cmdInput'); runCliLine(i ? i.value : ''); });
-  const cp = $('cmdPreset');
-  if (cp) cp.addEventListener('change', function () {
-    if (!cp.value) return;
-    const i = $('cmdInput');
-    if (i) i.value = cp.value;
-    runCliLine(cp.value);
-    cp.value = '';
-  });
-  const rs = $('rpcSend');
-  if (rs) rs.addEventListener('click', runRpc);
-  const ri = $('rpcInput');
-  if (ri) ri.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); runRpc(); } });
-
-  renderHistory();
   setLive(false, 'connecting…');
   connectEvents();
   renderTree();
@@ -4275,20 +3659,6 @@ function init() {
   pollPane();
   window.setInterval(refreshSnapshot, SNAPSHOT_MS);
   window.setInterval(pollPane, POLL_MS);
-  window.setInterval(renderAge, 250);
-  /* §12.2.2 — the usage chip is re-read twice a second: fast enough that a fresh answer replaces a
-     stale one promptly, slow enough that it never competes with the module's own 2s poll */
-  window.setInterval(renderUsage, 500);
-
-  /* DEFECT-23 — the chip re-renders on EVERY answer the module emits, not at the next tick of the
-     timer above: a pane switch, an open, or a read that lands just after a tick must not leave the
-     old number sitting in the header while the dock already shows the new one. The timer stays, so
-     a module that answers without emitting cannot freeze the chip either. */
-  ctx.events.on('dock', function (s) {
-    usageSummary = (s && typeof s === 'object') ? s : null;
-    renderUsage();
-  });
-
   mountModules();     // after the ctx exists and the shell is wired
 
   /* The terminal-first view. The engine is created after the
@@ -4297,7 +3667,7 @@ function init() {
   wireViewSwitching();
   setupTerminal();
 
-  /* DEFECT-16: emitted AFTER mountModules() on purpose. Palette only starts collecting
+  /* emitted AFTER mountModules() on purpose. Palette only starts collecting
      `keys.register` when IT mounts, so a registration emitted from init() (earlier) is silently
      dropped — the first version of this fix landed exactly that way: the `\` key worked, the help
      line did not. Registrations from app.js belong here, next to the modules they describe. */
@@ -4305,13 +3675,6 @@ function init() {
     ctx.events.emit('keys.register', {
       id: 'sidebar',
       keys: [{ key: '\\', help: 'toggle the sidebar (collapse / restore) — works even when nothing else is visible' }]
-    });
-    /* §12.2.1 — `d`, under its own id: the palette keys `id -> list` (a second registration for an
-       id REPLACES the first), and W3's dock module registers under `dock`, so the shell's own key
-       must not take that id. The `d` key is free — asserted in the local test suite. */
-    ctx.events.emit('keys.register', {
-      id: 'dock-shell',
-      keys: [{ key: 'd', help: 'toggle the side dock (the selected pane\'s usage + background processes)' }]
     });
   } catch (e) { /* the help overlay is optional */ }
 }

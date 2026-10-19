@@ -2,12 +2,12 @@
  * herdr-stream (pi extension): append pi's real token stream to the Herdr-Dash NDJSON
  * sink, so the dashboard can render assistant text/reasoning as it is generated.
  *
- * Contract: `_scratch/stream-round/CONTRACT.md` §2 (sink), §3 (envelope), §4 (pi
+ * `/` (sink), (envelope), (pi
  * mapping). This extension is an OBSERVER ONLY: it registers handlers, writes lines
  * and returns nothing. It never aborts, never changes a model, a session or a tool
  * result, and it never throws into the agent loop.
  *
- * Gating (§4): nothing at all is written unless `HERDR_ENV=1` and `HERDR_PANE_ID` is
+ * Gating: nothing at all is written unless `HERDR_ENV=1` and `HERDR_PANE_ID` is
  * set — the pane id is also the directory the dashboard tails.
  *
  * The whole mapping/writer path lives in `mapping.js` + `sink.js` as plain CommonJS,
@@ -19,6 +19,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import herdrStream from "./sink.js";
+import type { PiBridge } from "./sink.js";
 
 type Handler = (event: any, ctx: any) => unknown;
 
@@ -36,7 +37,7 @@ export default function herdrStreamExtension(pi: ExtensionAPI) {
 				try {
 					await fn(event, ctx);
 				} catch (err) {
-					// swallow: §4 "never throw into pi"
+ // swallow: "never throw into pi"
 				}
 			});
 		} catch (err) {
@@ -44,37 +45,37 @@ export default function herdrStreamExtension(pi: ExtensionAPI) {
 		}
 	};
 
-	// §4 turn boundary. pi emits turn_start per LLM request (so a tool-using run emits
+	// turn boundary. pi emits turn_start per LLM request (so a tool-using run emits
 	// several); sink.js keeps ONE turn file per run and only opens a new one when the
 	// previous run has settled.
 	on("session_start", (event, ctx) => bridge.sessionStart(event, ctx));
 	on("turn_start", (event, ctx) => bridge.turnStart(event, ctx));
 
-	// §4 messages. Only `assistant`/`user` map to envelopes; toolResult/custom are skipped.
+	// messages. Only `assistant`/`user` map to envelopes; toolResult/custom are skipped.
 	on("message_start", (event, ctx) => bridge.messageStart(event, ctx));
 	on("message_update", (event, ctx) => bridge.messageUpdate(event, ctx));
 	on("message_end", (event, ctx) => bridge.messageEnd(event, ctx));
 
-	// §4 execution side of a tool call (`tool_call_*` comes from message_update).
+	// execution side of a tool call (`tool_call_*` comes from message_update).
 	on("tool_execution_start", (event) => bridge.toolStart(event));
 	on("tool_execution_update", (event) => bridge.toolUpdate(event));
 	on("tool_execution_end", (event) => bridge.toolEnd(event));
 
-	// §4 end of run -> turn_end (+ close). Returns a promise so pi waits for the flush.
+	// end of run -> turn_end (+ close). Returns a promise so pi waits for the flush.
 	on("agent_settled", (event, ctx) => bridge.settled(event, ctx));
 
-	// §4 settings: into the open turn file, else `<session>__control.ndjson`.
+	// settings: into the open turn file, else `<session>__control.ndjson`.
 	on("model_select", (event, ctx) => bridge.modelSelect(event, ctx));
 	on("thinking_level_select", (event, ctx) => bridge.thinkingLevelSelect(event, ctx));
 
-	// §4 teardown: an open turn is force-closed (aborted) and flushed.
+	// teardown: an open turn is force-closed (aborted) and flushed.
 	on("session_shutdown", (event, ctx) => bridge.shutdown(event, ctx));
 
 	registerControlCommands(pi);
 	registerQueueCommands(pi, bridge);
 }
 
-/* ── wave 2: the pi control plane ─────────────────────────────────────────────
+/* ── the pi control plane ─────────────────────────────────────────────
  *
  * Herdr-Dash cannot drive sessions, models or a run's stop by typing at the TUI: `/resume`
  * opens a selector that disturbs the composer, `/model` is the picker, and a cancel key can
@@ -204,7 +205,7 @@ export function registerControlCommands(pi: ExtensionAPI): void {
 		});
 }
 
-/* ── queue control plane (QUEUE-CONTRACT §B/§C) ──────────────────────────────
+/* ── queue control plane (/) ──────────────────────────────
  *
  * The dashboard's composer cannot type into pi's TUI while a run streams, so steer and
  * follow-up go through pi's own delivery API:
@@ -213,23 +214,23 @@ export function registerControlCommands(pi: ExtensionAPI): void {
  *   /herdr-followup {"id":"q-...","text":"..."}  pi.sendUserMessage(text,{deliverAs:"followUp"})
  *
  * A human may type plain text after the command name instead of the JSON object; the
- * whole argument is then the text and the id is empty (§B).
+ * whole argument is then the text and the id is empty.
  *
  * Rules: a no-op outside a Herdr pane, NEVER a new run (an idle pane refuses), never
  * ctx.abort(), never throw into pi, and exactly one short notify line. The item enters
- * the sink's bridge-visible tray only after sendUserMessage returned without throwing
- * (§C.1) — the extension never invents a queue entry.
+ * the sink's bridge-visible tray only after sendUserMessage returned without throwing;
+ * the extension never invents a queue entry.
  */
 
 type QueueContext = ControlContext & { isIdle?(): boolean };
 
-/** §B: the command's kind -> pi's delivery mode. */
+/** the command's kind -> pi's delivery mode. */
 const QUEUE_DELIVER: Record<string, "steer" | "followUp"> = {
 	steer: "steer",
 	followup: "followUp",
 };
 
-export function registerQueueCommands(pi: ExtensionAPI, bridge: unknown): void {
+export function registerQueueCommands(pi: ExtensionAPI, bridge: PiBridge): void {
 	const api = pi as any;
 	/* Both halves are required, and either one missing must still load the extension:
 	   without registerCommand there is no command name, and without sendUserMessage there
@@ -240,11 +241,11 @@ export function registerQueueCommands(pi: ExtensionAPI, bridge: unknown): void {
 
 	const run = async (name: string, kind: string, argument: string, ctx: QueueContext): Promise<Say> => {
 		if (!inHerdrPane()) return say(name + ": not a Herdr pane — nothing was queued");
-		// §B: JSON {id,text} when it parses, otherwise the whole argument is the text.
-		const parsed = (herdrStream as any).parseQueueArgument(argument);
+		// JSON {id,text} when it parses, otherwise the whole argument is the text.
+		const parsed = herdrStream.parseQueueArgument(argument);
 		const text = parsed && typeof parsed.text === "string" ? parsed.text : "";
 		if (!text.trim()) return say(name + ": usage /" + name + " <text>", "warning");
-		/* §B: sendUserMessage while idle STARTS A RUN, which is not a queue operation.
+ /* sendUserMessage while idle STARTS A RUN, which is not a queue operation.
 		   An isIdle() that throws (or is absent) is treated as idle and refuses. */
 		let idle = true;
 		try {
@@ -258,9 +259,9 @@ export function registerQueueCommands(pi: ExtensionAPI, bridge: unknown): void {
 		} catch (err) {
 			return say(name + ": pi refused the message — " + (err instanceof Error ? err.message : String(err)), "error");
 		}
-		// §C.1: only now is the item real, and the tray is best-effort.
+ // only now is the item real, and the tray is best-effort.
 		try {
-			const queue = bridge as any;
+			const queue = bridge;
 			if (queue && typeof queue.queueAdd === "function") {
 				queue.queueAdd({ id: parsed && typeof parsed.id === "string" ? parsed.id : "", kind, text });
 			}

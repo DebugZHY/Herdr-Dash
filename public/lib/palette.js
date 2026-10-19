@@ -1,4 +1,4 @@
-/* herdr-dash — lib/palette.js (W2, CONTRACT-v2 §4.2)
+/* herdr-dash — lib/palette.js (, )
  *
  * Ctrl+K / Cmd+K command palette: fuzzy filter over every pane and over a command list.
  * `?` opens the help overlay, which lists every shortcut modules registered through
@@ -97,38 +97,13 @@
       return out;
     }
 
-    function moduleToggle(label, id) {
-      return {
-        kind: 'command',
-        key: label,
-        label: label,
-        sub: 'toggle the ' + id + ' module',
-        hay: label + ' ' + id,
-        run: function () {
-          if (!ctx.modules || !ctx.modules.toggle(id)) {
-            ctx.ui.toast('module "' + id + '" is not present', 'error');
-          }
-        }
-      };
-    }
-
     function commandItems() {
       var cmds = [
         { kind: 'command', key: 'focus pane', label: 'focus pane', sub: 'pick a pane from the tree', hay: 'focus pane select goto switch',
           run: function () { state.mode = 'panes'; input.value = ''; render(); } },
         { kind: 'command', key: 'send prompt…', label: 'send prompt…', sub: 'focus the prompt box of the selected pane', hay: 'send prompt text message write',
           run: function () { close(); var ta = document.getElementById('promptText'); if (ta) { ta.focus(); } } },
-        { kind: 'command', key: 'run herdr command…', label: 'run herdr command…', sub: 'focus the console cli line', hay: 'run herdr command cli console exec',
-          run: function () { close(); openConsole(); var ci = document.getElementById('cmdInput'); if (ci) ci.focus(); } },
-        { kind: 'command', key: 'open console', label: 'open console', sub: 'show the cli / rpc panel', hay: 'open console cli rpc panel',
-          run: function () { close(); openConsole(); } },
-        moduleToggle('toggle grid', 'grid'),
-        moduleToggle('toggle board', 'board'),
-        moduleToggle('toggle inbox', 'inbox'),
-        moduleToggle('toggle gitview', 'gitview'),   // round 5: read-only changes view (§7.2)
-        /* round 7.1 (DEFECT-13): the chat view / raw terminal have no module to toggle — they are
-           the two faces of the same panel, so each row asks the chatview module for its face */
-        { kind: 'command', key: 'chat view', label: 'chat view', sub: 'prompts + replies as a chat (§8.3)', hay: 'chat view conversation bubbles transcript',
+        { kind: 'command', key: 'chat view', label: 'chat view', sub: 'prompts + replies as a chat', hay: 'chat view conversation bubbles transcript',
           run: function () { close(); var api = ctx.modules && ctx.modules.api('chatview'); if (api && api.show) api.show(); else ctx.ui.toast('chatview module is not present', 'error'); } },
         { kind: 'command', key: 'raw terminal', label: 'raw terminal', sub: 'the raw transcript the pane writes (permission prompts live here)', hay: 'raw terminal transcript pre text t',
           run: function () { close(); var api = ctx.modules && ctx.modules.api('chatview'); if (api && api.hide) api.hide(); else ctx.ui.toast('chatview module is not present', 'error'); } },
@@ -143,15 +118,6 @@
           } }
       ];
       return cmds;
-    }
-
-    function openConsole() {
-      var p = document.getElementById('consolePanel');
-      if (!p) return;
-      if (p.classList.contains('collapsed')) {
-        try { window.localStorage.setItem('herdrDash.consoleCollapsed', '0'); } catch (e) { /* ignore */ }
-        p.classList.remove('collapsed');
-      }
     }
 
     function statusOf(p) {
@@ -336,7 +302,7 @@
     };
   }
 
-  /* §3 registration handshake (lib/*.js loads before app.js) */
+  /* registration handshake (lib/*.js loads before app.js) */
   var mod = { id: ID, title: TITLE, mount: mount };
   var HD = (window.HD = window.HD || {});
   HD.modules = HD.modules || {};
