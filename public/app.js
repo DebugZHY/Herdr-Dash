@@ -40,6 +40,7 @@ const LS = {
   /* §12: the round-8 keys are named literally in the contract (`hd.*`), unlike the v1 `herdrDash.*`
      ones above, so they are written exactly as specified rather than in the older house style. */
   promptH: 'hd.promptH',                    // §12.1.4 — the composer's height
+  queueH: 'hd.queueH',                      // the queued-messages panel's share of the composer
   dockW: 'hd.dockW',                        // §12.2.1 — the dock's width
   dockOpen: 'hd.dockOpen'                   // §12.2.1 — '1' open, anything else closed
 };
@@ -965,6 +966,121 @@ let queueInFlight = false;   // one GET /api/queue at a time
 let queueAgain = false;      // a forced refresh arrived while one was in flight
 let queueDone = new Set();    // rows this composer sent; hidden until a queue read has shown them
 let queueSeen = new Set();    // …and then stops naming them (so a slow bridge cannot make one reappear)
+let queueHPref = (function () {   // the tray's chosen height, restored across reloads
+  const v = parseInt(lsGet(LS.queueH, ''), 10);
+  return (isFinite(v) && v > 0) ? v : null;
+})();
+
+const QUEUE_MIN = 30;         // one row plus the tray's padding
+
+/* The tray and #promptTextRow share the composer's height. The tray may grow only
+   while leaving the textarea its own floor and the tools row its space. */
+function queueLimits() {
+  const box = $('promptBox');
+  if (!box) return { min: QUEUE_MIN, max: 88 };
+  const tools = $('composerTools');
+  const row = $('promptTextRow');
+  const handle = $('queueResize');
+  const cs = getComputedStyle(box);
+  const pad = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+  const toolsH = tools ? tools.getBoundingClientRect().height : 0;
+  const rowMin = row ? (parseFloat(getComputedStyle(row).minHeight) || 44) : 44;
+  let handleH = 0;
+  if (handle) {
+    const hs = getComputedStyle(handle);
+    handleH = handle.getBoundingClientRect().height +
+      (parseFloat(hs.marginTop) || 0) + (parseFloat(hs.marginBottom) || 0);
+  }
+  let extraH = 0;
+  for (const id of ['hdAttachList', 'hdAttachNote', 'approvalBanner', 'promptResultRow']) {
+    const el = $(id);
+    if (el && !el.classList.contains('hidden')) extraH += el.getBoundingClientRect().height;
+  }
+  const max = Math.max(QUEUE_MIN,
+    Math.floor(box.clientHeight - pad - rowMin - toolsH - handleH - extraH - 8));
+  return { min: QUEUE_MIN, max: max };
+}
+
+function setQueueH(px, remember) {
+  const tray = $('queueTray');
+  if (!tray || tray.classList.contains('hidden')) return 0;
+  const lim = queueLimits();
+  const h = Math.max(lim.min, Math.min(lim.max, Math.round(px)));
+  tray.style.height = h + 'px';
+  tray.style.maxHeight = h + 'px';
+  const handle = $('queueResize');
+  if (handle) handle.setAttribute('aria-valuenow', String(h));
+  if (remember) { queueHPref = h; lsSet(LS.queueH, h); }
+  return h;
+}
+
+function applyQueueH() {
+  if (queueHPref === null) return;
+  const tray = $('queueTray');
+  if (!tray || tray.classList.contains('hidden')) return;
+  setQueueH(queueHPref, false);
+}
+
+/* An auto-height composer grows with its tray, so without a fixed box the split
+   would just make the whole card taller instead of giving the textarea's room
+   to the tray. The first queue drag fixes the card at the height it has now. */
+function lockPromptForQueueDrag() {
+  const box = $('promptBox');
+  if (!box || promptHPref !== null) return;
+  const h = Math.ceil(box.getBoundingClientRect().height);
+  setPromptH(h, true);
+}
+
+/* The split handle between the queued tray and the message row. Moving it down
+   gives the tray more room; the textarea keeps its own floor. */
+function wireQueueResize() {
+  const handle = $('queueResize');
+  if (!handle) return;
+  let dragging = false;
+  let startY = 0;
+  let startH = 0;
+  let moved = false;
+  handle.addEventListener('mousedown', function (e) {
+    const tray = $('queueTray');
+    if (!tray || tray.classList.contains('hidden')) return;
+    lockPromptForQueueDrag();
+    dragging = true;
+    moved = false;
+    startY = e.clientY;
+    startH = tray.getBoundingClientRect().height;
+    e.preventDefault();
+    document.body.style.cursor = 'row-resize';
+  });
+  window.addEventListener('mousemove', function (e) {
+    if (!dragging) return;
+    if (e.clientY !== startY) moved = true;
+    if (!moved) return;
+    setQueueH(startH + (e.clientY - startY), false);
+  });
+  window.addEventListener('mouseup', function (e) {
+    if (!dragging) return;
+    dragging = false;
+    document.body.style.cursor = '';
+    if (!moved && e.clientY === startY) return;
+    setQueueH(startH + (e.clientY - startY), true);
+  });
+  handle.addEventListener('keydown', function (e) {
+    const tray = $('queueTray');
+    if (!tray || tray.classList.contains('hidden')) return;
+    lockPromptForQueueDrag();
+    const lim = queueLimits();
+    const cur = tray.getBoundingClientRect().height;
+    let next;
+    if (e.key === 'ArrowUp') next = cur - 16;
+    else if (e.key === 'ArrowDown') next = cur + 16;
+    else if (e.key === 'Home') next = lim.min;
+    else if (e.key === 'End') next = lim.max;
+    else return;
+    e.preventDefault();
+    if (e.stopPropagation) e.stopPropagation();
+    setQueueH(next, true);
+  });
+}
 
 function workingQueuePane() {
   const pane = state.selected ? findPane(state.selected) : null;
@@ -1081,7 +1197,9 @@ function showQueueTray(steering, followUp, note) {
   }
   /* The tray is a queue, not a status badge: with no actual queued row it stays out of the
      composer even when the agent has a note to explain what the echo means. */
-  tray.classList.toggle('hidden', rows.length === 0);
+  const visible = rows.length > 0;
+  tray.classList.toggle('hidden', !visible);
+  if (visible) applyQueueH();
 }
 
 /* Remove one row from the tray as soon as its send was accepted; the next queue read
@@ -1832,6 +1950,7 @@ function setPromptH(px, remember) {
   box.style.setProperty('--prompt-h', h + 'px');
   if (remember) { promptHPref = h; lsSet(LS.promptH, h); }
   syncConsoleStrip();
+  applyQueueH();
   return h;
 }
 
@@ -3544,6 +3663,7 @@ function init() {
      must not be left holding an out-of-range value, and growing it again restores the user's own */
   window.addEventListener('resize', function () {
     applyPromptH();
+    applyQueueH();
     applyDockWidth();
   });
 
@@ -3685,6 +3805,7 @@ function init() {
   const pFollow = $('promptFollowup');
   if (pFollow) pFollow.addEventListener('click', function () { sendQueued('followup'); });
   updateQueueControls();
+  wireQueueResize();                             // the split between the queued tray and the message box
   wireApprovals();                               // the Claude approval banner above the queue tray
   const resultClose = $('promptResultClose');
   if (resultClose) resultClose.addEventListener('click', clearResult);

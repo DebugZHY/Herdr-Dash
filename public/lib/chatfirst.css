@@ -253,6 +253,43 @@
 #promptResize:focus-visible::before { background: var(--accent); opacity: .9; }
 #promptResize:focus-visible { outline: 1px solid var(--accent); outline-offset: 0; }
 
+/* the queued-messages tray and the message row share the composer's height: the
+   handle between them moves that split, while the textarea keeps its own floor */
+.queue-tray {
+  flex: 0 0 auto;
+  min-height: 30px;
+  margin: 0;
+}
+#queueResize {
+  flex: 0 0 auto;
+  position: relative;
+  width: 100%;
+  height: 10px;
+  margin: 1px 0 3px;
+  background: transparent;
+  cursor: row-resize;
+  touch-action: none;
+}
+#queueResize:hover,
+#queueResize:focus { background: transparent; opacity: 1; outline: none; }
+#queueResize::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 34px;
+  height: 3px;
+  transform: translate(-50%, -50%);
+  border-radius: 2px;
+  background: var(--fg-dim);
+  opacity: .38;
+  transition: opacity .12s ease, background .12s ease;
+}
+#queueResize:hover::before,
+#queueResize:focus-visible::before { background: var(--accent); opacity: .9; }
+#queueResize:focus-visible { outline: 1px solid var(--accent); outline-offset: 0; }
+#queueTray.hidden + #queueResize { display: none; }
+
 #promptBox {
   flex: 0 0 auto;
   width: min(860px, calc(100% - 28px));
@@ -273,7 +310,7 @@
   align-items: stretch;
   gap: 10px;
   margin: 0;
-  min-height: 0;
+  min-height: 44px;
 }
 #promptText {
   flex: 1 1 auto;
