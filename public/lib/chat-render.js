@@ -1119,6 +1119,19 @@
   }
 
   /**
+   * A note a turn shows only because it has nothing else yet. It is marked `data-hd-placeholder`
+   * because the panel appends records into a LIVE turn (W3 §9: a running turn is no longer rebuilt on
+   * every poll): the moment a record lands, the sentence is no longer true and the appender removes
+   * exactly the nodes carrying that mark — never a note that is part of the record. The wording is the
+   * same string it always was; only the attribute is new.
+   */
+  function placeholder(text) {
+    var n = el('div', 'hd-cv-note', text);
+    n.setAttribute('data-hd-placeholder', '1');
+    return n;
+  }
+
+  /**
    * A1: one turn as ONE visual group — the user's prompt is the head bubble, the agent's records
    * follow in log order as distinguishable segments, and the last assistant text is the closing
    * reply bubble (marked, so the answer is findable without reading the process). While `working`
@@ -1171,9 +1184,9 @@
       else if (!drawn) {
         // only worth saying when there WAS a prompt: a turn with neither prompt nor records has
         // already said so in the head, and two notes about one silence is noise
-        if (user) body.appendChild(el('div', 'hd-cv-note', '(this turn has no records to show yet)'));
+        if (user) body.appendChild(placeholder('(this turn has no records to show yet)'));
       }
-      else if (lastText < 0) body.appendChild(el('div', 'hd-cv-note',
+      else if (lastText < 0) body.appendChild(placeholder(
         '(no reply in this turn — the log ends with the records above)'));
 
       group.appendChild(body);

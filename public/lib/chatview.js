@@ -4,9 +4,11 @@
  * instead of raw terminal text. Both views stay available — `t` toggles chat ↔ raw — because the
  * structured logs do NOT contain the TUI's permission prompts and transient screen state.
  *
- * Data: GET /api/chat (CONTRACT-v2 §8.2) through ctx.api.chat(). We poll every 2 s ONLY while the
+ * Data: GET /api/chat (CONTRACT-v2 §8.2) through ctx.api.chat(). We poll every 1 s ONLY while the
  * view is visible and a pane is selected; hidden → no timer at all (the §3 rule every module
- * follows). Per pane we keep the message list, the server cursor and the pending sends, and the
+ * follows), and handle.setActive(false) stops every timer of this module (§9: W4 calls it while the
+ * terminal view owns the screen, and calls it with `true` on the way back, which polls at once).
+ * Per pane we keep the message list, the server cursor and the pending sends, and the
  * cursor goes back out as `since` — so a second call with nothing new returns messages: [] and
  * changes nothing (the endpoint is idempotent per §8.2).
  *
@@ -19,6 +21,18 @@
  * ("working · 12s") instead of a reply, so a running turn can never read as finished. The source is
  * block level: there is NO per-token typing here, ever (A1 rule 5 — token-level live output is the
  * raw view's job, one `t` away).
+ *
+ * PERFORMANCE (§9, measured 2026-10-19): a working pane with 200 messages / ~4,100 chat nodes
+ * produced a 53-90 ms long task every poll. The cost was never the network: renderNew() redrew the
+ * whole open turn and then decoratePaths() walked EVERY text node under #hdChatList through the
+ * path extractor, every time. Three rules replace that, and each one is visible in __perf():
+ *   · a poll that only extends the running turn APPENDS the new records into that turn's own node
+ *     (appendToTurn) instead of rebuilding it; only a record that changes a node already on screen
+ *     (a paired result, a repeated call, the turn ending) redraws the turn it belongs to;
+ *   · decoration is handed ONLY the nodes the last render created or replaced
+ *     (HD.pathlink.decorateNodes), so the pass is proportional to what changed;
+ *   · that pass runs in requestIdleCallback (setTimeout(0) where it is missing) and a newer render
+ *     REPLACES it, so decoration can never walk a node a later render already detached.
  *
  * First load (§8.2 tail mode, W1): the first request for a pane asks for `tail=1&limit=200` — the
  * LAST page with the cursor at EOF — so a 2337-record session opens in one request instead of
@@ -86,7 +100,7 @@
   var ID = 'chatview';
   var TITLE = 'Chat view';
 
-  var POLL_MS = 2000;              // §8.3/A1: poll while visible (A1 asks for 1-2 s)
+  var POLL_MS = 1000;              // §9: poll while visible (was 2000; A1 asks for 1-2 s)
   var PENDING_TICK_MS = 1000;      // only while a send is unresolved, so the 20 s note is punctual
   var WORKING_TICK_MS = 1000;      // A1: the running turn's "working · Ns" label ticks every second
   var PAGE_LIMIT = 200;            // per-poll page size
@@ -1602,6 +1616,7 @@
         }
         listEl.insertBefore(node, before);
         syncReader(st, node);        // A2/A3: a folded or opened record comes back as it was left
+        noteDeco(node);              // §9: this is one of the nodes the decoration pass is for
         st.rendered.push({ from: g.from, to: g.to, node: node });
         if (st.openBig !== null && i > 0 && g.user) closedBig = true;
       }
@@ -1628,34 +1643,280 @@
       var max = st.expanded ? EXPAND_MAX : RENDER_MAX;
       return Math.max(0, st.messages.length - max);
     }
-    /** §13.2.1: after every render, hand the freshly drawn messages to the link module — a render
-     *  makes NEW text nodes, and a link drawn in the previous ones went away with them. The pass is a
-     *  promise that resolves on its own, so nothing here waits for it; the module asks the server
-     *  about each candidate once and never twice (§13.2.2), which is what makes this cheap enough to
-     *  call on every render. Absent or broken, the text stays exactly as the agent wrote it. */
-    function decoratePaths() {
-      var pl = window.HD && window.HD.pathlink;
-      if (!pl || typeof pl.decorate !== 'function') return;
+    /* ── §9: decoration is a scheduled, bounded pass ──────────────────────────────────────────────
+       The measured long task was decoration: every poll walked all ~4,100 chat nodes through the
+       path extractor. Two rules replace that.
+
+       (1) Only the nodes THIS render created or replaced are handed to the link module
+           (HD.pathlink.decorateNodes). A node that keeps its identity keeps its links — the module
+           remembers every answer (`truth`) and never asks twice — so nothing is lost by not walking
+           it again, and a poll that appends one record decorates one node.
+       (2) The pass runs in an idle callback (setTimeout(0) where requestIdleCallback is missing),
+           and a render that arrives first REPLACES the queued pass: a pass over nodes a newer render
+           has already detached could not draw anything a reader would ever see.
+
+       `decoQueue` holds the roots of the pending pass. runDecorate re-checks that each one is still
+       inside the list before walking it, because a node queued a moment ago may have been dropped by
+       trimFront/dropFrom in the meantime, and an appended node may not have been inserted yet when it
+       was queued (rerenderOne queues the replacement before the caller puts it in place). */
+    var decoQueue = [], decoHandle = null, decoKind = '', DECO_IDLE_MS = 200;
+
+    function noteDeco(n) { if (n && n.nodeType === 1) decoQueue.push(n); return n; }
+    function cancelDeco() {
+      if (decoHandle === null) return false;
       try {
-        var p = pl.decorate(listEl);
-        if (p && typeof p.then === 'function') p.then(function () { }, function () { });
-      } catch (e) { /* a reader's view never fails because a link could not be drawn */ }
+        if (decoKind === 'idle' && window.cancelIdleCallback) window.cancelIdleCallback(decoHandle);
+        else window.clearTimeout(decoHandle);
+      } catch (e) { /* the pass is gone either way */ }
+      decoHandle = null;
+      decoKind = '';
+      return true;
     }
+    function runDecorate() {
+      decoHandle = null; decoKind = '';
+      var queued = decoQueue;
+      decoQueue = [];
+      var pl = window.HD && window.HD.pathlink;
+      if (!pl || typeof pl.decorateNodes !== 'function') return;
+      var live = [], i;
+      for (i = 0; i < queued.length; i++) {
+        var n = queued[i];
+        if (n && n.nodeType === 1 && listEl.contains(n) && live.indexOf(n) < 0) live.push(n);
+      }
+      if (!live.length) return;
+      var t0 = nowMs();
+      function fin(sum) {
+        perf.decoratePasses++;
+        perf.decoratedNodes = live.length;
+        perf.decoratedTotal += live.length;
+        if (sum && typeof sum.textNodes === 'number') perf.lastDecorateTextNodes = sum.textNodes;
+        perf.lastDecorateMs = ms1(nowMs() - t0);
+      }
+      try {
+        var p = pl.decorateNodes(live);
+        if (p && typeof p.then === 'function') p.then(fin, function () { fin(null); });
+        else fin(p);
+      } catch (e) {
+        fin(null);           // a reader's view never fails because a link could not be drawn
+      }
+    }
+    function scheduleDecorate() {
+      /* replace, never stack: the queued nodes survive (they are re-checked at run time), so the
+         new pass covers the old ones that are still on screen plus the ones this render added */
+      cancelDeco();
+      if (unmounted || !decoQueue.length) return false;
+      if (typeof window.requestIdleCallback === 'function') {
+        decoKind = 'idle';
+        decoHandle = window.requestIdleCallback(runDecorate, { timeout: DECO_IDLE_MS });
+      } else {
+        decoKind = 'timeout';
+        decoHandle = window.setTimeout(runDecorate, 0);
+      }
+      return true;
+    }
+
+    /* ── the append-only poll (§9) ───────────────────────────────────────────────────────────────
+       A running turn grows by one or two records per poll, and rebuilding its whole group for that
+       is what made the pass expensive once decoration stopped being the cost. The group's own node
+       can take new records as they are, so the ordinary poll now creates exactly the nodes it is
+       adding — but only while nothing already on screen has to change. */
+
+    /** the direct child of `parent` that carries `cls` (a group's body, its working tail, its reply) */
+    function directChildOfClass(parent, cls) {
+      if (!parent || !parent.childNodes) return null;
+      for (var i = 0; i < parent.childNodes.length; i++) {
+        var c = parent.childNodes[i];
+        if (c.nodeType === 1 && c.classList && c.classList.contains(cls)) return c;
+      }
+      return null;
+    }
+    /** the element a turn group's segments live in: ChatRender gives the group a body, the built-in
+     *  fallback appends its segments straight into the group. null = a shape we cannot append into. */
+    function turnBody(node) {
+      var body = directChildOfClass(node, 'hd-cv-turn-body');
+      if (body) return body;
+      if (node && node.classList && node.classList.contains('chat-turn')) return node;
+      return null;
+    }
+    /** where a new segment goes: before the live "working · Ns" tail when there is one, else last */
+    function turnTail(body) {
+      var w = directChildOfClass(body, 'hd-cv-working');
+      if (w) return w;
+      return directChildOfClass(body, 'chat-working');
+    }
+    /** the notes a turn shows only because it had nothing else ("no records yet", "no reply") — the
+     *  renderer marks them data-hd-placeholder, so appending a record removes exactly those and never
+     *  a note that is part of the record. */
+    function dropPlaceholders(body) {
+      var out = 0;
+      if (!body || !body.childNodes) return 0;
+      for (var i = body.childNodes.length - 1; i >= 0; i--) {
+        var c = body.childNodes[i];
+        if (c.nodeType !== 1 || !c.getAttribute) continue;
+        if (c.getAttribute('data-hd-placeholder') === '1' && c.parentNode) {
+          c.parentNode.removeChild(c);
+          out++;
+        }
+      }
+      return out;
+    }
+    /* A1's two marks belong to the LAST assistant text of a closed turn, so appending one moves them.
+       Hand-maintained here (the renderer draws them from the whole turn, which an append does not
+       have) — without this, a turn would end up with two "reply" labels and the reader would be told
+       the wrong record is the answer. */
+    function demoteReply(body) {
+      var rep = directChildOfClass(body, 'hd-cv-reply');
+      if (!rep) return false;
+      if (rep.classList) { rep.classList.remove('hd-cv-reply'); rep.classList.add('hd-cv-interim'); }
+      var tag = rep.previousSibling;
+      while (tag && tag.nodeType !== 1) tag = tag.previousSibling;
+      if (tag && tag.classList && tag.classList.contains('hd-cv-replytag') && tag.parentNode) {
+        tag.parentNode.removeChild(tag);
+      }
+      return true;
+    }
+    function promoteReply(body, node) {
+      if (node.classList) node.classList.add('hd-cv-reply');
+      if (node.parentNode === body) body.insertBefore(el('div', 'hd-cv-replytag', 'reply'), node);
+      return node;
+    }
+    /** what ChatRender's dupe fold compares: name + input + result + call_key. The renderer's own
+     *  dupeIdentity() is asked first (the same convention summaryMax() uses), so this module and the
+     *  renderer can never disagree about which two calls are one call; the local form is the fallback
+     *  for a page whose renderer predates the dupe fold. */
+    function recordIdentity(m) {
+      try {
+        var T = window.HD && window.HD.chatRenderTest;
+        if (T && typeof T.dupeIdentity === 'function') {
+          var known = T.dupeIdentity(m);
+          if (known !== null && known !== undefined) return String(known);
+        }
+      } catch (e) { /* fall through to the local form */ }
+      var tool = (m && m.tool) || {};
+      var name = norm(tool.name || tool.tool_name || tool.tool || '');
+      var input = jsonish(tool.input), result = jsonish(tool.result), ck = text(tool.call_key);
+      if (!name && !input && !result && !ck) return '';
+      return [name, input, result, ck].join('\u0001');
+    }
+    function noteIdentity(m, calls, idents) {
+      if (!m || (m.kind || 'text') !== 'tool_call') return;
+      var ck = text(m.tool && m.tool.call_key);
+      if (ck) calls[ck] = 1;
+      var id = recordIdentity(m);
+      if (id) idents[id] = 1;
+    }
+    /** can this record be appended as a NEW node without changing one that is already drawn? */
+    function canAppendRecord(m, calls, idents) {
+      var kind = m.kind || 'text';
+      if (kind === 'tool_result') {
+        var ck = text(m.tool && m.tool.call_key);
+        return !(ck && calls[ck]);            // its call's card is on screen: the pair belongs there
+      }
+      if (kind === 'tool_call') {
+        var id = recordIdentity(m);           // a call the log repeats folds into the older card
+        return !(id && idents[id]);
+      }
+      /* Thinking blocks carry A2/A3 reader state and are redrawn by the full renderer: the selftest's
+         "a record lands while a block is open" case must exercise that redraw, and thinking records
+         are far rarer than a text poll. Plain text (the ordinary streaming record) appends in place. */
+      if (kind === 'thinking') return false;
+      return kind === 'text';
+    }
+
+    /** §9: append the records [from, to) to the OPEN turn's own node. Returns the nodes it created,
+     *  or null when the pass cannot be appended — every case where a record changes a node that is
+     *  already on screen, so the caller redraws just the turn it belongs to instead:
+     *    · a user text record (a new turn starts and the open turn closes, which moves its reply mark);
+     *    · a tool_result whose call_key names a call already drawn (the pair belongs in that card);
+     *    · a tool_call the log repeats (the older card gains its "×N" and this one is not drawn). */
+    function appendToTurn(st, g, from, to) {
+      var node = g.node;
+      if (!node || !node.parentNode || !listEl.contains(node)) return null;
+      var body = turnBody(node);
+      if (!body) return null;
+      var calls = {}, idents = {}, i, m;
+      for (i = g.from; i < from; i++) noteIdentity(st.messages[i], calls, idents);
+      for (i = from; i < to; i++) {
+        m = st.messages[i];
+        if (!m || m.__empty) continue;
+        if (isUserText(m)) return null;
+        if (!canAppendRecord(m, calls, idents)) return null;
+        noteIdentity(m, calls, idents);
+      }
+      var working = isWorking(st.id);
+      var markReply = (body !== node);        // only ChatRender's turn carries A1's reply/interim marks
+      var opts = renderOpts(st);
+      var made = [];
+      dropPlaceholders(body);
+      for (i = from; i < to; i++) {
+        m = st.messages[i];
+        if (!m || m.__empty) continue;
+        var frag = renderMessages([m], opts);
+        var n = frag && frag.firstChild;
+        if (!n || n.nodeType !== 1) continue;
+        var isText = ((m.kind || 'text') === 'text');
+        var isReplyable = isText && m.role === 'assistant';   // A1: only an assistant text can be the reply
+        if (markReply && isText) {
+          /* mirror renderTurn(): the newest assistant text is the reply of a closed turn, every other
+             text segment (and every text of a turn that is still running) is interim */
+          if (working || !isReplyable) { if (n.classList) n.classList.add('hd-cv-interim'); }
+          else demoteReply(body);
+        }
+        body.insertBefore(n, turnTail(body));   // the live label stays last
+        if (markReply && isReplyable && !working) promoteReply(body, n);
+        syncReader(st, n);                      // A2/A3: the reader's fold/open comes back with it
+        made.push(n);
+        noteDeco(n);
+      }
+      /* the group's record span is part of its public shape (the selftest reads it, and a reader
+         asking "which records are in this turn" must see the appended ones). */
+      node.setAttribute('data-turn', g.from + '-' + to);
+      return made;
+    }
+
     /** A1 rule 1: draw what has landed — never wait for the turn to end. */
     function renderNew(st, force) {
+      var t0 = nowMs();
       var floor = floorOf(st);
       trimFront(st, floor);
       var len = st.messages.length;
       var last = st.rendered.length ? st.rendered[st.rendered.length - 1] : null;
-      var from;
-      if (!last) from = floor;
-      else if (force || (len - last.from) <= TURN_RERENDER_MAX) from = last.from;   // redraw the open turn
-      else { from = st.renderedTo; st.openBig = last.from; }                        // huge turn: append only
-      if (from < floor) from = floor;
-      dropFrom(st, from);
-      st.renderedTo = from;
-      if (len > from) appendGroups(st, from, len);
-      st.renderedTo = len;
+      var path = 'none';
+
+      /* 1. the append-only pass — the ordinary poll while a turn is running */
+      if (last && !force && len > last.to && st.reclose === null) {
+        var made = appendToTurn(st, last, last.to, len);
+        if (made !== null) {
+          last.to = len;                      // the group's coverage grows with its node
+          st.renderedTo = len;
+          path = 'append';
+        }
+      }
+
+      /* 2. the redraw pass — only when a record really changes what is on screen.
+         NOTE the render window (`floor`) is NOT used as a clamp here: a turn group is atomic, so a
+         window that has moved past the open turn's first record must keep that record — dropping the
+         group and redrawing from `floor` would draw the tail of the same turn a SECOND time (the
+         loose-record path), which is what a straddling window costs if the group is cut. `from` is
+         therefore either the window (nothing on screen yet) or the open turn. */
+      if (path === 'none') {
+        var from = -1;
+        if (!last) from = floor;
+        else if (force) from = last.from;
+        else if (len > last.to) {
+          /* A turn already at the render cap was drawn append-only and is redrawn when it ENDS
+             (st.reclose), so a 500-record turn is never rebuilt on every poll. */
+          if ((len - last.from) > TURN_RERENDER_MAX) { st.openBig = last.from; from = st.renderedTo; }
+          else from = last.from;              // the open turn, and nothing else
+        }
+        if (from >= 0) {
+          dropFrom(st, from);
+          st.renderedTo = from;
+          if (len > from) appendGroups(st, from, len);
+          st.renderedTo = len;
+          path = !last ? 'all' : 'turn';
+        }
+      }
       if (st.reclose !== null) {                      // the open big turn just ended: close it properly
         var r = st.reclose;
         st.reclose = null;
@@ -1664,9 +1925,13 @@
           st.renderedTo = r;
           if (len > r) appendGroups(st, r, len);
           st.renderedTo = len;
+          path = 'turn';
         }
       }
-      decoratePaths();                                // §13.2.1: the text just drawn, as links
+      perf.renders++;
+      perf.lastRenderMs = ms1(nowMs() - t0);
+      perf.lastRenderPath = path;
+      scheduleDecorate();                             // §13.2.1 + §9: the nodes just drawn, as links
     }
     function renderPendings(st) {
       var id = currentPaneId();
@@ -1674,7 +1939,8 @@
       for (var i = nodes.length - 1; i >= 0; i--) if (nodes[i].parentNode) nodes[i].parentNode.removeChild(nodes[i]);
       if (!st || st.id !== id || !st.pending.length) return;
       var now = Date.now();
-      for (var j = 0; j < st.pending.length; j++) listEl.appendChild(renderPendingGroup(st.pending[j], now, st));
+      for (var j = 0; j < st.pending.length; j++) noteDeco(listEl.appendChild(renderPendingGroup(st.pending[j], now, st)));
+      scheduleDecorate();              // §9: the bubbles are new nodes too (a prompt can carry a path)
     }
     function refreshPendingNotes(st, now) {
       var id = currentPaneId();
@@ -1905,6 +2171,8 @@
       }
       var dp = node.getAttribute('data-pending');
       if (dp) fresh.setAttribute('data-pending', dp);
+      noteDeco(fresh);                 // §9: a replaced node is a NEW node, and needs its links back
+      scheduleDecorate();
       return fresh;
     }
 
@@ -2315,7 +2583,7 @@
         }
         updateJump();
       }
-      decoratePaths();                             // §13.2.1: the whole list, after a full render
+      scheduleDecorate();                          // §13.2.1 + §9: every group is new after a full render
     }
 
     /* ---------------- the mode (chat ↔ raw) ---------------- */
@@ -2777,8 +3045,9 @@
        status in the composer's result line. It is mounted on the chat host, which is the subtree the
        buttons live in, so one capture-phase listener covers every button of every render.
        §13.2.1: lib/pathlink.js is mounted on its own declared host (#hdPathHost, index.html) and is
-       handed the freshly drawn messages after every render (decoratePaths below). Both mounts are
-       best-effort on purpose: a page without either file keeps its conversations and its text. */
+       handed the freshly drawn messages after every render (scheduleDecorate / decorateNodes above).
+       Both mounts are best-effort on purpose: a page without either file keeps its conversations and
+       its text. */
     var copyApi = window.HD && window.HD.copy;
     if (copyApi && typeof copyApi.mount === 'function') {
       try { copyApi.mount(host); } catch (e) { /* §13.1.3: a broken copy module never breaks the view */ }
@@ -2797,6 +3066,36 @@
       show: function () { return setMode('chat'); },
       hide: function () { return setMode('raw'); },
       toggle: toggle,
+      /* §9 + §7: the integrator owns which view is on screen, so it also owns whether this one may
+         poll. `false` stops EVERY timer this module runs (poll, pending, working, slow) and sets
+         auto=false, so nothing rearms them behind the caller's back; `true` sets auto=true, re-derives
+         the timers (syncTimers) and reads at once when the chat view is the visible one — coming back
+         to the history must not cost a whole poll interval of blank time. Same seams as
+         __setAuto (the ?selftest=1 case keeps using that), plus the immediate poll. */
+      setActive: function (on) {
+        auto = !!on;
+        if (!auto) {
+          if (pollTimer) { window.clearInterval(pollTimer); pollTimer = null; }
+          if (pendingTimer) { window.clearInterval(pendingTimer); pendingTimer = null; }
+          if (workingTimer) { window.clearInterval(workingTimer); workingTimer = null; }
+          if (slowTimer) { window.clearInterval(slowTimer); slowTimer = null; }
+        }
+        syncTimers();
+        if (auto && mode === 'chat' && !unmounted && !document.hidden) poll();
+        renderStatus(currentPaneId() ? paneState(currentPaneId()) : null);
+        return auto;
+      },
+      /* §9: what the last render/decorate pass cost, and how much the polish walked. `decoratedNodes`
+         is the LAST pass's root count — the number that used to be "every node in the list" and is
+         now "the nodes this render made" — and `decoratedTotal` is the running sum. */
+      __perf: function () {
+        return { lastRenderMs: perf.lastRenderMs, lastDecorateMs: perf.lastDecorateMs,
+                 renders: perf.renders, decoratedNodes: perf.decoratedNodes, pollMs: POLL_MS,
+                 decoratedTotal: perf.decoratedTotal, decoratePasses: perf.decoratePasses,
+                 lastDecorateTextNodes: perf.lastDecorateTextNodes,
+                 lastRenderPath: perf.lastRenderPath,
+                 pendingDecorate: decoQueue.length, decorateScheduled: decoHandle !== null };
+      },
       mounted: function () { return mounted && !unmounted; },
       viewMode: function () { return mode; },
       state: state,
@@ -2829,6 +3128,8 @@
       unmount: function () {
         unmounted = true;
         leaveFreeze(false);                          // §13.8 rule 3: no freeze outlives the mount
+        cancelDeco();                                // §9: no decoration pass outlives the host
+        decoQueue = [];
         if (catchUpTimer) { window.clearTimeout(catchUpTimer); catchUpTimer = null; }
         if (liveHost === host) liveHost = null;
         document.removeEventListener('mousedown', onFreezeDown, true);
@@ -3051,6 +3352,29 @@
   var handle = null;
   var liveHost = null;          // the host of the instance currently mounted (idempotence guard)
 
+  /* §9 performance counters, read by handle.__perf(). Module level on purpose: a probe asks the same
+     object whether or not a host is mounted, and the numbers survive a remount.
+       lastRenderMs    one renderNew() pass (DOM work only; never includes decoration or the fetch)
+       lastDecorateMs  the last decoration pass (the link module's own walk, not its network)
+       renders         renderNew() passes so far
+       decoratedNodes  roots handed to the LAST decoration pass (this is the number the §9 fix is
+                       about: one appended record = 1, never "every node in the list")
+       decoratedTotal  sum of decoratedNodes over every pass
+       decoratePasses  how many passes ran
+       pollMs          POLL_MS as compiled */
+  var perf = { lastRenderMs: 0, lastDecorateMs: 0, renders: 0, decoratedNodes: 0,
+               decoratedTotal: 0, decoratePasses: 0, lastDecorateTextNodes: 0,
+               lastRenderPath: 'none' };
+
+  /* a monotonic clock for the two measurements (Date.now() is 1 ms-grained and can jump) */
+  function nowMs() {
+    try {
+      if (window.performance && typeof window.performance.now === 'function') return window.performance.now();
+    } catch (e) { /* fall through */ }
+    return Date.now();
+  }
+  function ms1(v) { return Math.round(num(v) * 10) / 10; }
+
   function testApi() {
     return {
       /* every seam feeds the SAME functions the network path uses (ingest / notePending / the
@@ -3058,6 +3382,9 @@
       setPane: function (id) { return !!(handle && handle.__setPaneOverride(id)); },
       setStatus: function (id, status) { return handle ? handle.__setStatus(id, status) : null; },
       setAuto: function (on) { return handle ? handle.__setAuto(on) : false; },
+      /* §9: the public pause/resume, exactly as app.js calls it (the selftest can too) */
+      setActive: function (on) { return handle ? handle.setActive(on) : false; },
+      perf: function () { return handle ? handle.__perf() : null; },
       /* §13.8: the frozen state, the OFF switch (the control run), and a manual release */
       freeze: function () { return handle ? handle.__freeze() : null; },
       setFreeze: function (on) { return handle ? handle.__setFreeze(on) : false; },

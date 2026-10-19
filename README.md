@@ -70,8 +70,11 @@ herdr itself from a NON-elevated terminal and nothing needs elevation anywhere.
 Three columns: the workspace / tab / pane tree on the left, the selected pane in the middle, and a **side dock** on the
 right showing that pane's own usage and background processes.
 
-- **Panes** (`Ctrl+1..9` or `j` / `k`): `t` switches between the structured **chat view** and the raw terminal
-  transcript — both stay available.
+- **Panes** (`Ctrl+1..9` or `j` / `k`): pick the pane shown in the terminal, chat or raw view.
+- **Views**: the selected pane opens in the live **terminal** by default. `t` cycles terminal → **chat** (the
+  structured history) → raw transcript → terminal; the header view chip does the same (in chat it toggles chat ↔ raw).
+  The terminal streams the pane's screen (~150 ms cadence), while the chat view reads the agent's own log. Add
+  `?perf=1` to the URL for a small header HUD (`read 14ms · 6.7/s · 3200 rows`) refreshed twice a second.
 - **Prompts**: `Enter` sends, `Shift+Enter` adds a newline, *wait for idle* queues until the pane is free, and *send
   text* sends the text verbatim (what menus and REPLs expect).
 - **Attachments**: paperclip, drag-and-drop, or paste. The file is copied to

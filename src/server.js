@@ -33,6 +33,7 @@ const attach = require('./attach');              // §10 POST /api/attach (round
 const pathsApi = require('./paths');             // §13.2 POST /api/pathinfo, /api/open (round 9)
 const statusView = require('./status');          // §12.3 GET /api/status (round 8)
 const promptdetect = require('./promptdetect');   // agent question detection from terminal text
+const paneCacheModule = require('./pane-cache'); // §8 pane/session read caches (W1)
 
 /** The jsonl reader for a file-log agent. claude and pi write different records
  *  but the server route is the same shape, so the path names one accessor instead
@@ -85,6 +86,16 @@ const healedPanes = new Map();
 const MAX_LINES = 20000;
 const MAX_BATCH_PANES = 20;
 
+// §8 (perf round): the terminal polls /api/pane every ~150 ms and recent
+// scrollback every ~1 s; the sessions view re-opens its selector often. These
+// caches coalesce concurrent identical reads and briefly reuse a successful
+// result. Errors are never cached (handled inside memo()).
+const paneReadCache = paneCacheModule.createCache({ maxEntries: 256 });
+const sessionListCache = paneCacheModule.createCache({ maxEntries: 256 });
+const PANE_CACHE_TTL_MS = { visible: 120, recent_unwrapped: 400 };
+const SESSION_LIST_CACHE_MS = 10000;
+const SESSION_LIST_KEY_PREFIX = 'sessions|';
+
 // ── tiny helpers ────────────────────────────────────────────────────────────
 const ok = (res, extra) => sendJson(res, Object.assign({ ok: true }, extra));
 const err = (res, code, message, extra) =>
@@ -92,14 +103,16 @@ const err = (res, code, message, extra) =>
 // Unknown paths are the one non-200 JSON response (§4): 404 + {code:"not_found"}.
 const notFound = (res, message) => sendJson(res, { ok: false, error: { code: 'not_found', message } }, 404);
 
-function sendJson(res, body, statusCode) {
+function sendJson(res, body, statusCode, extraHeaders) {
   if (res.writableEnded) return;
   const payload = JSON.stringify(body);
-  res.writeHead(statusCode || 200, {
+  const headers = {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(payload),
     'cache-control': 'no-store',
-  });
+  };
+  if (extraHeaders) Object.assign(headers, extraHeaders);
+  res.writeHead(statusCode || 200, headers);
   res.end(payload);
 }
 
@@ -361,19 +374,56 @@ async function handlePane(req, res, url) {
     throw { code: 'bad_request', message: '"source" must be one of ' + [...READ_SOURCES].join(', ') };
   }
   const lines = clampLines(url.searchParams.get('lines'));
+  const format = 'text';
 
-  const result = await hdr.request(
-    'pane.read',
-    { pane_id: paneId, source, lines, format: 'text' },
-    { timeoutMs: DEFAULT_TIMEOUT_MS },
-  );
-  // Live herdr nests the payload under `read`; accept a flat shape too.
-  const read = (result && result.read) ? result.read : (result || {});
-  ok(res, {
-    pane_id: read.pane_id || paneId,
-    source: read.source || source,
-    revision: read.revision === undefined ? null : read.revision,
-    text: read.text || '',
+  const load = async () => {
+    const result = await hdr.request(
+      'pane.read',
+      { pane_id: paneId, source, lines, format },
+      { timeoutMs: DEFAULT_TIMEOUT_MS },
+    );
+    // Live herdr nests the payload under `read`; accept a flat shape too.
+    const read = (result && result.read) ? result.read : (result || {});
+    return {
+      pane_id: read.pane_id || paneId,
+      source: read.source || source,
+      revision: read.revision === undefined ? null : read.revision,
+      text: read.text || '',
+    };
+  };
+
+  // Only the two hot terminal sources are cached; recent/detection keep their
+  // every-request semantics. memo() coalesces concurrent identical reads and
+  // never stores a rejection.
+  const ttl = PANE_CACHE_TTL_MS[source] || 0;
+  let hit = false;
+  let payload;
+  if (ttl > 0) {
+    const key = [paneId, source, lines, format].join('|');
+    const shared = paneReadCache.memo(key, ttl, load);
+    hit = shared.cacheHit === true;
+    payload = await shared;
+    if (CHAT_TIMING) {
+      const s = paneReadCache.stats();
+      console.log('[hd-chat-timing] ' + JSON.stringify({
+        time: new Date().toISOString(),
+        pane_cache: {
+          key,
+          hit,
+          hits: s.hits,
+          coalesced: s.coalesced,
+          misses: s.misses,
+          upstream: s.loads,
+          entries: s.entries,
+        },
+      }));
+    }
+  } else {
+    payload = await load();
+  }
+
+  sendJson(res, Object.assign({ ok: true }, payload), 200, {
+    'x-hd-pane-cache': hit ? 'hit' : 'miss',
   });
 }
 
@@ -719,12 +769,43 @@ function hermesSessions(currentId) {
 async function handleSessionsGet(req, res, url) {
   const paneId = url.searchParams.get('pane_id');
   if (!paneId) throw { code: 'bad_request', message: '"pane_id" query parameter is required' };
+  // §8: reading a claude/pi /resume selector costs seconds and the UI opens it
+  // repeatedly. Cache the successful payload per pane for a few seconds; a
+  // failed read (no selector, unsupported agent, ...) is never stored.
+  const startedAt = Date.now();
+  const shared = sessionListCache.memo(
+    SESSION_LIST_KEY_PREFIX + paneId,
+    SESSION_LIST_CACHE_MS,
+    () => loadSessionsPayload(paneId),
+  );
+  const hit = shared.cacheHit === true;
+  const payload = await shared;
+  if (CHAT_TIMING) {
+    const s = sessionListCache.stats();
+    console.log('[hd-chat-timing] ' + JSON.stringify({
+      time: new Date().toISOString(),
+      session_cache: {
+        pane_id: paneId,
+        hit,
+        hits: s.hits,
+        coalesced: s.coalesced,
+        misses: s.misses,
+        upstream: s.loads,
+        entries: s.entries,
+        ms: Date.now() - startedAt,
+      },
+    }));
+  }
+  ok(res, payload);
+}
+
+async function loadSessionsPayload(paneId) {
   const info = await paneSessionInfo(paneId);
 
   if (info.family === 'hermes') {
     const sessions = hermesSessions(info.sessionId);
     if (!sessions.length) throw { code: 'no_sessions', message: 'no sessions in ' + chatHermes.dbPath() };
-    return ok(res, { pane_id: paneId, agent: 'hermes', current: info.sessionId || null, sessions: sessions });
+    return { pane_id: paneId, agent: 'hermes', current: info.sessionId || null, sessions: sessions };
   }
 
   if (info.family === 'claude' || info.family === 'pi') {
@@ -737,13 +818,13 @@ async function handleSessionsGet(req, res, url) {
     if (!prompt || !prompt.options.length) {
       throw { code: 'no_sessions', message: 'the /resume selector showed no sessions (is this pane at an idle prompt?)' };
     }
-    return ok(res, {
+    return {
       pane_id: paneId, agent: info.family, current: info.sessionId || null,
       total: prompt.total,
       sessions: prompt.options.map((o) => ({
         id: null, n: o.n, title: o.label, detail: o.detail || null, current: false,
       })),
-    });
+    };
   }
 
   throw { code: 'unsupported', message: 'session switching is not available for a ' + info.family + ' pane' };
@@ -752,6 +833,9 @@ async function handleSessionsGet(req, res, url) {
 /* POST /api/sessions {pane_id, session_id} — hermes only. */
 async function handleSessionsPost(req, res, body) {
   const paneId = requireString(body, 'pane_id');
+  // §8: whatever this POST does (or fails to do) to the pane, the cached
+  // session list for it may now be stale.
+  sessionListCache.clear(SESSION_LIST_KEY_PREFIX + paneId);
   const info = await paneSessionInfo(paneId);
 
   if (info.family === 'hermes') {
@@ -2651,6 +2735,7 @@ function rememberSwitch(paneId, id, agent, from, seen) {
   liveCache.clear();                // keyed on herdr's record, which did not move
   paneTextCache.clear();
   storeCache.clear();
+  sessionListCache.clear(SESSION_LIST_KEY_PREFIX + paneId); // §8: the selector list changed
   /* The switch records whether a "started a new session" line is on screen RIGHT NOW: one that is
      belongs to the session the switch just left, so only a later appearance may move the pane. */
   if (agent === 'hermes') newSessionNotices.set(paneId, { at: Date.now(), count: (seen && seen.noticeCount) || 0 });

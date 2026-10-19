@@ -452,6 +452,18 @@ function selectPane(paneId) {
   renderTranscript(true);
   emit('select', { pane_id: paneId, paneId: paneId });
   pollPane();
+  /* Keep the engine pointed at the selection even while it is
+     paused, so returning to the terminal has the right pane from its first read. */
+  if (term) {
+    try {
+      term.setPane(paneId);
+      termPaneId = paneId;
+      if (!termActive) term.setActive(false);
+      // chatview's own select handler calls applyMode(), which repaints the chip for
+      // its chat/raw mode even while terminal is the visible view: claim it back.
+      else setViewChip('terminal');
+    } catch (e) { /* a pane switch must never break the page */ }
+  }
 }
 
 /* Pick a pane when nothing valid is selected (first load, or the pane disappeared). */
@@ -2600,6 +2612,309 @@ function watchMainLayout(box) {
   }
 }
 
+/* ------------------------------------------------------------------ *
+ * Terminal-first view integration
+ *
+ * Three views share #transcriptWrap: the live terminal (#terminalHost, W2's engine),
+ * the structured chat (#chatHost, chatview.js) and the raw transcript (#transcript).
+ * The terminal is the default; `t` cycles terminal -> chat -> raw -> terminal. Chat's
+ * own chat -> raw `t` stays chatview's, so the cycle is shared rather than duplicated.
+ * Only one view's timers run at a time: applyView() pauses chatview while the terminal
+ * is on screen and pauses the terminal while chat/raw are.
+ * ------------------------------------------------------------------ */
+
+const VIEW_LS = 'herdrDash.transcriptView';
+const PERF_HUD = /[?&]perf=1(&|$)/.test(window.location.search);
+
+let term = null;                 // the engine handle (null when unavailable)
+let termActive = false;          // true only while terminal is the visible view
+let termPaneId = null;           // the pane the engine currently holds
+let viewMode = 'terminal';       // the app's intended view: 'terminal' | 'chat' | 'raw'
+let termFailure = '';            // a visible sentence when the engine is unavailable
+let perfPrev = null;             // {at, updates} for the HUD's updates/s
+let perfTimer = null;
+
+function chatviewApi() {
+  return state.moduleApi.chatview || (window.HD && window.HD.chatview) || null;
+}
+
+/* Absent or 'raw' migrates to terminal; an explicit 'chat' is kept. */
+function bootViewMode() {
+  const stored = lsGet(VIEW_LS, '');
+  if (stored === 'chat') return 'chat';
+  if (stored !== 'terminal') lsSet(VIEW_LS, 'terminal');
+  return 'terminal';
+}
+
+/* What is actually on screen. chatview owns chat<->raw once we are not in terminal,
+   so its viewMode() wins there (the user may have toggled with chatview's own `t`). */
+function effectiveMode() {
+  if (term && termActive) return 'terminal';
+  const cv = chatviewApi();
+  if (cv && typeof cv.viewMode === 'function') {
+    try { return cv.viewMode() === 'raw' ? 'raw' : 'chat'; } catch (e) { /* fall through */ }
+  }
+  return (viewMode === 'chat' || viewMode === 'raw') ? viewMode : 'terminal';
+}
+
+function setViewChip(mode) {
+  const chip = $('hViewMode');
+  if (!chip) return;
+  chip.textContent = 'view: ' + mode;
+  chip.classList.remove('mode-chat', 'mode-raw');
+  chip.classList.toggle('mode-terminal', mode === 'terminal');
+  if (mode === 'terminal') chip.setAttribute('title', 'terminal view — click or press t for the chat view');
+}
+
+function setTermNotice(text) {
+  const el = $('hTermPerf');
+  if (!el) return;
+  el.hidden = false;
+  el.textContent = text;
+}
+
+function updatePerfHud() {
+  const el = $('hTermPerf');
+  if (!el) return;
+  if (termFailure) {
+    el.hidden = false;
+    el.textContent = 'terminal unavailable — showing raw (' + termFailure + ')';
+    return;
+  }
+  if (!PERF_HUD || !term) { el.hidden = true; return; }
+  let s;
+  try { s = term.state(); } catch (e) { el.hidden = true; return; }
+  const now = Date.now();
+  let rate = 0;
+  if (perfPrev) {
+    const dt = (now - perfPrev.at) / 1000;
+    if (dt > 0) rate = Math.max(0, (s.updates - perfPrev.updates) / dt);
+  }
+  perfPrev = { at: now, updates: s.updates };
+  el.hidden = false;
+  el.textContent = 'read ' + Math.round(s.lastReadMs) + 'ms · ' + rate.toFixed(1) + '/s · ' +
+                   s.bufferLines + ' rows';
+}
+
+/* Apply one of the three views. Persists the choice unless opts.persist === false
+   (boot already honoured/migrated the stored value; the failure fallback must not
+   overwrite a user's 'chat'). */
+function applyView(mode, opts) {
+  const next = (mode === 'chat' || mode === 'raw') ? mode : 'terminal';
+  if (next === 'terminal' && !term) {
+    // No engine: raw is the honest fallback (never a blank transcript area).
+    return applyView('raw', { persist: false });
+  }
+  const persist = !opts || opts.persist !== false;
+  viewMode = next;
+  if (persist) lsSet(VIEW_LS, next);
+
+  const cv = chatviewApi();
+  const host = $('terminalHost');
+  const wrap = $('transcriptWrap');
+
+  if (next === 'terminal') {
+    // Pause chat first, then hand the pane to the engine and activate it; the
+    // engine loads scrollback+screen only while active.
+    if (cv && typeof cv.setActive === 'function') {
+      try { cv.setActive(false); } catch (e) { /* a view switch must not break the page */ }
+    }
+    if (wrap) wrap.classList.add('terminal-active');
+    if (host) host.hidden = false;
+    setViewChip('terminal');
+    termActive = false;
+    try {
+      const wantPane = state.selected || null;
+      if (wantPane !== termPaneId) {
+        term.setPane(wantPane);
+        termPaneId = wantPane;
+      }
+      termActive = true;
+      term.setActive(true);
+    } catch (e) {
+      termActive = false;
+      setTermNotice('terminal view failed — press t for the raw transcript (' +
+                    (e && e.message ? e.message : String(e)) + ')');
+    }
+    updatePerfHud();
+    return next;
+  }
+
+  termActive = false;
+  if (term) { try { term.setActive(false); } catch (e) { /* ignore */ } }
+  if (host) host.hidden = true;
+  if (wrap) wrap.classList.remove('terminal-active');
+
+  if (next === 'chat' && cv) {
+    try { cv.show(); } catch (e) { /* fall back to the raw transcript below */ }
+    if (typeof cv.setActive === 'function') {
+      try { cv.setActive(true); } catch (e) { /* ignore */ }
+    }
+  } else if (next === 'raw' && cv) {
+    try {
+      if (typeof cv.viewMode === 'function' && cv.viewMode() === 'chat' && typeof cv.toggle === 'function') cv.toggle();
+      if (typeof cv.setActive === 'function') cv.setActive(true);
+    } catch (e) { /* ignore */ }
+  } else {
+    // chatview absent (or chat requested without it): show the raw transcript directly.
+    const pre = $('transcript');
+    if (pre) pre.classList.remove('hidden');
+    const chat = $('chatHost');
+    if (chat) chat.classList.add('hidden');
+    setViewChip('raw');
+  }
+  updatePerfHud();
+  return next;
+}
+
+/* /api/pane wrapper for the engine: fetch with the caller's AbortSignal and no browser
+   cache; every HTTP/JSON failure becomes a readable {ok:false,status,error} so the
+   engine's status line says what happened. AbortError/network rejections propagate for
+   the engine's own timeout/backoff handling. */
+function readTermPane(paneId, source, lines, signal) {
+  const url = '/api/pane?pane_id=' + encodeURIComponent(paneId) +
+              '&lines=' + encodeURIComponent(lines) + '&source=' + encodeURIComponent(source);
+  return fetch(url, { signal: signal, cache: 'no-store' }).then(function (res) {
+    return res.text().then(function (raw) {
+      let body = null;
+      try { body = raw ? JSON.parse(raw) : null; } catch (e) { body = null; }
+      if (!res.ok) {
+        const msg = (body && body.error && body.error.message) ? body.error.message : ('HTTP ' + res.status);
+        return { ok: false, status: res.status, error: msg };
+      }
+      if (!body || body.ok !== true) {
+        const msg = (body && body.error && body.error.message) ? body.error.message : ('HTTP ' + res.status);
+        return { ok: false, status: res.status, error: msg };
+      }
+      return body;
+    });
+  });
+}
+
+function terminalUnavailable(reason) {
+  termFailure = String(reason || 'terminal engine unavailable');
+  term = null;
+  termActive = false;
+  termPaneId = null;
+  // Raw fallback, but never rewrite a stored 'chat': the next load may have the engine
+  // and must still open the reader's chosen view.
+  applyView('raw', { persist: false });
+  setTermNotice('terminal unavailable — showing raw (' + termFailure + ')');
+}
+
+/* Called after mountModules(): the engine needs the shell and the chat handle to exist. */
+function setupTerminal() {
+  const host = $('terminalHost');
+  const want = bootViewMode();
+  try {
+    if (!host) throw new Error('the #terminalHost mount is missing');
+    const engine = window.HD && window.HD.terminal;
+    if (!engine || typeof engine.create !== 'function') throw new Error('HD.terminal is not loaded');
+    term = engine.create({
+      host: host,
+      readScreen: function (paneId, signal) { return readTermPane(paneId, 'visible', 60, signal); },
+      readScrollback: function (paneId, lines, signal) {
+        return readTermPane(paneId, 'recent_unwrapped', lines, signal);
+      },
+      intervalMs: 150,
+      idleMs: 600,
+      scrollbackLines: 1200,
+      maxBuffer: 6000
+    });
+  } catch (e) {
+    terminalUnavailable(e && e.message ? e.message : String(e));
+    return;
+  }
+  applyView(want, { persist: false });
+  if (PERF_HUD && !perfTimer) {
+    perfTimer = window.setInterval(updatePerfHud, 500);
+    updatePerfHud();
+  }
+}
+
+/* `t` and the chip. Both are window-capture so the press/click is seen before
+   chatview's document/chip listener; stopPropagation is the only way to say "handled".
+   In chat mode we deliberately do nothing, leaving chat -> raw to chatview. */
+function wireViewSwitching() {
+  window.addEventListener('keydown', function (e) {
+    try {
+      if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+      if (e.key !== 't' && e.key !== 'T') return;
+      const t = e.target || {};
+      const tag = t.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || t.isContentEditable) return;
+      const k = ctx.modules && ctx.modules.api ? ctx.modules.api('keys') : null;
+      if (k && typeof k.overlayOpen === 'function' && k.overlayOpen()) return;
+      const mode = effectiveMode();
+      if (mode === 'terminal') {
+        e.preventDefault();
+        if (e.stopPropagation) e.stopPropagation();
+        applyView('chat');
+      } else if (mode === 'raw') {
+        e.preventDefault();
+        if (e.stopPropagation) e.stopPropagation();
+        applyView('terminal');
+      }
+      /* chat: chatview's own `t` turns chat into raw; the next `t` lands in the raw branch above. */
+    } catch (err) { /* a shortcut must never break the page */ }
+  }, true);
+
+  window.addEventListener('click', function (e) {
+    try {
+      const chip = $('hViewMode');
+      if (!chip) return;
+      const t = e.target;
+      if (!t || (t !== chip && !chip.contains(t))) return;
+      const mode = effectiveMode();
+      if (mode === 'terminal') {
+        e.preventDefault();
+        if (e.stopPropagation) e.stopPropagation();
+        applyView('chat');
+      } else if (mode === 'raw') {
+        e.preventDefault();
+        if (e.stopPropagation) e.stopPropagation();
+        applyView('terminal');
+      }
+      /* chat: chatview's chip listener owns chat -> raw. */
+    } catch (err) { /* ignore */ }
+  }, true);
+
+  /* Hidden stops every timer; visible restores exactly the view the reader left. */
+  document.addEventListener('visibilitychange', function () {
+    try {
+      const cv = chatviewApi();
+      if (document.hidden) {
+        viewMode = effectiveMode();
+        if (term) term.setActive(false);
+        termActive = false;
+        if (cv && typeof cv.setActive === 'function') cv.setActive(false);
+        return;
+      }
+      // Terminal keeps its buffer across a tab switch: resume the existing engine
+      // instead of re-seeding it, so the reader comes back to the same screen.
+      if (viewMode === 'terminal' && term) {
+        const host = $('terminalHost');
+        const wrap = $('transcriptWrap');
+        if (wrap) wrap.classList.add('terminal-active');
+        if (host) host.hidden = false;
+        setViewChip('terminal');
+        try {
+          termActive = true;
+          term.setActive(true);
+        } catch (e) {
+          termActive = false;
+          applyView('raw', { persist: false });
+          setTermNotice('terminal resume failed — showing raw (' +
+                        (e && e.message ? e.message : String(e)) + ')');
+        }
+        updatePerfHud();
+        return;
+      }
+      applyView(viewMode, { persist: false });
+    } catch (e) { /* a tab switch must never break the page */ }
+  });
+}
+
 function init() {
   applySidebar();
   applyConsole();
@@ -3161,6 +3476,12 @@ function init() {
   });
 
   mountModules();     // after the ctx exists and the shell is wired
+
+  /* The terminal-first view. The engine is created after the
+     modules mount (it reads chatview's handle); `t`, the chip and visibility share the
+     same three-view state. */
+  wireViewSwitching();
+  setupTerminal();
 
   /* DEFECT-16: emitted AFTER mountModules() on purpose. Palette only starts collecting
      `keys.register` when IT mounts, so a registration emitted from init() (earlier) is silently

@@ -239,6 +239,20 @@ html, body {
 
 .sep { color: var(--st-unknown); }
 
+/* ---------------- terminal-first view ----------------
+   #terminalHost is the W2 engine's mount box; it fills the same transcript track as
+   #transcript/#chatHost. When terminal is not the active view it must take no space at
+   all (terminal.css gives .hd-term-host display:flex, which would otherwise beat the
+   hidden attribute's UA rule). `.terminal-active` on #transcriptWrap is what swaps the
+   three views; without it the raw/chat layout is exactly as it was. */
+#terminalHost { flex: 1 1 auto; min-height: 0; min-width: 0; display: flex; }
+.hd-term-host[hidden] { display: none !important; }
+.terminal-active #chatHost,
+.terminal-active #transcript,
+.terminal-active #transcriptError,
+.terminal-active #jumpLatest { display: none !important; }
+#hViewMode.mode-terminal { border-color: var(--accent); color: #cfe4ff; }
+
 /* ---------------- prompt box ---------------- */
 
 #promptBox {

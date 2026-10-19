@@ -16,6 +16,9 @@
 <link rel="stylesheet" href="/lib/gitview.css">
 <link rel="stylesheet" href="/lib/chatview.css">
 <link rel="stylesheet" href="/lib/pathlink.css">
+<!-- The terminal-first view (W2's engine). Its rows are styled by this sheet;
+     the host box itself is app.js/W4's (#terminalHost). -->
+<link rel="stylesheet" href="/lib/terminal.css">
 <link rel="stylesheet" href="/lib/dock.css">
 
 <!-- bootstrap: CONTRACT-v2 §3 loads lib/*.js BEFORE app.js, so modules may register first.
@@ -64,6 +67,11 @@ if (typeof window.HD.register !== 'function') {
 <!-- the pending agent question cards (W3). Self-registers like dock.js, so mountModules() mounts it. -->
 <script src="/lib/prompt.js" defer></script>
 
+<!-- The terminal-first view. Both are classic deferred scripts loaded
+     before app.js; app.js creates the engine after modules mount and owns when it is active. -->
+<script src="/lib/terminal-merge.js" defer></script>
+<script src="/lib/terminal.js" defer></script>
+
 <!-- app.js publishes window.HD.ctx and mounts every module present -->
 <script src="/app.js" defer></script>
 </head>
@@ -95,9 +103,10 @@ if (typeof window.HD.register !== 'function') {
         <div class="hdr-row">
           <span id="hPane" class="mono strong">no pane selected</span>
           <span id="hLabel" class="mono dim"></span>
-          <!-- §8.3: which view the pane is showing. chatview.js owns the label; `t` and a click toggle -->
-          <button id="hViewMode" class="mode-chip mode-chat" type="button"
-                  title="t — chat view / raw terminal">view: chat</button>
+          <!-- Which view the pane is showing. app.js owns it in
+               terminal mode (chatview.js owns chat/raw; `t` and a click cycle all three). -->
+          <button id="hViewMode" class="mode-chip mode-terminal" type="button"
+                  title="t — terminal / chat / raw">view: terminal</button>
           <span class="hdr-status">
             <span id="hStatusDot" class="dot unknown" title="agent status"></span>
             <span id="hStatus" class="mono">unknown</span>
@@ -107,6 +116,9 @@ if (typeof window.HD.register !== 'function') {
           <span class="dim">agent</span> <span id="hAgent" class="mono">-</span>
           <span class="dim">cwd</span> <span id="hCwd" class="mono">-</span>
           <span class="dim">poll</span> <span id="hAge" class="mono">-</span>
+          <!-- ?perf=1: the terminal view's own HUD (read ms · updates/s · buffer rows), also used
+               for the visible terminal-unavailable fallback sentence. Hidden otherwise. -->
+          <span id="hTermPerf" class="mono small dim" hidden></span>
           <!-- CONTRACT-v2 §12.2.2: fed by the dock module (W3, id `dock`), filled by app.js. It shows
                — with a title reason whenever there is no current value, and never shows a stale one. -->
           <span class="dim">usage</span> <span id="hUsage" class="mono dim"
@@ -126,9 +138,11 @@ if (typeof window.HD.register !== 'function') {
       </div>
     </header>
 
-    <!-- transcript: the raw terminal text (#transcript, app.js) and the structured chat view
-         (#chatHost, chatview.js). `t` switches which one is shown; both stay mounted. -->
+    <!-- transcript: the live terminal (#terminalHost, W2's engine), the raw terminal text
+         (#transcript, app.js) and the structured chat view (#chatHost, chatview.js). The view
+         chip / `t` choose one; all three stay mounted. -->
     <div id="transcriptWrap">
+      <div id="terminalHost" class="hd-term-host" hidden></div>
       <pre id="transcript" tabindex="0"></pre>
       <div id="chatHost" class="chat-host hidden">
         <!-- CONTRACT-v2 §13.2.1: HD.pathlink's mount host (mounted by chatview.js, W2). It is

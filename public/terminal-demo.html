@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Herdr-Dash — terminal engine demo (mock data)</title>
+<link rel="stylesheet" href="lib/terminal.css">
+<style>
+  :root {
+    --bg: #0d1117; --bg-panel: #141a22; --bg-panel2: #1a2029; --bg-input: #0b0f14;
+    --line: #263040; --line-soft: #1e2632; --fg: #d6dee8; --fg-dim: #8b97a6;
+    --accent: #4aa3ff;
+    --mono: ui-monospace, "Cascadia Mono", "JetBrains Mono", Consolas, "Courier New", monospace;
+  }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg);
+    font: 13px/1.45 system-ui, "Segoe UI", Roboto, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  header { flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+    padding: 8px 10px; border-bottom: 1px solid var(--line); background: var(--bg-panel); }
+  header .brand { font: 700 12.5px/1 var(--mono); color: var(--fg); margin-right: 10px; }
+  header .hint { color: var(--fg-dim); font-size: 11.5px; margin-left: auto; }
+  button { padding: 4px 9px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--bg-panel2); color: var(--fg); font: 11.5px/1.4 var(--mono); cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  main { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+  #hostWrap { flex: 1 1 auto; min-height: 0; display: flex; }
+  #terminalHost { flex: 1 1 auto; min-width: 0; }
+  #demoState { flex: 0 0 auto; margin: 0; padding: 6px 10px; max-height: 96px; overflow: auto;
+    border-top: 1px solid var(--line); background: var(--bg-input); color: var(--fg-dim);
+    font: 11px/1.5 var(--mono); white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">terminal engine demo</span>
+  <button type="button" data-act="pane-p1">setPane p1</button>
+  <button type="button" data-act="pane-p2">setPane p2</button>
+  <button type="button" data-act="pane-null">setPane null</button>
+  <button type="button" data-act="active-on">setActive true</button>
+  <button type="button" data-act="active-off">setActive false</button>
+  <button type="button" data-act="follow-on">setFollow true</button>
+  <button type="button" data-act="follow-off">setFollow false</button>
+  <button type="button" data-act="refresh">refresh</button>
+  <button type="button" data-act="restart">restart mock stream</button>
+  <span class="hint">mock data — no server, no npm</span>
+</header>
+
+<main>
+  <div id="hostWrap"><div id="terminalHost"></div></div>
+  <pre id="demoState">state() …</pre>
+</main>
+
+<script src="lib/terminal-merge.js"></script>
+<script src="lib/terminal.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var SPINNER = ['\u280b', '\u2819', '\u2839', '\u2838', '\u283c', '\u2834', '\u2826', '\u2827', '\u2807', '\u280f'];
+  var PANE_NAMES = { p1: 'hermes-agent', p2: 'pi-worker' };
+
+  // ---------------------------------------------------------------- mock
+  // A synthetic agent log: a growing stream of lines plus one line that changes
+  // in place (spinner / progress). herdr gives us text snapshots, not a stream,
+  // so the mock exposes the same thing through readScreen / readScrollback.
+  function MockPane(id) {
+    this.id = id;
+    this.seed = id === 'p2' ? 7919 : 104729;
+    this.lines = [];
+    this.spinnerStep = 0;
+    this.seq = 0;
+    this.stopped = false;
+    this.visible = 60;
+    this.reset(true);
+  }
+
+  MockPane.prototype.rand = function () {
+    this.seed = (this.seed * 1664525 + 1013904223) % 4294967296;
+    return this.seed / 4294967296;
+  };
+
+  MockPane.prototype.makeLine = function (n) {
+    var words = ['scan', 'diff', 'render', 'fetch', 'merge', 'flush', 'patch', 'probe', 'sync', 'trace'];
+    var w = words[Math.floor(this.rand() * words.length)];
+    var stamp = '10:' + String(10 + Math.floor(n / 60)).padStart(2, '0') + ':' + String(n % 60).padStart(2, '0');
+    if (n % 37 === 0) {
+      return stamp + '  ' + w + '  GET /api/pane?pane_id=' + this.id + '&lines=60&source=visible 200 ' +
+        '14.4ms  \u2014 a deliberately long line to exercise horizontal scrolling in the terminal view, never wrapped';
+    }
+    if (n % 11 === 0) return stamp + '  ' + w + '  tick ' + n + '  ok';
+    if (n % 7 === 0) return stamp + '  ' + w + '  ' + PANE_NAMES[this.id] + ' working\u2026';
+    if (n % 5 === 0) return stamp + '    ' + w + '  indented detail line ' + n;
+    if (n % 13 === 0) return '';
+    return stamp + '  ' + w + '  row ' + n;
+  };
+
+  MockPane.prototype.reset = function (initial) {
+    var start = initial ? 0 : this.lines.length;
+    var count = initial ? 800 : 0;
+    this.lines = [];
+    this.seq = 0;
+    for (var i = 0; i < count; i += 1) {
+      this.lines.push(this.makeLine(this.seq));
+      this.seq += 1;
+    }
+    return start;
+  };
+
+  MockPane.prototype.tick = function () {
+    if (this.stopped) return;
+    this.spinnerStep = (this.spinnerStep + 1) % SPINNER.length;
+    // ~1 new line every 300 ms, driven by the demo's 150 ms clock.
+    if (this.spinnerStep % 2 === 0) {
+      this.lines.push(this.makeLine(this.seq));
+      this.seq += 1;
+    }
+  };
+
+  MockPane.prototype.spinnerLine = function () {
+    var pct = 20 + (this.spinnerStep * 7) % 79;
+    return '  ' + SPINNER[this.spinnerStep] + ' ' + PANE_NAMES[this.id] + '  working ' + pct + '%  ' +
+      '[' + '#'.repeat(Math.floor(pct / 4)) + '-'.repeat(25 - Math.floor(pct / 4)) + ']';
+  };
+
+  MockPane.prototype.screenLines = function () {
+    var body = this.lines.slice(-(this.visible - 1));
+    return body.concat([this.spinnerLine()]);
+  };
+
+  MockPane.prototype.screenText = function () {
+    return this.screenLines().join('\n') + '\n';
+  };
+
+  MockPane.prototype.scrollbackText = function (lines) {
+    var all = this.lines.concat([this.spinnerLine()]);
+    var want = Math.max(1, Math.min(lines || all.length, all.length));
+    return all.slice(-want).join('\n') + '\n';
+  };
+
+  var panes = { p1: new MockPane('p1'), p2: new MockPane('p2') };
+
+  function abortedError() {
+    try {
+      return new DOMException('The operation was aborted.', 'AbortError');
+    } catch (e) {
+      var err = new Error('aborted');
+      err.name = 'AbortError';
+      return err;
+    }
+  }
+
+  function later(fn, signal) {
+    var delay = 8 + Math.floor(Math.random() * 18); // ~14 ms average, like the measured reads
+    return new Promise(function (resolve, reject) {
+      var timer = setTimeout(function () {
+        if (signal) signal.removeEventListener('abort', onAbort);
+        resolve(fn());
+      }, delay);
+      function onAbort() {
+        clearTimeout(timer);
+        reject(abortedError());
+      }
+      if (signal) {
+        if (signal.aborted) {
+          clearTimeout(timer);
+          reject(abortedError());
+          return;
+        }
+        signal.addEventListener('abort', onAbort);
+      }
+    });
+  }
+
+  function paneFor(id) {
+    return panes[id] || panes.p1;
+  }
+
+  function readScreen(id, signal) {
+    return later(function () {
+      return { ok: true, pane_id: id, source: 'visible', text: paneFor(id).screenText() };
+    }, signal);
+  }
+
+  function readScrollback(id, lines, signal) {
+    return later(function () {
+      return { ok: true, pane_id: id, source: 'recent_unwrapped', text: paneFor(id).scrollbackText(lines) };
+    }, signal);
+  }
+
+  // --------------------------------------------------------------- engine
+  var term = window.HD.terminal.create({
+    host: document.getElementById('terminalHost'),
+    readScreen: readScreen,
+    readScrollback: readScrollback,
+    intervalMs: 150,
+    idleMs: 600,
+    scrollbackLines: 1200,
+    maxBuffer: 6000,
+    onState: function () { /* the state panel polls instead */ }
+  });
+
+  term.setPane('p1');
+  term.setActive(true);
+
+  // Mock stream clock: tick both panes whether selected or not, like a real agent.
+  (function clock() {
+    setTimeout(clock, 150);
+    panes.p1.tick();
+    panes.p2.tick();
+  })();
+
+  // --------------------------------------------------------------- state
+  var stateEl = document.getElementById('demoState');
+  (function showState() {
+    setTimeout(showState, 500);
+    var s = term.state();
+    stateEl.textContent = JSON.stringify(s) +
+      '\ninteraction: scroll up in the terminal to pause follow (a "N new \u2193" button appears); ' +
+      'select text to pause DOM updates (mode becomes selecting)';
+  })();
+
+  // ------------------------------------------------------------- buttons
+  document.querySelector('header').addEventListener('click', function (ev) {
+    var act = ev.target && ev.target.getAttribute ? ev.target.getAttribute('data-act') : null;
+    if (!act) return;
+    if (act === 'pane-p1') term.setPane('p1');
+    else if (act === 'pane-p2') term.setPane('p2');
+    else if (act === 'pane-null') term.setPane(null);
+    else if (act === 'active-on') term.setActive(true);
+    else if (act === 'active-off') term.setActive(false);
+    else if (act === 'follow-on') term.setFollow(true);
+    else if (act === 'follow-off') term.setFollow(false);
+    else if (act === 'refresh') term.refresh();
+    else if (act === 'restart') {
+      panes.p1 = new MockPane('p1');
+      panes.p2 = new MockPane('p2');
+      var current = term.state().paneId;
+      term.setPane(current);
+    }
+  });
+})();
+</script>
+</body>
+</html>

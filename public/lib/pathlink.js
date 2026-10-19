@@ -10,6 +10,11 @@
  *   HD.pathlink.mount(host, opts)  -> the module (a handle); remembers the host and decorates it
  *   HD.pathlink.unmount()          -> forget the host, stop observing, close any menu
  *   HD.pathlink.decorate(rootEl)   -> one pass over a subtree; returns a promise of its summary
+ *   HD.pathlink.decorateNodes(list) -> the same pass, restricted to the supplied roots — the way
+ *                                    chatview decorates ONLY the nodes its last render created
+ *                                    (a poll that appends one record walks one record, not the
+ *                                    whole 200-message list; this is the fix for W3's 53-90 ms
+ *                                    long task, and it is an addition — `decorate` is unchanged)
  *   HD.pathlink.state()            -> a snapshot: what it knows, what it asked, what it drew
  * and, for the tests only (the same convention as HD.chatRenderTest / HD.dockTest):
  *   HD.pathlinkTest = { candidatesIn, anchorsIn, CLS, MAX_PER_PASS, REJECT_AT, STOP }
@@ -237,6 +242,7 @@
   var links = 0;              // how many anchors this module has drawn (across passes)
   var available = true, unavailableReason = null;
   var pending = false, lastAnswer = null, lastAction = null, lastError = null, held = 0, passes = 0;
+  var lastPass = null;        // {at, nodes, textNodes, candidates}: how much the last pass walked
 
   function fetchImpl(opts) { return (opts && opts.fetch) || window.fetch; }
 
@@ -347,6 +353,29 @@
     }
     return false;
   }
+  /** The roots of one pass: a single node or an array of them, nulls dropped. */
+  function rootsOf(rootList) {
+    var list = Array.isArray(rootList) ? rootList : [rootList];
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      var r = list[i];
+      if (r && r.nodeType) out.push(r);
+    }
+    return out;
+  }
+  /** The text nodes under every root, in order. Overlapping roots are NOT deduplicated on purpose:
+   *  a text node already rewritten by the first walk offers no candidate on the second (it is either
+   *  inside a link of ours or has no anchor left), so the overlap costs one regexp run rather than a
+   *  identity set over thousands of nodes on the one pass that has to stay cheap. */
+  function textNodesOf(roots) {
+    var out = [];
+    for (var i = 0; i < roots.length; i++) {
+      var list = textNodes(roots[i]);
+      for (var j = 0; j < list.length; j++) out.push(list[j]);
+    }
+    return out;
+  }
+
   /** The text nodes under `root`, in document order, skipping anything already inside a link of ours
    *  (that text is the LAST thing we rewrote, not a new candidate), anything inside our own chrome
    *  (a path we are quoting, not a path we were asked about), and optionally one node. */
@@ -426,32 +455,48 @@
     return hits.length;
   }
 
-  /** One pass (§13.2.1): collect the candidates under `root`, ask about the new ones, and paint the
-   *  confirmed ones — including the ones confirmed by an EARLIER pass, so a re-render gets its links
-   *  back without a single new request (that is what "never re-asked" buys). */
-  function decorate(rootEl, opts) {
-    var root = rootEl || host;
-    if (!root) return Promise.resolve({ ok: false, error: 'no_root' });
-    if (!available) return Promise.resolve({ ok: false, error: 'pathinfo_unavailable' });
+  /** One pass (§13.2.1) over a SUPPLIED set of roots: collect the candidates under them, ask about
+   *  the new ones, and paint the confirmed ones — including the ones confirmed by an EARLIER pass,
+   *  so a re-render of a node gets its links back without a single new request (that is what "never
+   *  re-asked" buys, and it is why decorating only the new nodes loses nothing: the nodes that keep
+   *  their identity keep their links, and a node that is replaced is handed to this function again).
+   *
+   *  `rootList` is one node or an array of them. The summary reports both counts, so a caller (or a
+   *  probe) can see how much work a pass really did: `nodes` = roots walked, `textNodes` = text nodes
+   *  examined. Nothing about a pass is memoised except `asked`/`truth`, which is per path. */
+  function decorateNodes(rootList, opts) {
+    var roots = rootsOf(rootList);
+    if (!roots.length) return Promise.resolve({ ok: false, error: 'no_nodes', nodes: 0, textNodes: 0 });
+    if (!available) return Promise.resolve({ ok: false, error: 'pathinfo_unavailable', nodes: roots.length, textNodes: 0 });
     passes++;
-    var nodes = textNodes(root), cands = [], i, j;
+    var nodes = textNodesOf(roots), cands = [], i, j;
     for (i = 0; i < nodes.length; i++) {
       var a = anchorsIn(str(nodes[i].nodeValue));
       for (j = 0; j < a.length; j++) for (var k = 0; k < a[j].variants.length; k++) cands.push(a[j].variants[k]);
     }
     var drawn = 0;
     for (i = 0; i < nodes.length; i++) drawn += decorateNode(nodes[i], opts);
+    lastPass = { at: Date.now(), nodes: roots.length, textNodes: nodes.length, candidates: cands.length };
     return ask(cands, opts).then(function (r) {
       var more = 0;
       // The answer may name paths in nodes the walk above did not touch (a variant that only the
       // server could tell apart, or a node a re-render added while the request was in flight).
-      var again = textNodes(root);
+      var again = textNodesOf(roots);
       for (var n = 0; n < again.length; n++) more += decorateNode(again[n], opts);
-      return { ok: true, asked: r.asked || 0, drawn: drawn + more, held: held, passes: passes };
+      return { ok: true, asked: r.asked || 0, drawn: drawn + more, held: held, passes: passes,
+               nodes: roots.length, textNodes: nodes.length };
     }, function (e) {
       lastError = { code: 'decorate_failed', message: str(e && e.message || e) };
-      return { ok: false, error: lastError };
+      return { ok: false, error: lastError, nodes: roots.length, textNodes: nodes.length };
     });
+  }
+
+  /** The frozen entry point (§13.2.1): the whole mounted host, or the subtree the caller names. It is
+   *  exactly `decorateNodes([root])`, so there is one walk and one answer shape in this module. */
+  function decorate(rootEl, opts) {
+    var root = rootEl || host;
+    if (!root) return Promise.resolve({ ok: false, error: 'no_root' });
+    return decorateNodes([root], opts);
   }
 
   // ── the menu and the two actions (§13.2.4 / §13.2.5 / §13.2.7) ────────────────
@@ -715,6 +760,7 @@
       pending: pending,
       held: held,
       passes: passes,
+      last_pass: lastPass,   // what the last pass walked (roots / text nodes / candidates)
       menu: !!menu,
       menu_path: menuLink && menuLink.getAttribute ? str(menuLink.getAttribute('data-hd-path')) : null,
       note: !!noteEl,        // §13.5: the note a folder click is showing, if one is showing
@@ -729,6 +775,7 @@
     mount: mount,
     unmount: unmount,
     decorate: decorate,
+    decorateNodes: decorateNodes,   // §9/W3: decorate only the nodes a render just created
     state: state
   };
   window.HD.pathlink = mod;
