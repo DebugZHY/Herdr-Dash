@@ -226,7 +226,7 @@
 #promptResize {
   flex: 0 0 auto;
   position: relative;
-  width: min(860px, calc(100% - 28px));
+  width: calc(100% - 28px);
   height: 10px;
   margin: 0 auto;
   border-radius: 5px;
@@ -292,7 +292,7 @@
 
 #promptBox {
   flex: 0 0 auto;
-  width: min(860px, calc(100% - 28px));
+  width: calc(100% - 28px);
   height: var(--prompt-h, auto);
   min-height: 0;
   margin: 0 auto 14px;
