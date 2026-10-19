@@ -955,19 +955,22 @@ async function sendPrompt() {
 /* ------------------------------------------------------------------ *
  * steer / follow-up / bridge-visible tray
  *
- * A pi OR hermes pane whose agent_status is "working" gets the queued composer:
+ * A pi OR hermes pane whose agent_status is "working" gets the streaming controls:
  * steer delivers after the current step, follow-up after the run settles. The tray
  * shows what the bridge reports for pi and the echoed command rows plus note for
- * hermes; there is deliberately no clear/recall control.
+ * hermes; there is deliberately no clear/recall control. The tray itself follows a
+ * selected pi/hermes pane even after its status turns idle, so a non-empty queue
+ * stays visible until the bridge reports it drained.
  * ------------------------------------------------------------------ */
 
-let queuePaneId = null;      // the working pane the tray currently follows
-let queueTimer = null;       // 1.2 s refresh interval (only while that pane is working)
+let queuePaneId = null;      // the selected pi/hermes pane the tray follows
+let queueTimer = null;       // 1.2 s refresh interval while a run or queue row exists
 let queueSig = null;         // the last rendered rows (kind/id/text)
 let queueInFlight = false;   // one GET /api/queue at a time
 let queueAgain = false;      // a forced refresh arrived while one was in flight
 let queueDone = new Set();    // rows this composer sent; hidden until a queue read has shown them
 let queueSeen = new Set();    // …and then stops naming them (so a slow bridge cannot make one reappear)
+let queueHasRows = false;     // the last queue read had at least one row
 let queueHPref = (function () {   // the tray's chosen height, restored across reloads
   const v = parseInt(lsGet(LS.queueH, ''), 10);
   return (isFinite(v) && v > 0) ? v : null;
@@ -1085,9 +1088,15 @@ function wireQueueResize() {
 }
 
 function workingQueuePane() {
+  const pane = queuePane();
+  return (pane && statusOf(pane) === 'working') ? pane : null;
+}
+
+/* The tray follows the selected pi/hermes pane even when its status has just
+   flipped to idle: a non-empty queue still belongs on screen until it drains. */
+function queuePane() {
   const pane = state.selected ? findPane(state.selected) : null;
-  const queued = pane && (pane.agent === 'pi' || pane.agent === 'hermes');
-  return (queued && statusOf(pane) === 'working') ? pane : null;
+  return (pane && (pane.agent === 'pi' || pane.agent === 'hermes')) ? pane : null;
 }
 
 /* Enter = steer, Alt+Enter = follow-up — but only on a working pi or hermes pane.
@@ -1116,6 +1125,7 @@ function startQueueTimer() {
    lands here; entering the streaming state reads the queue at once. */
 function updateQueueControls() {
   const pane = workingQueuePane();
+  const trayPane = queuePane();
   const streaming = !!pane;
   const send = $('promptSend');
   const steer = $('promptSteer');
@@ -1124,21 +1134,25 @@ function updateQueueControls() {
   if (steer) steer.classList.toggle('hidden', !streaming);
   if (follow) follow.classList.toggle('hidden', !streaming);
 
-  if (!streaming) {
+  if (!trayPane) {
     stopQueueTimer();
     if (queuePaneId !== null) { queuePaneId = null; queueSig = null; queueDone.clear(); queueSeen.clear(); }
+    queueHasRows = false;
     showQueueTray([], []);
     return;
   }
 
-  if (queuePaneId !== pane.pane_id) {
-    queuePaneId = pane.pane_id;
+  if (queuePaneId !== trayPane.pane_id) {
+    queuePaneId = trayPane.pane_id;
     queueSig = null;
     queueDone.clear();
     queueSeen.clear();
-    refreshQueue(true);            // immediate read on pane/status change
+    queueHasRows = false;
+    showQueueTray([], []);          // do not show the previous pane's rows while the new read lands
+    refreshQueue(true);            // immediate read on pane change, working or not
   }
-  startQueueTimer();
+  if (streaming || queueHasRows) startQueueTimer();
+  else stopQueueTimer();
 }
 
 function queueExcerpt(text) {
@@ -1169,6 +1183,8 @@ function showQueueTray(steering, followUp, note) {
   }
   const rows = all.filter(function (row) { return !queueDone.has(row.id); });
   const noteText = String(note == null ? '' : note).trim();
+  const visible = rows.length > 0;
+  queueHasRows = visible;
   const sig = JSON.stringify({ rows: rows, note: noteText });
   if (sig === queueSig) return;
   queueSig = sig;
@@ -1199,7 +1215,6 @@ function showQueueTray(steering, followUp, note) {
   }
   /* The tray is a queue, not a status badge: with no actual queued row it stays out of the
      composer even when the agent has a note to explain what the echo means. */
-  const visible = rows.length > 0;
   tray.classList.toggle('hidden', !visible);
   if (visible) applyQueueH();
 }
@@ -1219,6 +1234,7 @@ function forgetQueuedRow(id) {
     }
     const tray = $('queueTray');
     if (tray) tray.classList.toggle('hidden', !list.querySelector('.queue-row'));
+    queueHasRows = !!list.querySelector('.queue-row');
     const note = $('queueNote');
     if (note && !list.querySelector('.queue-row')) { note.textContent = ''; note.classList.add('hidden'); }
   }
@@ -1226,7 +1242,7 @@ function forgetQueuedRow(id) {
 }
 
 async function refreshQueue(force) {
-  const pane = workingQueuePane();
+  const pane = queuePane();
   if (!pane) return;
   if (queueInFlight) { if (force) queueAgain = true; return; }
   queueInFlight = true;
@@ -1235,12 +1251,16 @@ async function refreshQueue(force) {
   queueInFlight = false;
   if (queueAgain) { queueAgain = false; refreshQueue(true); }
   /* the selection may have moved while the read was in flight */
-  const now = workingQueuePane();
+  const now = queuePane();
   if (!now || now.pane_id !== paneId || queuePaneId !== paneId) return;
   if (!body || body.ok !== true) return;   // keep the last good rows; never invent an empty tray
   /* Hermes reports an ECHO plus a note; pi's response is unchanged (and carries no note). */
   const note = now.agent === 'hermes' ? body.note : '';
   showQueueTray(body.steering, body.followUp, note);
+  /* Keep polling while a queue is visible even if the pane has gone idle; once it
+     drains and no run is active, there is nothing left to poll. */
+  if (queueHasRows || workingQueuePane()) startQueueTimer();
+  else stopQueueTimer();
 }
 
 async function sendQueued(mode) {
