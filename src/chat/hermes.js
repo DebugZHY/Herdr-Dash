@@ -57,6 +57,8 @@
  */
 
 const path = require('node:path');
+const fsp = require('node:fs/promises');
+const os = require('node:os');
 const {
   LIMITS, clampText, isBlankValue, toMs, message, planUnits, applyPlan, planBucket, absorbPairedResults,
   mergeCounts, mergeDelta, addUnits, emittedUnits, markPendingReasons,
@@ -593,7 +595,86 @@ function sessionSettings(file, sessionId) {
   }
 }
 
+/**
+ * One session's stored policy plus where the answer came from.
+ *
+ * `source` is `state.db` only when the row actually carried something: a missing row is
+ * "nothing recorded yet", which lets a caller fall back to the pane footer and say so.
+ * Never throws.
+ *
+ * @param {string} file state.db path
+ * @param {string} sessionId hermes session id
+ * @returns {{model: string|null, provider: string|null, reasoning: string|null,
+ *            found: boolean, source: string, file: string}}
+ */
+function sessionPolicy(file, sessionId) {
+  const values = sessionSettings(file, sessionId);
+  const found = !!(values.model || values.provider || values.reasoning);
+  return {
+    model: values.model,
+    provider: values.provider,
+    reasoning: values.reasoning,
+    found: found,
+    source: found ? 'state.db' : 'none',
+    file: String(file == null ? '' : file),
+  };
+}
+
+/** `$HERMES_HOME/config.yaml`, or `~/.hermes/config.yaml`; `opts.file`/`opts.home` override. */
+function configPath(opts) {
+  const o = opts || {};
+  if (o.file) return path.resolve(String(o.file));
+  if (o.home) return path.join(path.resolve(String(o.home)), 'config.yaml');
+  const home = process.env.HERMES_HOME;
+  if (home && String(home).trim()) return path.join(path.resolve(String(home).trim()), 'config.yaml');
+  return path.join(os.homedir(), '.hermes', 'config.yaml');
+}
+
+/**
+ * The `custom_providers` block of hermes' config, read from disk with no pane I/O.
+ *
+ * Each entry is `{name, baseUrl, apiKey}`; `apiKey` is for the server's own model fetch
+ * and must never be sent to a client. A provider that is not in this list is not a
+ * provider this dashboard can enumerate or switch to — callers report that as an empty
+ * list plus this note rather than inventing a row.
+ *
+ * @param {{file?: string, home?: string}} [opts]
+ * @returns {Promise<{file: string, providers: Array<{name: string, baseUrl: string, apiKey: string|null}>,
+ *                    source: string, note: string}>}
+ */
+async function configProviders(opts) {
+  const file = configPath(opts);
+  let text;
+  try { text = await fsp.readFile(file, 'utf8'); }
+  catch (e) { return { file, providers: [], source: file, note: 'no hermes config at ' + file }; }
+  const lines = text.split(/\r?\n/);
+  const out = [];
+  let inBlock = false;
+  let cur = null;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!inBlock) {
+      if (/^custom_providers:\s*$/.test(line)) inBlock = true;
+      continue;
+    }
+    if (/^\S/.test(line)) break;                       // back at column 0: the block ended
+    let m = /^\s*-\s+name:\s*(\S+)\s*$/.exec(line);
+    if (m) { cur = { name: m[1], baseUrl: null, apiKey: null }; out.push(cur); continue; }
+    if (!cur) continue;
+    if ((m = /^\s+base_url:\s*(\S+)/.exec(line))) cur.baseUrl = m[1];
+    else if ((m = /^\s+api_key:\s*(\S+)/.exec(line))) cur.apiKey = m[1];
+  }
+  const providers = out.filter((p) => p.name && p.baseUrl);
+  return {
+    file,
+    providers,
+    source: file,
+    note: providers.length ? '' : 'config.yaml has no usable custom_providers entries',
+  };
+}
+
 module.exports = {
   SOURCE_KIND, dbPath, readOnlyUri, openReadOnly, parseToolCalls, parseRow, readWindow, readTail,
   recentSessions, listSessions, sessionKnown, sessionSettings,
+  sessionPolicy, configPath, configProviders,
 };

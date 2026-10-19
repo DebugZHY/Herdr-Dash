@@ -133,9 +133,50 @@
     var scrollInFlight = false;
 
     // ------------------------------------------------------------- helpers
-    function makeRow(text) {
+    /* Rows may carry SGR escapes when the pane read asked for ANSI. They are rendered through
+       lib/ansi.js when it is loaded, and as the plain text they always were when it is not (or
+       when the row has no escape at all — the common case, and the cheap one).
+
+       `rowSrc` remembers the SOURCE line behind each row. A rendered row's textContent is the
+       escape-free text, so comparing it with the buffer would redraw every coloured row on every
+       frame; comparing the source does not. */
+    var rowSrc = [];
+
+    function ansiApi() {
+      var HDx = (typeof window !== 'undefined' && window.HD) ? window.HD : null;
+      return (HDx && HDx.ansi && typeof HDx.ansi.toNodes === 'function') ? HDx.ansi : null;
+    }
+
+    function setRowContent(row, source) {
+      var text = (source === undefined || source === null) ? '' : String(source);
+      if (text.indexOf('\u001b') < 0) { row.textContent = text; return; }
+      var api = ansiApi();
+      if (!api) { row.textContent = text; return; }
+      var out;
+      try {
+        out = api.toNodes(text);            // parsed BEFORE the row is touched
+      } catch (e) {
+        out = null;
+      }
+      if (out && out.nodeType === 11) {
+        row.textContent = '';
+        row.appendChild(out);
+        return;
+      }
+      if (out && out.length !== undefined) {
+        row.textContent = '';
+        for (var i = 0; i < out.length; i += 1) {
+          var node = out[i];
+          row.appendChild(typeof node === 'string' ? document.createTextNode(node) : node);
+        }
+        return;
+      }
+      row.textContent = text;               // no parser result (or it failed): never blank a row
+    }
+
+    function makeRow(source) {
       var row = el('div', 'hd-term-row');
-      row.appendChild(document.createTextNode(text));
+      setRowContent(row, source);
       return row;
     }
 
@@ -143,9 +184,11 @@
       listEl.innerHTML = '';
       var frag = document.createDocumentFragment();
       rows = new Array(buffer.length);
+      rowSrc = new Array(buffer.length);
       for (var i = 0; i < buffer.length; i += 1) {
         var row = makeRow(buffer[i]);
         rows[i] = row;
+        rowSrc[i] = buffer[i];
         frag.appendChild(row);
       }
       listEl.appendChild(frag);
@@ -159,11 +202,13 @@
           if (dead && dead.parentNode) dead.parentNode.removeChild(dead);
         }
         rows.length = buffer.length;
+        rowSrc.length = buffer.length;
       } else if (rows.length < buffer.length) {
         var frag = document.createDocumentFragment();
         for (i = rows.length; i < buffer.length; i += 1) {
           var row = makeRow(buffer[i]);
           rows.push(row);
+          rowSrc.push(buffer[i]);
           frag.appendChild(row);
         }
         listEl.appendChild(frag);
@@ -172,7 +217,10 @@
       for (i = 0; i < changed.length; i += 1) {
         var idx = changed[i];
         if (idx < 0 || idx >= rows.length) continue;
-        if (rows[idx].textContent !== buffer[idx]) rows[idx].textContent = buffer[idx];
+        if (rowSrc[idx] !== buffer[idx]) {
+          setRowContent(rows[idx], buffer[idx]);
+          rowSrc[idx] = buffer[idx];
+        }
       }
     }
 
@@ -191,10 +239,14 @@
         if (dead && dead.parentNode) dead.parentNode.removeChild(dead);
       }
       if (rows.length > next.length) rows.length = next.length;
+      if (rowSrc.length > next.length) rowSrc.length = next.length;
       buffer = next;
       var start = Math.max(0, buffer.length - frame.length);
       for (var j = start; j < buffer.length; j += 1) {
-        if (rows[j] && rows[j].textContent !== buffer[j]) rows[j].textContent = buffer[j];
+        if (rows[j] && rowSrc[j] !== buffer[j]) {
+          setRowContent(rows[j], buffer[j]);
+          rowSrc[j] = buffer[j];
+        }
       }
       if (follow) scrollToBottom();
       updateJump();
@@ -208,6 +260,7 @@
         if (row && row.parentNode) row.parentNode.removeChild(row);
       }
       buffer.splice(0, count);
+      rowSrc.splice(0, count);
       followAnchor = Math.max(0, followAnchor - count);
       if (!follow) {
         var removed = beforeHeight - scrollEl.scrollHeight;

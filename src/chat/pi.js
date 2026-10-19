@@ -309,22 +309,31 @@ async function sinkSettingsForPane(paneId, opts) {
       text = await fsp.readFile(best.file, 'utf8');
     } catch (e) { return Object.assign({}, empty, { file: best.file }); }
     const lines = String(text).split(/\r?\n/);
+    let model = null;
+    let level = null;
+    let protocol = 0;
+    /* A model switch and a thinking switch each write a partial settings line.
+       Scan back and merge the newest value of each field; stopping at the first
+       line that has only one of them pairs a new model with a stale level. */
     for (let i = lines.length - 1; i >= 0; i--) {
       if (!lines[i]) continue;
       let env;
       try { env = JSON.parse(lines[i]); } catch (e) { continue; }
       if (!env || env.v !== 1 || env.pane_id !== rawPane || env.type !== 'settings') continue;
-      const model = env.model || (env.data && env.data.model);
-      const level = env.thinking_level || env.thinkingLevel || (env.data && (env.data.thinking_level || env.data.thinkingLevel));
-      if (!model && !level) continue;
-      return {
-        model: typeof model === 'string' && model.trim() ? model.trim() : null,
-        thinking_level: typeof level === 'string' && level.trim() ? level.trim() : null,
-        protocol: Number.isFinite(Number(env.protocol)) ? Number(env.protocol) : 0,
-        file: best.file,
-      };
+      if (!protocol && Number.isFinite(Number(env.protocol))) protocol = Number(env.protocol);
+      const m = env.model || (env.data && env.data.model);
+      const l = env.thinking_level || env.thinkingLevel || (env.data && (env.data.thinking_level || env.data.thinkingLevel));
+      if (!model && typeof m === 'string' && m.trim()) model = m.trim();
+      if (!level && typeof l === 'string' && l.trim()) level = l.trim();
+      if (model && level) break;
     }
-    return Object.assign({}, empty, { file: best.file });
+    if (!model && !level) return Object.assign({}, empty, { file: best.file, protocol });
+    return {
+      model,
+      thinking_level: level,
+      protocol,
+      file: best.file,
+    };
   } catch (e) {
     return empty;
   }
@@ -1096,6 +1105,75 @@ async function listModelCatalogue(opts) {
   return { file, models, note: models.length ? '' : 'models.json lists no models' };
 }
 
+/** The order pi itself renders thinking levels in. */
+const PI_THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+
+/**
+ * The thinking levels the CURRENT model actually maps, read from pi's own models.json.
+ *
+ * A model without `reasoning` has exactly `off`. A model WITH reasoning follows its
+ * `thinkingLevelMap`: `null` means the level does not exist for it, `xhigh`/`max` exist
+ * only when the map names them, and the rest exist unless mapped to null. When the model
+ * is not in the catalogue (or the catalogue is unreadable) the answer is EMPTY levels and
+ * a note — the full set is never invented, because pi rejects a level the model does not
+ * map.
+ *
+ * @param {string|null} modelId
+ * @param {{agentDir?: string}} [opts]
+ * @returns {Promise<{model: string|null, provider: string|null, found: boolean,
+ *                    levels: string[], source: string, note: string}>}
+ */
+async function modelThinkingLevels(modelId, opts) {
+  const file = piModelsFile(opts);
+  const id = modelId === undefined || modelId === null ? '' : String(modelId).trim();
+  const out = { model: id || null, provider: null, found: false, levels: [], source: file, note: '' };
+  if (!id) {
+    out.note = 'no current model is known, so its thinking levels are unknown';
+    return out;
+  }
+  let raw;
+  try { raw = await fsp.readFile(file, 'utf8'); }
+  catch (e) {
+    out.note = 'no pi model catalogue at ' + file;
+    return out;
+  }
+  let doc;
+  try { doc = JSON.parse(raw); }
+  catch (e) {
+    out.note = 'models.json is not valid JSON (' + file + ')';
+    return out;
+  }
+  const providers = doc && typeof doc === 'object' && doc.providers && typeof doc.providers === 'object'
+    ? doc.providers : null;
+  if (!providers) {
+    out.note = 'models.json has no "providers" object';
+    return out;
+  }
+  for (const key of Object.keys(providers)) {
+    const provider = providers[key];
+    const rows = provider && Array.isArray(provider.models) ? provider.models : [];
+    const hit = rows.find((m) => m && (m.id === id || m.name === id));
+    if (!hit) continue;
+    out.found = true;
+    out.provider = key;
+    if (!hit.reasoning) {
+      out.levels = ['off'];
+      return out;
+    }
+    const map = hit.thinkingLevelMap && typeof hit.thinkingLevelMap === 'object' ? hit.thinkingLevelMap : {};
+    out.levels = PI_THINKING_LEVELS.filter((level) => {
+      const mapped = map[level];
+      if (mapped === null) return false;
+      if (level === 'xhigh' || level === 'max') return mapped !== undefined;
+      return true;
+    });
+    if (!out.levels.length) out.note = 'the model maps no thinking level';
+    return out;
+  }
+  out.note = 'the current model is not in models.json, so its thinking levels are unknown';
+  return out;
+}
+
 /** How much of a session file the title scan may read. A title is the first user text
  *  block; a session whose first 128 KiB holds none falls back to the file's basename. */
 const TITLE_SCAN_BYTES = 128 * 1024;
@@ -1366,6 +1444,7 @@ module.exports = {
   PI_RESUME_COMMAND, PI_MODEL_COMMAND, PI_ABORT_COMMAND, PI_NEW_COMMAND,
   resumeCommand, modelCommand, safeCommandToken,
   piAgentDir, piModelsFile, listModelCatalogue,
+  PI_THINKING_LEVELS, modelThinkingLevels,
   firstUserTitle, listSessionsForCwd,
   /* wave 3 queue control plane (pure builders + a bounded control-file reader) */
   PI_STEER_COMMAND, PI_FOLLOWUP_COMMAND, QUEUE_ITEM_TEXT_MAX, QUEUE_ITEMS_MAX,

@@ -98,6 +98,37 @@ right showing that pane's own usage and background processes.
 - **Keys**: `Ctrl+K` palette · `?` shortcuts · `Ctrl+1..9` / `j`,`k` panes · `/` prompt · `Esc` closes overlays ·
   `g b` board, `g i` inbox, `g p` palette, `g f` fan-out, `g s` search, `g g` changes · `\` collapse the sidebar.
 
+## Stream bridges (optional)
+
+Token-level live output comes from small add-ons that run **inside** the agent and write its
+stream to a local NDJSON sink; the dashboard serves that sink as SSE. Without them everything
+still works from the record logs — the conversation is just record-level, not token-level.
+
+```
+powershell -ExecutionPolicy Bypass -File tools\install-stream-bridges.ps1
+```
+
+The script copies the pi extension into `%USERPROFILE%\.pi\agent\extensions\herdr-stream`,
+copies the hermes plugin into `%LOCALAPPDATA%\hermes\plugins\herdr-stream`, enables the plugin
+(`hermes plugins enable herdr-stream`) and, unless `-NoReasoning` is passed, opts into reasoning
+deltas. It is idempotent: a target that already matches the repo is left alone, and a target that
+differs is moved aside with a timestamp before the new copy is written. Nothing is deleted and no
+agent process is touched.
+
+After installing:
+
+1. **pi** — run `/reload` in each open pi pane (new panes load the extension automatically).
+2. **hermes** — restart each hermes pane; plugins load when the agent starts.
+3. **dashboard** — reload the page.
+
+`bridge_missing` means no bridge envelope has been seen for the selected pane: the extension or
+plugin is not installed, not loaded in *that* pane, or the pane was started before the install.
+The view stays on records and the pane is never typed into.
+
+Token streaming requires a **live pane**: the sink is written by the agent process as it runs, so
+a session read from disk cannot stream, and an idle or stopped pane produces nothing until it runs
+again. Remove the add-ons with the same script and `-Uninstall`.
+
 ## What it deliberately does not do
 
 - It never writes to a pane except the prompts you send, and never through a shell.

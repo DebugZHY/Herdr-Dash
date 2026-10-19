@@ -1959,6 +1959,10 @@
       if (!node || !node.parentNode || !listEl.contains(node)) return null;
       var body = turnBody(node);
       if (!body) return null;
+      var proc = directChildOfClass(body, 'hd-cv-processwrap');
+      /* the group's user prompt is the record the turn starts on (st.rendered keeps the span, not
+         the turn descriptor), and the summary must not count it as process detail */
+      var userRec = isUserText(st.messages[g.from]) ? st.messages[g.from] : null;
       var calls = {}, idents = {}, i, m;
       for (i = g.from; i < from; i++) noteIdentity(st.messages[i], calls, idents);
       for (i = from; i < to; i++) {
@@ -1981,22 +1985,79 @@
         if (!n || n.nodeType !== 1) continue;
         var isText = ((m.kind || 'text') === 'text');
         var isReplyable = isText && m.role === 'assistant';   // A1: only an assistant text can be the reply
-        if (markReply && isText) {
-          /* mirror renderTurn(): the newest assistant text is the reply of a closed turn, every other
-             text segment (and every text of a turn that is still running) is interim */
-          if (working || !isReplyable) { if (n.classList) n.classList.add('hd-cv-interim'); }
-          else demoteReply(body);
+        if (proc) {
+          /* a closed turn's history is folded: the appended record becomes the new answer and the
+             old one joins the process body (the group's summary is recomputed below) */
+          if (markReply && isReplyable && !working) appendAnswerToGroup(body, proc, n);
+          else {
+            var box = proc.querySelector('.hd-cv-process');
+            if (isText && n.classList) n.classList.add('hd-cv-interim');
+            if (box) box.appendChild(n);
+            else body.insertBefore(n, turnTail(body));
+          }
+        } else {
+          if (markReply && isText) {
+            /* mirror renderTurn(): the newest assistant text is the reply of a closed turn, every other
+               text segment (and every text of a turn that is still running) is interim */
+            if (working || !isReplyable) { if (n.classList) n.classList.add('hd-cv-interim'); }
+            else demoteReply(body);
+          }
+          body.insertBefore(n, turnTail(body));   // the live label stays last
+          if (markReply && isReplyable && !working) promoteReply(body, n);
         }
-        body.insertBefore(n, turnTail(body));   // the live label stays last
-        if (markReply && isReplyable && !working) promoteReply(body, n);
         syncReader(st, n);                      // A2/A3: the reader's fold/open comes back with it
         made.push(n);
         noteDeco(n);
       }
+      if (proc) updateProcessSummary(st, g, to, proc, userRec);
       /* the group's record span is part of its public shape (the selftest reads it, and a reader
          asking "which records are in this turn" must see the appended ones). */
       node.setAttribute('data-turn', g.from + '-' + to);
       return made;
+    }
+
+    /** A closed turn already groups its work: a new answer moves the previous one into the folded
+        body and becomes the reply, so the group keeps its shape without redrawing the turn. */
+    function appendAnswerToGroup(body, wrap, n) {
+      var box = wrap.querySelector('.hd-cv-process');
+      var old = directChildOfClass(body, 'hd-cv-reply');
+      if (old && box) {
+        if (old.classList) { old.classList.remove('hd-cv-reply'); old.classList.add('hd-cv-interim'); }
+        box.appendChild(old);                          // moves it into the process, in log order
+      }
+      var tag = directChildOfClass(body, 'hd-cv-replytag');
+      if (tag && tag.parentNode) tag.parentNode.removeChild(tag);
+      body.insertBefore(n, turnTail(body));
+      if (n.classList) n.classList.add('hd-cv-reply');
+      body.insertBefore(el('div', 'hd-cv-replytag', 'reply'), n);
+    }
+
+    /** the fold control's own summary, recomputed through the renderer that wrote its wording */
+    function updateProcessSummary(st, g, to, wrap, userRec) {
+      var R = renderer();
+      if (!R || typeof R.processInfo !== 'function') return;
+      var segs = [], i;
+      for (i = g.from; i < to; i++) {
+        var m = st.messages[i];
+        if (!m || m.__empty) continue;
+        if (userRec && m === userRec) continue;
+        segs.push(m);
+      }
+      var info = null;
+      try { info = R.processInfo({ user: userRec, segments: segs, working: false }); } catch (e) { info = null; }
+      if (!info) return;
+      var sum = wrap.querySelector('.hd-cv-procsum');
+      if (sum) sum.textContent = info.text;
+      var note = wrap.querySelector('.hd-cv-procnotes');
+      if (info.notes) {
+        if (!note) {
+          note = el('div', 'hd-cv-procnotes', info.notes);
+          note.setAttribute('data-hd-procnotes', '1');
+          wrap.insertBefore(note, wrap.querySelector('.hd-cv-process'));
+        } else note.textContent = info.notes;
+      } else if (note && note.parentNode) {
+        note.parentNode.removeChild(note);
+      }
     }
 
     /** A1 rule 1: draw what has landed — never wait for the turn to end. */
@@ -2369,6 +2430,11 @@
         var c = ctrl.closest ? ctrl.closest('.hd-cv-card') : null;
         return c ? c.querySelector('.hd-cv-card-body') : null;
       }
+      /* the process control of a closed turn: its body is the whole hidden group, not a message */
+      if (cls.indexOf('hd-cv-procbtn') >= 0) {
+        var turn = ctrl.closest ? ctrl.closest('.hd-cv-turn') : null;
+        return turn ? turn.querySelector('.hd-cv-process') : null;
+      }
       /* the `show all` control is appended by the renderer right after the box it belongs to */
       var sib = ctrl.previousElementSibling;
       if (sib && sib.classList
@@ -2391,6 +2457,12 @@
       hit.setAttribute('aria-expanded', open ? 'true' : 'false');
       if (cls.indexOf('hd-cv-more') >= 0) hit.textContent = (open ? 'show less' : 'show all') + ' · ' + (hit.getAttribute('data-lines') || '?') + ' lines';
       else if (cls.indexOf('hd-cv-toggle') >= 0) hit.textContent = open ? 'collapse' : 'expand';
+      else if (cls.indexOf('hd-cv-procbtn') >= 0) {
+        /* the summary is the renderer's words; only the caret belongs to the state */
+        var caret = hit.querySelector ? hit.querySelector('.hd-cv-proccaret') : null;
+        if (caret) caret.textContent = open ? '▾' : '▸';
+        hit.title = open ? 'hide the records behind this answer' : 'show the records behind this answer';
+      }
       var body = bodyForControl(hit);
       if (body) {
         body.hidden = !open;
@@ -2414,12 +2486,15 @@
         if (!id || !Object.prototype.hasOwnProperty.call(st.openKeys, id)) continue;
         var want = !!st.openKeys[id];
         if ((ctrls[i].getAttribute('aria-expanded') === 'true') === want) continue;
-        var node = ctrls[i].closest ? ctrls[i].closest('.hd-cv-msg, .chat-msg') : null;
-        var m = (node && st.msgByKey) ? st.msgByKey[node.getAttribute('data-key')] : null;
+        var node = ctrls[i].closest ? ctrls[i].closest('.hd-cv-msg, .chat-msg, .hd-cv-turn') : null;
+        var key = (node && node.getAttribute) ? node.getAttribute('data-key') : null;
+        var m = (key && st.msgByKey) ? st.msgByKey[key] : null;
         if (node && m) {
           var fresh = rerenderOne(st, node, m);
           if (fresh && node.parentNode) { node.parentNode.replaceChild(fresh, node); node = fresh; }
         }
+        /* a turn-level control (the process fold) has no one message to redraw: its body is painted
+           in place, and the map already holds the reader's choice */
         if (node) paintOpen(node, id, want);
       }
     }
@@ -2436,7 +2511,7 @@
       var wasOpen = !!(control && control.getAttribute && control.getAttribute('aria-expanded') === 'true');
       var open = !wasOpen;
       st.openKeys[id] = open;
-      var node = (control && control.closest) ? control.closest('.hd-cv-msg, .chat-msg') : null;
+      var node = (control && control.closest) ? control.closest('.hd-cv-msg, .chat-msg, .hd-cv-turn') : null;
       return withStableScroll(function () {
         var m = (node && st.msgByKey) ? st.msgByKey[node.getAttribute('data-key')] : null;
         if (node && m) {

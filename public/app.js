@@ -117,6 +117,9 @@ const TOAST_MS = 4200;
    A module in this list that never loaded is simply skipped, so the missing file cannot break
    the page — and mountModules() reports what actually mounted in the header tag. */
 const MODULE_ORDER = ['palette', 'search', 'fanout', 'keys', 'board', 'inbox', 'grid', 'timebar', 'gitview'];
+/* The chat-first shell is the whole page: these older views stay in the bundle but are
+   not mounted, so they cannot add chrome, timers or a second column to the landing view. */
+const SHELL_SKIP_MODULES = { board: true, inbox: true, grid: true, timebar: true, gitview: true, dock: true };
 const STATUSES = ['working', 'blocked', 'idle', 'done', 'unknown'];
 const ROLLUP_PRIORITY = ['blocked', 'working', 'unknown', 'done', 'idle'];
 const STATUS_RANK = { blocked: 0, working: 1, done: 2, idle: 3, unknown: 4 };
@@ -345,6 +348,23 @@ function rowEl(cls) { const d = document.createElement('div'); d.className = cls
 function span(cls, text) { const s = document.createElement('span'); if (cls) s.className = cls; s.textContent = text; return s; }
 function dot(status) { const s = document.createElement('span'); s.className = 'dot ' + status; s.title = 'agent_status: ' + status; return s; }
 
+/* A short, readable label for a rail row: the pane's own title when it has one,
+   otherwise its cwd's last segment, otherwise the pane id. */
+function paneShortName(p) {
+  if (!p) return '';
+  const nm = String(paneName(p) || '').trim();
+  if (nm) {
+    const base = nm.split(/[\\/]/).filter(Boolean).pop();
+    if (base) return base;
+  }
+  const cwd = String(p.cwd || p.foreground_cwd || '').trim();
+  if (cwd) {
+    const base = cwd.split(/[\\/]/).filter(Boolean).pop();
+    if (base) return base;
+  }
+  return p.pane_id || '';
+}
+
 function renderTree() {
   const host = $('sidebarBody');
   if (!host) return;
@@ -368,21 +388,22 @@ function renderTree() {
     return;
   }
 
-  const tabs = tabsAll();
   const panes = panesAll();
 
   wss.forEach(function (w) {
     const wid = w.workspace_id;
-    const wTabs = tabs.filter(function (t) { return t && t.workspace_id === wid; });
     const wPanes = panes.filter(function (p) { return p && p.workspace_id === wid; });
+    if (!wPanes.length) return;                    // the rail is an agent list: empty groups take no room
+
     const collapsed = isCollapsed('ws', wid);
+    const group = document.createElement('div');
+    group.className = 'ws-group';
 
     const wr = rowEl('ws-row');
-    wr.title = 'workspace ' + wid;
-    const wc = span('caret' + (collapsed ? '' : ' open'), collapsed ? '▸' : '▾');
-    wr.appendChild(wc);
-    wr.appendChild(span('mono n', '#' + (w.number != null ? w.number : '?') + ' ' + (w.label || wid)));
-    wr.appendChild(span('mono dim small', '(' + wPanes.length + ')'));
+    wr.title = 'workspace ' + wid + ' — click to ' + (collapsed ? 'expand' : 'collapse');
+    wr.appendChild(span('caret' + (collapsed ? '' : ' open'), collapsed ? '▸' : '▾'));
+    wr.appendChild(span('ws-name', (w.number != null ? '#' + w.number + ' ' : '') + (w.label || wid)));
+    wr.appendChild(span('ws-count', String(wPanes.length)));
     const wst = rollup(wPanes);
     if (wst) wr.appendChild(dot(wst));
     wr.addEventListener('click', function (ev) {
@@ -390,49 +411,50 @@ function renderTree() {
       setCollapsed('ws', wid, !collapsed);
       renderTree();
     });
-    host.appendChild(wr);
-    if (collapsed) return;
+    group.appendChild(wr);
 
-    wTabs.forEach(function (t) {
-      const tid = t.tab_id;
-      const tPanes = wPanes.filter(function (p) { return p && p.tab_id === tid; });
-      const tCol = isCollapsed('tab', tid);
-
-      const tr = rowEl('tab-row');
-      tr.title = 'tab ' + tid;
-      tr.appendChild(span('caret' + (tCol ? '' : ' open'), tCol ? '▸' : '▾'));
-      tr.appendChild(span('mono n', 'tab ' + (t.number != null ? t.number : '?') + ' ' + (t.label || '')));
-      tr.appendChild(span('mono dim small', '(' + tPanes.length + ')'));
-      if (t.focused) tr.appendChild(span('focus-mark', '●'));
-      const tst = rollup(tPanes);
-      if (tst) tr.appendChild(dot(tst));
-      tr.addEventListener('click', function (ev) {
-        ev.stopPropagation();
-        setCollapsed('tab', tid, !tCol);
-        renderTree();
-      });
-      host.appendChild(tr);
-      if (tCol) return;
-
-      tPanes.forEach(function (p) {
+    if (!collapsed) {
+      const list = document.createElement('div');
+      list.className = 'ws-panes';
+      wPanes.forEach(function (p) {
         const pr = rowEl('pane-row' + (p.pane_id === state.selected ? ' selected' : ''));
-        pr.title = 'pane ' + p.pane_id + (p.cwd ? '  cwd=' + p.cwd : '');
+        pr.title = 'pane ' + p.pane_id + (p.agent ? ' · ' + p.agent : '') +
+                   (p.cwd ? '  cwd=' + p.cwd : '');
         pr.dataset.paneId = p.pane_id;                       // lib/fanout.js reads this
         pr.appendChild(dot(statusOf(p)));
-        pr.appendChild(span('mono n', p.pane_id));
-        if (p.agent) pr.appendChild(span('mono dim small', p.agent));
-        const nm = paneName(p);
-        if (nm) pr.appendChild(span('dim small n', nm));
+
+        const main = document.createElement('span');
+        main.className = 'pane-main';
+        main.appendChild(span('pane-name', paneShortName(p)));
+        const meta = document.createElement('span');
+        meta.className = 'pane-meta';
+        meta.appendChild(span('pane-id mono', p.pane_id));
+        if (p.agent) {
+          meta.appendChild(span('pane-sep', '·'));
+          meta.appendChild(span('pane-agent', p.agent));
+        }
+        main.appendChild(meta);
+        pr.appendChild(main);
+        pr.appendChild(span('pane-status small', statusOf(p)));
         if (p.focused) pr.appendChild(span('focus-mark', '●'));
-        pr.appendChild(span('badge', statusOf(p)));
+
         pr.addEventListener('click', function (ev) {
           ev.stopPropagation();
           selectPane(p.pane_id);
         });
-        host.appendChild(pr);
+        list.appendChild(pr);
       });
-    });
+      group.appendChild(list);
+    }
+    host.appendChild(group);
   });
+
+  if (!host.firstChild) {
+    const d = document.createElement('div');
+    d.className = 'muted pad';
+    d.textContent = 'no panes in snapshot';
+    host.appendChild(d);
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -1337,7 +1359,7 @@ function applySidebar(forceOpen) {
   if (handle) handle.classList.toggle('hidden', collapsed);
   const openBtn = $('sidebarToggleOpen');
   if (openBtn) openBtn.classList.toggle('hidden', !collapsed);
-  const w = parseInt(lsGet(LS.width, '300'), 10);
+  const w = parseInt(lsGet(LS.width, '280'), 10);
   if (w >= 240) document.documentElement.style.setProperty('--sidebar-w', w + 'px');
   /* a stored `collapsed` that leaves no usable way back must not survive the page load */
   if (collapsed && !restoreReachable()) {
@@ -1503,12 +1525,14 @@ function applyDockWidth() {
 function applyDock(forceOpen) {
   const dock = $('dock');
   const handle = $('dockResize');
+  const t = $('dockToggle');
+  /* the chat-first shell has no dock: no elements, no stored-state self-heal */
+  if (!dock && !handle && !t) return;
   if (forceOpen) lsSet(LS.dockOpen, '1');
   /* closed unless the user opened it: the default layout is the one every other check measures */
   const open = lsGet(LS.dockOpen, '0') === '1';
   if (dock) dock.classList.toggle('collapsed', !open);
   if (handle) handle.classList.toggle('hidden', !open);
-  const t = $('dockToggle');
   if (t) {
     t.textContent = open ? '❯' : '❮';   // ❯ / ❮, like the sidebar's pair
     t.title = open ? 'd — collapse the dock'
@@ -1526,6 +1550,7 @@ function applyDock(forceOpen) {
 }
 
 function toggleDock() {
+  if (!$('dock') && !$('dockResize') && !$('dockToggle')) return;
   const open = lsGet(LS.dockOpen, '0') === '1';
   lsSet(LS.dockOpen, open ? '0' : '1');
   applyDock();
@@ -1912,6 +1937,7 @@ function mountModules() {
   }
   state.booted = true;              // set before the loop so a module that mounts late is still tagged
   for (let i = 0; i < ids.length; i++) {
+    if (SHELL_SKIP_MODULES[ids[i]]) continue;
     const mod = HD.modules[ids[i]];
     if (mod && typeof mod.mount === 'function') mountModule(ids[i], mod);
   }
@@ -2823,12 +2849,13 @@ function chatviewApi() {
   return state.moduleApi.chatview || (window.HD && window.HD.chatview) || null;
 }
 
-/* Absent or 'raw' migrates to terminal; an explicit 'chat' is kept. */
+/* The landing view is chat. An explicit terminal choice is kept; a legacy 'raw'
+   value or no stored choice lands on chat and is written back. */
 function bootViewMode() {
   const stored = lsGet(VIEW_LS, '');
-  if (stored === 'chat') return 'chat';
-  if (stored !== 'terminal') lsSet(VIEW_LS, 'terminal');
-  return 'terminal';
+  if (stored === 'terminal') return 'terminal';
+  if (stored !== 'chat') lsSet(VIEW_LS, 'chat');
+  return 'chat';
 }
 
 /* What is actually on screen. chatview owns chat<->raw once we are not in terminal,
@@ -2958,7 +2985,8 @@ function applyView(mode, opts) {
    the engine's own timeout/backoff handling. */
 function readTermPane(paneId, source, lines, signal) {
   const url = '/api/pane?pane_id=' + encodeURIComponent(paneId) +
-              '&lines=' + encodeURIComponent(lines) + '&source=' + encodeURIComponent(source);
+              '&lines=' + encodeURIComponent(lines) + '&source=' + encodeURIComponent(source) +
+              '&format=ansi';
   return fetch(url, { signal: signal, cache: 'no-store' }).then(function (res) {
     return res.text().then(function (raw) {
       let body = null;

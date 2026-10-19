@@ -630,7 +630,13 @@ function createWriter(opts) {
     sessionStart(event, ctx) {
       if (!enabled) return null;
       updateSession(sessionOf(ctx));
-      const out = writeSettings({ type: 'settings', reason: (event && event.reason) || 'startup' });
+      /* A startup event carries no model, but the extension context already has the
+         active model and level. Writing them now lets the dashboard read settings
+         from the control record instead of the pane scrollback. */
+      const settings = { type: 'settings', reason: (event && event.reason) || 'startup' };
+      if (ctx && ctx.model) Object.assign(settings, mapping.mapSettingsModel(ctx.model));
+      if (ctx && ctx.thinkingLevel) settings.thinking_level = String(ctx.thinkingLevel);
+      const out = writeSettings(settings);
       queueClear('session_start', true);
       return out;
     },

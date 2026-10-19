@@ -46,6 +46,8 @@
  *                  .hd-cv-note .hd-cv-warn .hd-cv-more .hd-cv-sys .hd-cv-dupes
  *                  A1: .hd-cv-turn .hd-cv-turn-body .hd-cv-turn-pending .hd-cv-interim
  *                      .hd-cv-reply .hd-cv-replytag .hd-cv-working .hd-cv-working-text .hd-cv-dot
+ *                      .hd-cv-processwrap .hd-cv-procbtn .hd-cv-proccaret .hd-cv-procsum
+ *                      .hd-cv-procnotes .hd-cv-process
  *
  * A1 (round 7.1) — a turn is drawn as a group: the user's prompt is the head bubble, the agent's
  * records follow in log order as segments (thinking segment -> tool card -> interim text -> ...),
@@ -283,27 +285,40 @@
     return parts;
   }
 
-  // http/https only: no javascript:, no data:, no protocol-relative. The character class stops at
-  // quotes and angle brackets, so a URL can never swallow markup that follows it.
-  var INLINE_RE = /\*\*([^*]+)\*\*|(https?:\/\/[^\s<>"'`)\]]+)/gi;
+  /* Inline: bold, a markdown link, then a bare URL. The markdown link is tried first so that its
+     label cannot be re-read as a bare URL; only an http(s) href ever becomes an anchor, and every
+     other href (javascript:, data:, a relative or local path) is left as the text the agent wrote
+     — never a link, never an executable URL. The character class stops at quotes and angle
+     brackets, so a URL can never swallow markup that follows it. */
+  var INLINE_RE = /\*\*([^*]+)\*\*|\[([^\]\n]+)\]\(\s*<?([^)\s<>]+)>?\s*\)|(https?:\/\/[^\s<>"'`)\]]+)/gi;
 
-  function linkNode(url) {
-    if (!/^https?:\/\//i.test(url)) return document.createTextNode(url);   // belt and braces
+  /** http(s) only — the single gate every anchor below goes through. A URL carrying whitespace, a
+   *  quote or an angle bracket is not a URL we will put in an href. */
+  function safeHttpUrl(url) {
+    var s = str(url);
+    return /^https?:\/\//i.test(s) && !/[\s<>"'`]/.test(s);
+  }
+  function linkNode(url, label) {
+    if (!safeHttpUrl(url)) return document.createTextNode(label == null ? url : label);
     var a = el('a', 'hd-cv-link');
-    a.textContent = url;
+    a.textContent = label == null ? url : label;
     a.setAttribute('href', url);
     a.setAttribute('target', '_blank');
     a.setAttribute('rel', 'noopener noreferrer');
     return a;
   }
-  /** bold + bare URLs, appended as nodes. A sentence's trailing punctuation stays in the text. */
+  /** bold, markdown links and bare URLs, appended as nodes. A sentence's trailing punctuation
+   *  stays in the text; a link's label is plain text (never parsed as markup). */
   function appendRich(parent, text) {
     var s = str(text), re = new RegExp(INLINE_RE.source, 'gi'), last = 0, m;
     while ((m = re.exec(s))) {
       if (m.index > last) parent.appendChild(document.createTextNode(s.slice(last, m.index)));
       if (m[1] != null) parent.appendChild(el('strong', null, m[1]));
-      else {
-        var url = m[2], tail = '';
+      else if (m[2] != null) {
+        if (safeHttpUrl(m[3])) parent.appendChild(linkNode(m[3], m[2]));
+        else parent.appendChild(document.createTextNode(m[0]));    // unsafe href: left as written
+      } else {
+        var url = m[4], tail = '';
         while (/[.,;:!?]$/.test(url)) { tail = url.slice(-1) + tail; url = url.slice(0, -1); }
         parent.appendChild(linkNode(url));
         if (tail) parent.appendChild(document.createTextNode(tail));
@@ -1131,12 +1146,145 @@
     return n;
   }
 
+  // ── a closed turn's process fold ─────────────────────────────────────────────
+  // The answer is what the reader came for, so the records that produced it sit behind ONE control.
+  // The control carries a stable id, its state lives in `opts.openKeys` like every other collapsible
+  // block, and it is toggled by chatview.js's delegation (`data-hd-open`) — this file only draws it.
+
+  function isToolKind(m) {
+    var k = normKind(m && m.kind);
+    return k === 'tool_call' || k === 'tool_result';
+  }
+  function plural(n, one, many) { return n + ' ' + (n === 1 ? one : many); }
+  /** The control's id: derived from the turn's own first record, never from the DOM or the span, so
+   *  appending a record to the turn cannot rename the reader's fold. */
+  function procIdOf(t, kept) {
+    var first = (t && t.user) ? t.user : (kept.length ? kept[0] : null);
+    var base = first ? idBase(first) : '';
+    if (base !== '') return base + '#proc';
+    var ts = first ? tsMs(first.ts) : null;      // keyless records: the timestamp is the best name
+    return '#turn' + (ts === null ? '0' : String(ts)) + '#proc';
+  }
+  /** `N messages · M tool calls · 12s` — what the fold hides. A tool call/result record is a tool
+   *  call; every other record (thinking, interim text) is a message. The duration is the turn's own
+   *  span, prompt to answer, and is omitted when either end carries no timestamp. */
+  function processSummary(entries, toolCalls, durationMs) {
+    var msgs = entries.length - toolCalls;
+    var parts = [];
+    if (msgs > 0) parts.push(plural(msgs, 'message', 'messages'));
+    if (toolCalls > 0) parts.push(plural(toolCalls, 'tool call', 'tool calls'));
+    var dur = elapsedLabel(durationMs);
+    if (dur) parts.push(dur);
+    return parts.length ? parts.join(' · ') : plural(entries.length, 'record', 'records');
+  }
+  /** The disclosures a fold must not swallow. The records inside the fold still carry their own
+   *  notes; this line restates them ABOVE the fold so a collapsed turn never hides a server clamp or
+   *  pretends a pending call is a finished one. */
+  function disclosureNotes(entries) {
+    var textTrunc = 0, toolTrunc = 0, waiting = 0, stale = 0;
+    for (var i = 0; i < entries.length; i++) {
+      var m = entries[i].msg, kind = normKind(m && m.kind);
+      var tool = (m && m.tool && typeof m.tool === 'object') ? m.tool : {};
+      var isResult = kind === 'tool_result';
+      if (isToolKind(m)) {
+        if (tool.input_truncated || tool.result_truncated || (isResult && m.text_truncated)) toolTrunc++;
+        if (!isResult && tool.pending && resultText(m, tool, false) === null) {
+          if (tool.pending_reason === 'not_in_window') stale++;
+          else waiting++;
+        }
+      } else if (m && m.text_truncated) textTrunc++;
+    }
+    var parts = [];
+    if (textTrunc) parts.push(plural(textTrunc, 'message', 'messages') + ' truncated by the server');
+    if (toolTrunc) parts.push('tool ' + (toolTrunc === 1 ? 'output' : 'outputs') + ' truncated by the server');
+    if (waiting) parts.push(plural(waiting, 'call', 'calls') + ' waiting for a result');
+    if (stale) parts.push(plural(stale, 'call', 'calls') + ' with no result in the loaded window');
+    return parts.join(' · ');
+  }
+
+  /** The folded process: control, restated disclosures, then the hidden records themselves. */
+  function processGroup(t, kept, entries, toolCalls, durationMs, fold, opts) {
+    var o = normOpts(opts);
+    var id = procIdOf(t, kept);
+    var open = isOpen(o, id, false);            // a closed turn starts folded; openKeys always wins
+    var wrap = el('div', 'hd-cv-processwrap');
+
+    var btn = el('button', 'hd-cv-procbtn');
+    btn.setAttribute('type', 'button');
+    btn.setAttribute('data-hd-open', id);
+    btn.setAttribute('data-hd-proc', id);
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    btn.title = open ? 'hide the records behind this answer' : 'show the records behind this answer';
+    var caret = el('span', 'hd-cv-proccaret', open ? '▾' : '▸');
+    caret.setAttribute('aria-hidden', 'true');
+    btn.appendChild(caret);
+    btn.appendChild(el('span', 'hd-cv-procsum', processSummary(entries, toolCalls, durationMs)));
+    wrap.appendChild(btn);
+
+    var notes = disclosureNotes(entries);
+    if (notes) {
+      var note = el('div', 'hd-cv-procnotes', notes);
+      note.setAttribute('data-hd-procnotes', '1');
+      wrap.appendChild(note);
+    }
+
+    var box = el('div', 'hd-cv-process' + (open ? ' hd-cv-open' : ''));
+    box.hidden = !open;
+    for (var i = 0; i < entries.length; i++) {
+      var m = entries[i].msg;
+      var node = renderMessage(m, neighbourOpts(m, fold, entries[i].at, opts));
+      if (normKind(m.kind) === 'text') node.className += ' hd-cv-interim';   // not the answer
+      box.appendChild(node);
+    }
+    wrap.appendChild(box);
+    return wrap;
+  }
+
+  /** The same counts the control shows, for a caller that appends to an already-drawn turn and must
+   *  refresh its summary without redrawing the group. `turn` has the renderTurn shape ({user,
+   *  segments, working}); returns {text, notes, count, toolCalls, durationMs}. */
+  function processInfo(turn) {
+    var t = (turn && typeof turn === 'object' && !Array.isArray(turn)) ? turn : {};
+    var segs = Array.isArray(t.segments) ? t.segments : [];
+    var kept = [], i;
+    for (i = 0; i < segs.length; i++) if (!isEmptySegment(segs[i])) kept.push(segs[i]);
+    var lastText = -1;
+    if (!t.working) {
+      for (i = kept.length - 1; i >= 0; i--) {
+        if (normKind(kept[i].kind) === 'text' && normRole(kept[i].role, 'text') === 'assistant') {
+          lastText = i;
+          break;
+        }
+      }
+    }
+    var entries = [], toolCalls = 0;
+    for (i = 0; i < kept.length; i++) {
+      if (i === lastText || i > lastText) continue;
+      entries.push({ msg: kept[i], at: i });
+      if (isToolKind(kept[i])) toolCalls++;
+    }
+    var startTs = t.user ? tsMs(t.user.ts) : (kept.length ? tsMs(kept[0].ts) : null);
+    var endTs = lastText >= 0 ? tsMs(kept[lastText].ts) : null;
+    var duration = (startTs !== null && endTs !== null) ? Math.max(0, endTs - startTs) : null;
+    return {
+      text: processSummary(entries, toolCalls, duration),
+      notes: disclosureNotes(entries),
+      count: entries.length, toolCalls: toolCalls, durationMs: duration
+    };
+  }
+
   /**
    * A1: one turn as ONE visual group — the user's prompt is the head bubble, the agent's records
    * follow in log order as distinguishable segments, and the last assistant text is the closing
    * reply bubble (marked, so the answer is findable without reading the process). While `working`
    * there is no reply by construction: the group ends in renderWorkingTail() instead, and every
    * text segment is marked interim. Nothing is reordered and nothing is merged across kinds.
+   *
+   * A closed turn keeps its answer visible and puts the work behind ONE control (`N messages ·
+   * M tool calls · duration`). The control defaults to folded because the answer is what the reader
+   * came for; while a turn is running there is nothing to fold yet, so its records stay in the open
+   * (the expanded state the control would name). Server clamps and pending/stale facts are restated
+   * above the folded body, so folding can never hide a disclosure.
    */
   function renderTurn(turn, opts) {
     passBegin();
@@ -1167,18 +1315,40 @@
       }
 
       var fold = foldMap(kept), drawn = 0;
-      for (i = 0; i < kept.length; i++) {
-        if (fold.skip[i]) continue;
-        var seg = kept[i];
-        var node = renderMessage(seg, neighbourOpts(seg, fold, i, opts));
-        if (i === lastText) {
-          node.className += ' hd-cv-reply';
-          body.appendChild(el('div', 'hd-cv-replytag', 'reply'));
-        } else if (normKind(seg.kind) === 'text') {
-          node.className += ' hd-cv-interim';         // not the answer: it must not read as one
+      if (lastText >= 0) {
+        /* the answer closes the turn: the records before it are the process, the answer itself is
+           never inside the fold, and a record that came after the answer keeps its log position */
+        var answer = kept[lastText];
+        var before = [], after = [], toolCalls = 0;
+        for (i = 0; i < kept.length; i++) {
+          if (i === lastText || fold.skip[i]) continue;
+          var item = { msg: kept[i], at: i };
+          if (i < lastText) {
+            before.push(item);
+            if (isToolKind(kept[i])) toolCalls++;
+          } else after.push(item);
         }
-        body.appendChild(node);
-        drawn++;
+        var startTs = user ? tsMs(user.ts) : (kept.length ? tsMs(kept[0].ts) : null);
+        var endTs = tsMs(answer.ts);
+        var duration = (startTs !== null && endTs !== null) ? Math.max(0, endTs - startTs) : null;
+        if (before.length) body.appendChild(processGroup(t, kept, before, toolCalls, duration, fold, opts));
+        var answerNode = renderMessage(answer, neighbourOpts(answer, fold, lastText, opts));
+        answerNode.className += ' hd-cv-reply';
+        body.appendChild(el('div', 'hd-cv-replytag', 'reply'));
+        body.appendChild(answerNode);
+        for (i = 0; i < after.length; i++) {
+          body.appendChild(renderMessage(after[i].msg, neighbourOpts(after[i].msg, fold, after[i].at, opts)));
+        }
+        drawn = before.length + 1 + after.length;
+      } else {
+        for (i = 0; i < kept.length; i++) {
+          if (fold.skip[i]) continue;
+          var seg = kept[i];
+          var node = renderMessage(seg, neighbourOpts(seg, fold, i, opts));
+          if (normKind(seg.kind) === 'text') node.className += ' hd-cv-interim';   // not the answer
+          body.appendChild(node);
+          drawn++;
+        }
       }
       if (t.working) body.appendChild(renderWorkingTail(t.elapsedMs));
       else if (!drawn) {
@@ -1210,6 +1380,7 @@
     renderTurn: renderTurn,                 // A1
     renderWorkingTail: renderWorkingTail,    // A1
     foldReport: foldReport,                  // "count it", for whoever wants to show the total
+    processInfo: processInfo,                // the control's summary/notes, for an in-place append
     blockText: blockText,                    // §13.1.2: W2's copy.js consumes this
   };
   window.ChatRender = ChatRender;
@@ -1223,7 +1394,7 @@
     toolName: toolName, callKeys: callKeys, isPairedResult: isPairedResult, normKind: normKind,
     normRole: normRole, normOpts: normOpts, roleLabel: roleLabel, clip: clip, linkNode: linkNode,
     dupeNote: dupeNote, dupeIdentity: dupeIdentity, foldMap: foldMap, isEmptySegment: isEmptySegment,
-    elapsedSeconds: elapsedSeconds, elapsedLabel: elapsedLabel,
+    elapsedSeconds: elapsedSeconds, elapsedLabel: elapsedLabel, processInfo: processInfo,
     STICK_PX: STICK_PX, DEF_MAX_TEXT_LINES: DEF_MAX_TEXT_LINES, SUMMARY_MAX: SUMMARY_MAX,
   };
 })();

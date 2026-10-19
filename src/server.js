@@ -369,7 +369,7 @@ async function handleSnapshot(req, res) {
   }
 }
 
-// GET /api/pane?pane_id=..&lines=..&source=.. — tail of a pane's scrollback.
+// GET /api/pane?pane_id=..&lines=..&source=..&format=text|ansi — tail of a pane's scrollback.
 async function handlePane(req, res, url) {
   const paneId = url.searchParams.get('pane_id');
   if (!paneId) throw { code: 'bad_request', message: '"pane_id" query parameter is required' };
@@ -379,7 +379,14 @@ async function handlePane(req, res, url) {
     throw { code: 'bad_request', message: '"source" must be one of ' + [...READ_SOURCES].join(', ') };
   }
   const lines = clampLines(url.searchParams.get('lines'));
-  const format = 'text';
+  /* `format=ansi` asks herdr for its own SGR sequences and passes them through untouched;
+     the default stays `text`, which is what every existing reader expects. The format is
+     part of the cache key, so a colour read can never be served a stripped body. */
+  const rawFormat = url.searchParams.get('format');
+  const format = rawFormat === null || rawFormat === '' ? 'text' : String(rawFormat).toLowerCase();
+  if (format !== 'text' && format !== 'ansi') {
+    throw { code: 'bad_request', message: '"format" must be "text" or "ansi"' };
+  }
 
   const load = async () => {
     const result = await hdr.request(
@@ -392,6 +399,7 @@ async function handlePane(req, res, url) {
     return {
       pane_id: read.pane_id || paneId,
       source: read.source || source,
+      format: read.format === 'ansi' || format === 'ansi' ? 'ansi' : 'text',
       revision: read.revision === undefined ? null : read.revision,
       text: read.text || '',
     };
@@ -695,37 +703,30 @@ async function readRecent(paneId, lines) {
    own picker shows; the API keys stay server-side and are never returned. */
 
 const HERMES_HOME = process.env.HERMES_HOME || path.join(os.homedir(), '.hermes');
-/* pi keeps its model catalogue beside the session directory, which the chat module resolves. */
-const PI_AGENT_HOME = path.dirname(chatPi.sessionsRoot());
 const HERMES_MODEL_CACHE_MS = 5 * 60 * 1000;
+const HERMES_MODEL_STORE = path.join(os.homedir(), '.herdr-dash', 'hermes-models.json');
 let hermesModelCache = { at: 0, models: null };
+let hermesModelRefresh = null;
 
-/* the custom_providers block of $HERMES_HOME/config.yaml -> [{name, baseUrl, apiKey}].
-   A hand-rolled reader keeps the server dependency-free; it stops at the first
-   line that returns to column 0 after the block (the next top-level key). */
-async function readHermesProviders() {
-  const file = path.join(HERMES_HOME, 'config.yaml');
-  let text;
-  try { text = await fsp.readFile(file, 'utf8'); } catch (e) { return []; }
-  const lines = text.split(/\r?\n/);
-  const out = [];
-  let inBlock = false;
-  let cur = null;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (!inBlock) {
-      if (/^custom_providers:\s*$/.test(line)) inBlock = true;
-      continue;
+/* The catalogue survives a dashboard restart. Provider lists change rarely; a
+   disk copy lets the first settings read after a restart answer in milliseconds
+   while the background refresh checks the providers. */
+async function loadHermesModelStore() {
+  try {
+    const raw = await fsp.readFile(HERMES_MODEL_STORE, 'utf8');
+    const saved = JSON.parse(raw);
+    if (saved && Number.isFinite(saved.at) && saved.value && Array.isArray(saved.value.models)) {
+      hermesModelCache = { at: saved.at, models: saved.value.models, value: saved.value };
     }
-    if (/^\S/.test(line)) break;                        // back to column 0 -> block ended
-    let m = /^\s*-\s+name:\s*(\S+)\s*$/.exec(line);
-    if (m) { cur = { name: m[1], baseUrl: null, apiKey: null }; out.push(cur); continue; }
-    if (!cur) continue;
-    if ((m = /^\s+base_url:\s*(\S+)/.exec(line))) cur.baseUrl = m[1];
-    else if ((m = /^\s+api_key:\s*(\S+)/.exec(line))) cur.apiKey = m[1];
-  }
-  return out.filter((p) => p.name && p.baseUrl);
+  } catch (e) { /* no store, or an old/corrupt one: the network path is the fallback */ }
 }
+
+function saveHermesModelStore(at, value) {
+  void fsp.mkdir(path.dirname(HERMES_MODEL_STORE), { recursive: true })
+    .then(() => fsp.writeFile(HERMES_MODEL_STORE, JSON.stringify({ at, value }), 'utf8'))
+    .catch(() => {});
+}
+
 
 /* GET a provider's live model ids. base_url may or may not already carry /v1. */
 function fetchProviderModels(prov) {
@@ -754,34 +755,81 @@ function fetchProviderModels(prov) {
   });
 }
 
-/* the flat, de-duplicated model list every hermes pane can switch to, each entry
-   remembering which providers offer it. The three polyu gateways share one host,
-   so a shared model name resolves to the same endpoint regardless of which of
-   them hermes picks — the model NAME is all `/model` needs. */
-async function hermesModels() {
-  const now = Date.now();
-  if (hermesModelCache.models && (now - hermesModelCache.at) < HERMES_MODEL_CACHE_MS) {
-    return hermesModelCache.models;
-  }
-  const provs = await readHermesProviders();
+/* Rebuild the provider/model catalogue. This is the only function that may touch
+   provider APIs; callers never wait on it once a previous catalogue exists. */
+async function refreshHermesModelCatalogue(cfg, now, providerNames) {
   // One row per provider/model pair: the same model name can live behind several gateways,
   // and `/model <name> --provider <name>` chooses among them. Deduping by model name would
   // silently drop every provider but the first.
   const byPair = new Map();
-  const lists = await Promise.all(provs.map((p) => fetchProviderModels(p)));
-  for (let i = 0; i < provs.length; i++) {
+  const lists = await Promise.all(cfg.providers.map((p) => fetchProviderModels(p)));
+  for (let i = 0; i < cfg.providers.length; i++) {
     for (const id of lists[i]) {
-      const key = provs[i].name + '\u0000' + id;
-      if (!byPair.has(key)) byPair.set(key, { model: id, provider: provs[i].name, providers: [provs[i].name] });
+      const key = cfg.providers[i].name + '\u0000' + id;
+      if (!byPair.has(key)) byPair.set(key, { model: id, provider: cfg.providers[i].name, providers: [cfg.providers[i].name] });
     }
   }
   const models = Array.from(byPair.values())
     .sort((a, b) => (a.model < b.model ? -1 : a.model > b.model ? 1 : a.provider < b.provider ? -1 : a.provider > b.provider ? 1 : 0))
     .map((m, i) => ({ n: i + 1, model: m.model, provider: m.provider, providers: m.providers }));
-  if (models.length) hermesModelCache = { at: now, models };
-  return models;
+  const value = {
+    models,
+    providers: providerNames,
+    providerNames,
+    source: cfg.source,
+    note: models.length ? '' : 'none of the configured providers listed a model',
+  };
+  if (models.length || providerNames.length) {
+    hermesModelCache = { at: now, models, value };
+    saveHermesModelStore(now, value);
+  }
+  return value;
 }
 
+/* the flat, de-duplicated model list every hermes pane can switch to, each entry
+   remembering which providers offer it. The three polyu gateways share one host,
+   so a shared model name resolves to the same endpoint regardless of which of
+   them hermes picks — the model NAME is all `/model` needs. */
+async function hermesModelCatalogue() {
+  const cfg = await chatHermes.configProviders({ home: HERMES_HOME });
+  const now = Date.now();
+  const providerNames = cfg.providers.map((p) => p.name);
+  if (!cfg.providers.length) {
+    return {
+      models: [], providers: [], providerNames: [],
+      source: cfg.source, note: cfg.note,
+    };
+  }
+  if (hermesModelCache.value && (now - hermesModelCache.at) < HERMES_MODEL_CACHE_MS) {
+    return Object.assign({}, hermesModelCache.value, { providers: providerNames, providerNames, source: cfg.source });
+  }
+  /* A stale catalogue is still useful: answer from it immediately and refresh in
+     the background. Only a cold process waits for the provider round-trip. */
+  if (hermesModelCache.value) {
+    if (!hermesModelRefresh) {
+      hermesModelRefresh = refreshHermesModelCatalogue(cfg, now, providerNames)
+        .catch(() => null)
+        .finally(() => { hermesModelRefresh = null; });
+    }
+    return Object.assign({}, hermesModelCache.value, {
+      providers: providerNames, providerNames, source: cfg.source, stale: true, refreshing: true,
+    });
+  }
+  if (!hermesModelRefresh) {
+    hermesModelRefresh = refreshHermesModelCatalogue(cfg, now, providerNames)
+      .finally(() => { hermesModelRefresh = null; });
+  }
+  return hermesModelRefresh;
+}
+
+/* Warm the catalogue after listen so the first /api/model or /api/settings is
+   usually a cache hit instead of a provider round-trip. Never blocks startup. */
+function primeHermesModels() {
+  hermesModelCatalogue().catch(() => {});
+}
+
+
+/** The model rows only (existing callers); the catalogue adds source/note. */
 /* the pane's current model, read from its own status line (the ☤ bar hermes repaints). */
 async function hermesCurrentModel(paneId) {
   try {
@@ -806,14 +854,18 @@ async function paneSessionInfo(paneId) {
   const session = entry && entry.agent_session;
   const agent = String((session && session.agent) || (entry && entry.agent) || '');
   let sessionId = session && session.value != null ? String(session.value) : '';
+  let sessionSource = sessionId ? 'herdr' : '';
   // herdr never publishes a pi session id; the binding this view established for /api/chat is
   // the only source, and a pane never chatted has none yet.
   if (!sessionId && agent === 'pi') {
     const mem = readMemory.get(paneId);
-    if (mem && mem.agent === 'pi' && mem.session_id) sessionId = String(mem.session_id);
+    if (mem && mem.agent === 'pi' && mem.session_id) {
+      sessionId = String(mem.session_id);
+      sessionSource = 'chat binding';
+    }
   }
   const family = agent === 'hermes' ? 'hermes' : agent === 'claude' ? 'claude' : agent === 'pi' ? 'pi' : 'other';
-  return { agent: agent || null, family, sessionId, cwd: (entry && entry.cwd) || null, entry };
+  return { agent: agent || null, family, sessionId, sessionSource, cwd: (entry && entry.cwd) || null, entry };
 }
 
 /* a coarse "3m ago" for the session rows, so the list reads like the agents' own selectors.
@@ -1167,23 +1219,44 @@ async function handleModelGet(req, res, url) {
   const family = await agentFamilyOf(paneId);
 
   if (family === 'hermes') {
-    const models = await hermesModels();
-    if (!models.length) throw { code: 'no_models', message: 'no custom provider models found in ' + path.join(HERMES_HOME, 'config.yaml') };
+    /* Provider-qualified rows come from config.yaml's custom_providers (live /v1/models per
+       provider). The CURRENT model comes from the durable session policy in state.db first,
+       then the pane footer. Nothing is typed: a read must not send `/model`. When the current
+       provider is not a configured custom provider its model is reported as-is, with that
+       fact said out loud — never as a synthetic row. */
     const info = await paneSessionInfo(paneId);
-    const stored = chatHermes.sessionSettings(chatHermes.dbPath(), info.sessionId);
-    const cur = stored.model || await hermesCurrentModel(paneId);
-    const curProvider = stored.provider ? stored.provider.replace(/^custom:/, '') : null;
+    const cat = await hermesModelCatalogue();
+    const policy = chatHermes.sessionPolicy(chatHermes.dbPath(), info.sessionId);
+    const footer = await hermesCurrentModel(paneId);
+    const cur = policy.model || footer || null;
+    const currentSource = policy.model ? 'state.db' : (footer ? 'footer' : null);
+    let curProvider = policy.provider ? policy.provider.replace(/^custom:/, '') : null;
+    let providerSource = curProvider ? 'state.db' : null;
+    if (!curProvider && cur) {
+      const row = cat.models.find((m) => m.model === cur);
+      if (row) { curProvider = row.provider; providerSource = 'model list'; }
+    }
+    const providerListed = !curProvider || cat.providers.indexOf(curProvider) >= 0;
     let marked = false;
-    const rows = models.map((m) => {
-      const modelMatch = !!cur && m.model === cur;
-      const providerMatch = !curProvider || m.provider === curProvider;
-      const isCurrent = !marked && modelMatch && providerMatch;
+    const rows = cat.models.map((m) => {
+      const isCurrent = !marked && !!cur && m.model === cur && (!curProvider || m.provider === curProvider);
       if (isCurrent) marked = true;
       return Object.assign({}, m, { current: isCurrent });
     });
+    const notes = [];
+    if (cat.note) notes.push(cat.note);
+    if (!cur) notes.push('no model is recorded for this session yet (state.db has no row and the footer names none)');
+    if (cur && !marked) {
+      notes.push(curProvider && !providerListed
+        ? 'provider "' + curProvider + '" is not in custom_providers, so its models cannot be listed here'
+        : 'the current model is not offered by the configured providers');
+    }
     return ok(res, {
       pane_id: paneId, agent: 'hermes', current: cur, provider: curProvider,
+      source: cat.source, current_source: currentSource, provider_source: providerSource,
+      providers: cat.providers, provider_listed: providerListed,
       models: rows,
+      note: notes.length ? notes.join('; ') : undefined,
     });
   }
 
@@ -1194,15 +1267,15 @@ async function handleModelGet(req, res, url) {
      catalogue is an empty list plus a note. */
   if (family === 'pi') {
     const cat = await chatPi.listModelCatalogue();
-    /* The bridge records the last /herdr-model in its control file; the footer is the
-       fallback when pi has not been switched through the dash yet. Both are reads, never
-       commands. */
+    /* The extension's control record is tiny and authoritative; the footer is only
+       a fallback while the bridge has not reported a model. */
     const settings = await chatPi.sinkSettingsForPane(paneId);
     const bridge = await chatPi.bridgeStateForPane(paneId);
-    const line = piStatusLine(await readRecent(paneId, 40));
-    const cur = (line && line.model) || settings.model || null;
+    const line = settings.model ? null : piStatusLine(await readRecent(paneId, 40));
+    const cur = settings.model || (line && line.model) || null;
     return ok(res, {
       pane_id: paneId, agent: 'pi', current: cur, source: cat.file,
+      current_source: settings.model ? 'bridge control' : (line && line.model ? 'footer' : null),
       bridge_ready: bridge.ready,
       models: cat.models.map((m) => ({
         provider: m.provider, model: m.model, label: m.label,
@@ -1340,14 +1413,13 @@ const EFFORT_LEVELS = {
   hermes: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
   claude: ['low', 'medium', 'high', 'xhigh', 'max'],
 };
-/* Reading an effort level writes a command into the pane (hermes`/reasoning`, claude`s
-   `/effort` slider). A dashboard render must not turn that read into a poll: cache the answer,
-   coalesce concurrent reads, and never cache a failed probe. */
+/* Reading an effort level can cost a pane command on some agents, so a dashboard render must
+   not turn that read into a poll: cache the answer, coalesce concurrent reads, and never cache
+   a failed probe. */
 const EFFORT_READ_CACHE_MS = 5 * 60 * 1000;
 const effortReadCache = new Map();       // paneId -> { at, body }
 const effortReadInflight = new Map();    // paneId -> Promise<body>
 const effortReadEpoch = new Map();       // paneId -> generation, bumped by a switch
-const PI_THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 /* what the pane's own agent is doing. A read that writes a command into a busy pane — or that
    cancels one with esc — can interrupt the turn it is in the middle of, so every write below is
@@ -1391,27 +1463,11 @@ function piStatusLine(text) {
   return null;
 }
 
-/* which levels pi's current model maps. A level mapped to null does not exist for that model,
-   and xhigh/max exist only where the model maps them explicitly — the same rule pi applies. */
+/* Which levels pi's current model maps, read from pi's own models.json by the chat module.
+   Unknown is an EMPTY list plus a note: the full set is never fabricated, because pi rejects
+   a level the model does not map. */
 async function piThinkingLevels(modelId) {
-  try {
-    const raw = await fsp.readFile(path.join(PI_AGENT_HOME, 'models.json'), 'utf8');
-    const providers = (JSON.parse(raw) || {}).providers || {};
-    for (const name of Object.keys(providers)) {
-      const models = (providers[name] && providers[name].models) || [];
-      const hit = models.find((x) => x && (x.id === modelId || x.name === modelId));
-      if (!hit) continue;
-      if (!hit.reasoning) return ['off'];
-      const map = hit.thinkingLevelMap || {};
-      return PI_THINKING_LEVELS.filter((level) => {
-        const mapped = map[level];
-        if (mapped === null) return false;
-        if (level === 'xhigh' || level === 'max') return mapped !== undefined;
-        return true;
-      });
-    }
-  } catch (e) { /* no catalogue: return no levels rather than inventing a superset pi may reject */ }
-  return [];
+  return chatPi.modelThinkingLevels(modelId);
 }
 
 /* claude's /effort is a slider: a ruler line carries a ▲ under the level it is set to and the
@@ -1496,16 +1552,25 @@ async function loadEffortLevel(paneId) {
 
   if (family === 'pi') {
     const settings = await chatPi.sinkSettingsForPane(paneId);
-    const line = piStatusLine(await readRecent(paneId, 40));
-    /* The footer is what the running pi actually shows; the bridge record covers panes whose
-       footer has scrolled out of the read window. Prefer the live footer, then the record. */
-    const model = (line && line.model) || settings.model || null;
-    const current = (line && line.level) || settings.thinking_level || null;
-    const levels = await piThinkingLevels(model);
+    /* The bridge record is the cheap, authoritative source once the extension has
+       reported. The footer is only a fallback for a pane whose extension is not
+       streaming yet; reading the scrollback of a 2 MB turn on every GET is not. */
+    const line = (!settings.model || !settings.thinking_level)
+      ? piStatusLine(await readRecent(paneId, 40))
+      : null;
+    const model = settings.model || (line && line.model) || null;
+    const current = settings.thinking_level || (line && line.level) || null;
+    const thinking = await piThinkingLevels(model);
+    const levels = thinking.levels;
     return {
-      pane_id: paneId, agent: 'pi', current: current || 'off', levels: levels,
-      source: line ? 'status line' : 'bridge',
-      note: levels.length ? undefined : 'the current model is not in pi models.json, so its thinking levels are unknown',
+      pane_id: paneId, agent: 'pi',
+      current: levels.length ? current : null,
+      levels: levels,
+      source: settings.model ? 'bridge control' : (line ? 'status line' : null),
+      levels_source: thinking.source,
+      note: levels.length
+        ? undefined
+        : (thinking.note || 'the current model is not in pi models.json, so its thinking levels are unknown'),
     };
   }
 
@@ -1625,9 +1690,16 @@ async function handleEffortPost(req, res, body) {
     const settings = await chatPi.sinkSettingsForPane(paneId);
     const beforeLine = piStatusLine(await readRecent(paneId, 40));
     const beforeModel = (beforeLine && beforeLine.model) || settings.model;
-    const levels = await piThinkingLevels(beforeModel);
+    const thinking = await piThinkingLevels(beforeModel);
+    const levels = thinking.levels;
     if (levels.indexOf(level) < 0) {
-      throw { code: 'bad_request', message: 'this model does not take thinking level "' + level + '" (one of ' + levels.join(', ') + ')' };
+      throw {
+        code: 'bad_request',
+        message: (levels.length
+          ? 'this model does not take thinking level "' + level + '" (one of ' + levels.join(', ') + ')'
+          : (thinking.note || 'the current model is unknown, so no thinking level can be confirmed')),
+        extra: { levels: levels, levels_source: thinking.source },
+      };
     }
     await hdr.request('agent.prompt', { target: paneId, text: '/thinking ' + level, timeoutMs: DEFAULT_TIMEOUT_MS });
     let confirmed = false;
@@ -1697,6 +1769,226 @@ async function handleEffortPost(req, res, body) {
   }
 
   throw { code: 'no_effort', message: 'no think-effort control is known for this pane (' + family + ')' };
+}
+
+/* ── native settings (read-only aggregate) ────────────────────────────────────
+ *
+ * One answer per selected pane, so the composer can paint its model/effort/session controls
+ * from a single request. Every branch is a READ:
+ *
+ *   pi      the extension's control record, then the pane footer, then pi's models.json
+ *   hermes  state.db session policy, config.yaml, then the pane footer
+ *   claude  its session log (model) and footer (effort) — its picker is never opened
+ *
+ * Nothing here sends /model, /reasoning, /thinking, or any key.
+ */
+
+/**
+ * Did the hermes stream plugin write for this pane? Settings do not depend on it (state.db
+ * and the footer are enough), so this only reports presence — it never implies readiness of
+ * a control protocol that does not exist.
+ */
+async function hermesBridgeState(paneId) {
+  const absent = 'no hermes stream record for this pane yet — settings are read from state.db and the footer without it';
+  const note = (why) => ({ ready: false, protocol: null, note: why });
+  try {
+    const root = path.resolve(chatPi.sinkStreamRoot(process.env));
+    const dir = path.resolve(root, chatPi.sinkSafeSegment(paneId));
+    if (dir === root || !dir.startsWith(root + path.sep)) return note('the pane id does not resolve to a stream directory');
+    let names;
+    try { names = await fsp.readdir(dir); } catch (e) { return note(absent); }
+    let best = null;
+    for (const name of names) {
+      if (!name.endsWith('.ndjson')) continue;
+      const file = path.join(dir, name);
+      let st;
+      try { st = await fsp.stat(file); } catch (e) { continue; }
+      if (!st.isFile()) continue;
+      const mtimeMs = st.mtimeMs || 0;
+      if (!best || mtimeMs > best.mtimeMs) best = { file, mtimeMs };
+    }
+    if (!best) return note(absent);
+    let head = '';
+    try {
+      const fh = await fsp.open(best.file, 'r');
+      try {
+        const buf = Buffer.alloc(4096);
+        const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+        head = buf.subarray(0, bytesRead).toString('utf8').split('\n')[0];
+      } finally {
+        await fh.close().catch(() => {});
+      }
+    } catch (e) { head = ''; }
+    let env = null;
+    try { env = JSON.parse(head.replace(/\r$/, '')); } catch (e) { env = null; }
+    if (!env || env.agent !== 'hermes') return note('the newest stream record for this pane is not a hermes stream');
+    return { ready: true, protocol: null, note: 'the hermes stream bridge has written for this pane; its settings do not depend on it' };
+  } catch (e) {
+    return note('the stream directory could not be inspected');
+  }
+}
+
+/* The reasoning level hermes prints after a switch, read from its own footer text. */
+function hermesEffortIn(text) {
+  const m = lastMatch(/Reasoning effort(?:\s+set to)?\s*:?\s*'?([a-z]+)'?/gi, String(text || ''));
+  return m ? m[1].toLowerCase() : null;
+}
+
+/* GET /api/settings?pane_id=.. — one read-only aggregate for the selected pane. */
+async function handleSettingsGet(req, res, url) {
+  const paneId = url.searchParams.get('pane_id');
+  if (!paneId) throw { code: 'bad_request', message: '"pane_id" query parameter is required' };
+  const info = await paneSessionInfo(paneId);
+  const session = { id: info.sessionId || null, source: info.sessionSource || null };
+
+  if (info.family === 'pi') {
+    const bridge = await chatPi.bridgeStateForPane(paneId);
+    const settings = await chatPi.sinkSettingsForPane(paneId);
+    /* Bridge first: it is a tiny control record. The pane footer is only read when
+       the extension has not reported a model/level yet. */
+    const needFooter = !settings.model || !settings.thinking_level;
+    const line = needFooter ? piStatusLine(await readRecent(paneId, 40)) : null;
+    const cat = await chatPi.listModelCatalogue();
+    const footerModel = (line && line.model) || null;
+    const current = settings.model || footerModel || null;
+    const modelSource = settings.model ? 'bridge control' : (footerModel ? 'footer' : null);
+    const row = current ? cat.models.find((m) => m.model === current) : null;
+    const thinking = await chatPi.modelThinkingLevels(current);
+    const footerLevel = (line && line.level) || null;
+    const currentLevel = settings.thinking_level || footerLevel || null;
+    return ok(res, {
+      pane_id: paneId, agent: 'pi',
+      model: {
+        current,
+        provider: (row && row.provider) || thinking.provider || null,
+        models: cat.models.map((m) => ({
+          provider: m.provider, model: m.model, label: m.label,
+          current: !!current && (m.model === current || m.label === current),
+        })),
+        source: modelSource,
+        catalogue: cat.file,
+        note: cat.note || undefined,
+      },
+      effort: {
+        current: thinking.levels.length ? currentLevel : null,
+        levels: thinking.levels,
+        source: thinking.levels.length ? (footerLevel ? 'footer' : (settings.thinking_level ? 'bridge control' : 'none')) : 'none',
+        levels_source: thinking.source,
+        note: thinking.levels.length
+          ? undefined
+          : (thinking.note || 'the current model is not in pi models.json, so its thinking levels are unknown'),
+      },
+      bridge: { ready: bridge.ready, protocol: bridge.protocol, note: bridge.note || undefined },
+      session,
+      source: {
+        model: cat.file,
+        effort: thinking.source,
+        session: info.sessionSource || null,
+        bridge: bridge.ready ? 'control record' : null,
+      },
+    });
+  }
+
+  if (info.family === 'hermes') {
+    const cat = await hermesModelCatalogue();
+    const policy = chatHermes.sessionPolicy(chatHermes.dbPath(), info.sessionId);
+    const footerModel = await hermesCurrentModel(paneId);
+    const current = policy.model || footerModel || null;
+    let provider = policy.provider ? String(policy.provider).replace(/^custom:/, '') : null;
+    if (!provider && current) {
+      const row = cat.models.find((m) => m.model === current);
+      if (row) provider = row.provider;
+    }
+    const providerListed = !provider || cat.providers.indexOf(provider) >= 0;
+    let marked = false;
+    const rows = cat.models.map((m) => {
+      const isCurrent = !marked && !!current && m.model === current && (!provider || m.provider === provider);
+      if (isCurrent) marked = true;
+      return { provider: m.provider, model: m.model, label: m.label, current: isCurrent };
+    });
+    const paneText = await readVisible(paneId);
+    const footerLevel = hermesEffortIn(paneText);
+    const effortCurrent = footerLevel || policy.reasoning || null;
+    const bridge = await hermesBridgeState(paneId);
+    const notes = [];
+    if (cat.note) notes.push(cat.note);
+    if (current && !marked) {
+      notes.push(provider && !providerListed
+        ? 'provider "' + provider + '" is not in custom_providers, so its models cannot be listed here'
+        : 'the current model is not offered by the configured providers');
+    }
+    return ok(res, {
+      pane_id: paneId, agent: 'hermes',
+      model: {
+        current,
+        provider,
+        models: rows,
+        source: policy.model ? 'state.db' : (footerModel ? 'footer' : null),
+        catalogue: cat.source,
+        providers: cat.providers,
+        provider_listed: providerListed,
+        note: notes.length ? notes.join('; ') : undefined,
+      },
+      effort: {
+        current: effortCurrent,
+        levels: EFFORT_LEVELS.hermes,
+        source: footerLevel ? 'pane text' : (policy.reasoning ? 'state.db' : 'none'),
+        note: effortCurrent ? undefined : 'no reasoning setting recorded for this session yet',
+      },
+      bridge,
+      session,
+      source: {
+        model: cat.source,
+        effort: 'state.db + pane text',
+        session: info.sessionSource || null,
+        bridge: bridge.ready ? 'stream record' : null,
+      },
+    });
+  }
+
+  if (info.family === 'claude') {
+    /* The picker is a pane command, and a settings READ must not type: the model comes from
+       the session log and the effort level from the footer it already paints. */
+    let current = null;
+    if (info.sessionId) {
+      try {
+        const file = chatClaude.findSessionFile(info.sessionId);
+        if (file) {
+          const tail = await statusView.readUsageTail(file);
+          current = (tail && tail.model) || null;
+        }
+      } catch (e) { current = null; }
+    }
+    const footerLevel = claudeEffortFooter(await readVisible(paneId));
+    return ok(res, {
+      pane_id: paneId, agent: 'claude',
+      model: {
+        current,
+        provider: null,
+        models: [],
+        source: current ? 'session log' : null,
+        note: 'the model list is only available from the /model picker, which this read does not open',
+      },
+      effort: {
+        current: footerLevel,
+        levels: EFFORT_LEVELS.claude,
+        source: footerLevel ? 'footer' : 'none',
+        note: footerLevel ? undefined : 'the footer names no effort level right now',
+      },
+      bridge: { ready: false, protocol: null, note: 'claude is driven through its own picker; no herdr-stream bridge is involved' },
+      session,
+      source: { model: 'session log', effort: 'footer', session: info.sessionSource || null, bridge: null },
+    });
+  }
+
+  return ok(res, {
+    pane_id: paneId, agent: info.agent || null,
+    model: { current: null, provider: null, models: [], source: null, note: 'no model source is known for this pane' },
+    effort: { current: null, levels: [], source: null, note: 'no effort control is known for this pane' },
+    bridge: { ready: false, protocol: null, note: 'no bridge is involved for this pane' },
+    session,
+    source: { model: null, effort: null, session: info.sessionSource || null, bridge: null },
+  });
 }
 
 // POST /api/rpc {method, params} — raw passthrough for any herdr method.
@@ -3560,7 +3852,18 @@ function hubSubscriptions() {
 
 function onHerdrEvent(evt) {
   if (!evt || !evt.event) return;
-  broadcast({ event: evt.event, data: evt.data || {} });
+  const data = evt.data || {};
+  /* Status is the one event the composer cannot wait for a snapshot to learn: broadcast the
+     normalized frame immediately, before any topology debounce, and then stop — routing it
+     through scheduleSnapshot would cost the selected pane a full list round trip. */
+  if (evt.event === 'pane.agent_status_changed') {
+    const frame = Object.assign({}, data);
+    if (data.pane_id !== undefined && data.pane_id !== null) frame.pane_id = data.pane_id;
+    if (data.agent_status !== undefined && data.agent_status !== null) frame.agent_status = data.agent_status;
+    broadcast({ event: evt.event, data: frame });
+    return;
+  }
+  broadcast({ event: evt.event, data: data });
   // A pane appeared or vanished: refresh the pane set promptly, and let the
   // 30 s timer be the backstop.
   if (evt.event === 'pane.created' || evt.event === 'pane.closed') schedulePaneRefresh(250);
@@ -3570,10 +3873,13 @@ function onHubStatus(st) {
   if (st.state === 'connected') {
     hub.backoff = 500;
     hub.error = null;
-    if (hub.state !== 'connected') {
-      hub.state = 'connected';
-      broadcastStatus();
-    }
+    const was = hub.state;
+    hub.state = 'connected';
+    // The status subscription set is per pane: a hub that reconnects (or a first connect after
+    // herdr was down) must learn the pane set now, not on the 30 s sweep, or a selected pane's
+    // status changes would only appear after a snapshot.
+    schedulePaneRefresh(0);
+    if (was !== 'connected') broadcastStatus();
     return;
   }
 
@@ -3731,6 +4037,7 @@ async function handle(req, res) {
     if (pathname === '/api/model') return handleModelGet(req, res, url);
     if (pathname === '/api/sessions') return handleSessionsGet(req, res, url);
     if (pathname === '/api/effort') return handleEffortGet(req, res, url);
+    if (pathname === '/api/settings') return handleSettingsGet(req, res, url);
     // §2 convenience: GET /api/cli?argv=agent+list — same as the POST body, with
     // argv split on whitespace. No quoting support; use POST for arguments that
     // contain spaces.
@@ -3818,8 +4125,9 @@ function parseArgs(argv) {
   return opts;
 }
 
-function main() {
+async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  await loadHermesModelStore();
   server.on('error', (e) => {
     console.error('[herdr-dash] server error:', e.message);
     process.exitCode = 1;
@@ -3830,6 +4138,7 @@ function main() {
     console.log(`[herdr-dash] herdr pipe: ${hdr.pipe}`);
     console.log(`[herdr-dash] herdr bin:  ${HERDR_BIN}`);
     startHub();
+    primeHermesModels();
   });
 }
 

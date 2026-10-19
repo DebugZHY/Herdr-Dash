@@ -1,0 +1,325 @@
+/* herdr-dash — chat-first shell: a compact agent rail and one conversation column.
+   Reuses the palette declared in style.css; no second palette. */
+
+:root {
+  --sidebar-w: 280px;
+  --rail-row-radius: 10px;
+}
+
+/* ---------------------------------------------------------------- layout */
+
+#app {
+  grid-template-columns: auto 4px minmax(0, 1fr);
+  height: 100vh;
+  height: 100dvh;
+  background: var(--bg);
+}
+#sidebar { grid-column: 1; }
+#sidebarResize { grid-column: 2; }
+#main { grid-column: 3; }
+
+#main {
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+/* ---------------------------------------------------------------- agent rail */
+
+#sidebar {
+  width: var(--sidebar-w);
+  min-width: 240px;
+  max-width: 420px;
+  background: var(--bg-panel);
+  border-right: 1px solid var(--line);
+}
+#sidebar.collapsed {
+  width: 0 !important;
+  min-width: 0;
+  max-width: 0;
+  border-right: none;
+}
+#sidebarResize { background: transparent; cursor: col-resize; }
+#sidebarResize:hover { background: var(--accent); opacity: .35; }
+
+.side-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 12px 10px 14px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.brand { font-family: var(--mono); font-size: 15px; font-weight: 700; letter-spacing: .02em; }
+.brand-dim { color: var(--fg-dim); font-weight: 400; }
+.side-head .icon-btn { margin-left: auto; }
+
+#treeError { margin: 8px 10px 0; }
+
+#sidebarBody {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px 8px 14px;
+}
+
+.ws-group { margin: 2px 0 8px; }
+.ws-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  color: var(--fg-dim);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  user-select: none;
+}
+.ws-row:hover { background: var(--bg-panel2); color: var(--fg); }
+.ws-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ws-count { color: var(--fg-dim); font-size: 10px; }
+.ws-row .dot { margin-left: auto; }
+.ws-panes { display: flex; flex-direction: column; gap: 2px; margin-top: 3px; }
+
+.pane-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  padding: 8px 9px;
+  border: 1px solid transparent;
+  border-radius: var(--rail-row-radius);
+  cursor: pointer;
+}
+.pane-row:hover { background: var(--bg-panel2); }
+.pane-row.selected {
+  background: #151f2d;
+  border-color: #223149;
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.pane-row .dot { flex: 0 0 auto; }
+.pane-main { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1 1 auto; }
+.pane-name {
+  font-size: 12.5px;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pane-meta {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  font-size: 10.5px;
+  color: var(--fg-dim);
+}
+.pane-id { font-size: 10.5px; color: var(--fg-dim); }
+.pane-agent { text-transform: uppercase; letter-spacing: .06em; }
+.pane-status { flex: 0 0 auto; color: var(--fg-dim); font-size: 10px; }
+.focus-mark { color: var(--accent); font-size: 10px; flex: 0 0 auto; }
+
+/* ---------------------------------------------------------------- top bar */
+
+#header {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 52px;
+  padding: 8px 18px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+}
+#header .icon-btn { flex: 0 0 auto; }
+#hPane { font-size: 14px; color: var(--fg); }
+#hAgent {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--fg-dim);
+}
+.hdr-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+}
+#hStatus { font-size: 11.5px; color: var(--fg-dim); }
+#hViewMode { flex: 0 0 auto; }
+#hTermPerf { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.live { margin-left: auto; display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+#liveText { color: var(--fg-dim); }
+
+/* ---------------------------------------------------------------- conversation */
+
+#transcriptWrap {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  background: var(--bg);
+  border-bottom: none;
+  overflow: hidden;
+}
+#chatHost.chat-host {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+#transcript {
+  flex: 1 1 auto;
+  min-height: 0;
+  border: none;
+  background: var(--bg);
+}
+#hdPathHost { display: contents; }
+
+/* one centred reading column; chatview.css's own ceiling is 980px */
+.hd-cv-scroll { padding: 18px 20px 12px; }
+.hd-cv-list { max-width: 860px; margin: 0 auto; }
+
+/* ---------------------------------------------------------------- composer */
+
+#promptBox {
+  flex: 0 0 auto;
+  width: min(860px, calc(100% - 28px));
+  height: auto;
+  min-height: 0;
+  margin: 0 auto 14px;
+  padding: 10px 12px 9px;
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  overflow: visible;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, .28);
+}
+
+#promptTextRow {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  margin: 0;
+  min-height: 0;
+}
+#promptText {
+  flex: 1 1 auto;
+  min-height: 44px;
+  max-height: 160px;
+  resize: none;
+  padding: 10px 12px;
+  background: var(--bg-input);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  font: 13px/1.5 system-ui, "Segoe UI", Roboto, sans-serif;
+}
+#promptText:focus { border-color: var(--accent); outline: none; }
+#promptText::placeholder { color: var(--fg-dim); }
+
+.prompt-side {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  padding-bottom: 2px;
+}
+
+.btn {
+  padding: 7px 13px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--bg-panel2);
+  color: var(--fg);
+  font-size: 12px;
+  cursor: pointer;
+}
+.btn:hover { background: #1c2532; }
+.btn.primary {
+  background: var(--accent);
+  border-color: transparent;
+  color: #06101c;
+  font-weight: 600;
+}
+.btn.primary:hover { background: #66b2ff; }
+.btn:disabled { opacity: .5; cursor: default; }
+.queue-btn { background: transparent; color: var(--fg); }
+
+#queueTray {
+  margin: 0 0 9px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  background: var(--bg-panel2);
+}
+
+#hdAttachList, #hdAttachNote { margin-bottom: 8px; }
+
+.composer-tools {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 9px;
+}
+.tool-btn,
+.tool-select {
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--fg-dim);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.tool-btn:hover,
+.tool-select:hover { color: var(--fg); border-color: #35425a; }
+.tool-select { max-width: 280px; }
+#agentModelSel { min-width: 190px; max-width: 300px; }
+#agentEffortSel { min-width: 74px; }
+.tool-select:disabled { opacity: .55; cursor: default; }
+
+#promptResult { margin-top: 8px; }
+
+/* rounded result line inside the card */
+.result { border-radius: 8px; }
+
+/* ---------------------------------------------------------------- focus */
+
+.icon-btn:focus-visible,
+.btn:focus-visible,
+.tool-btn:focus-visible,
+.tool-select:focus-visible,
+#hViewMode:focus-visible,
+#promptAttachBtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* ---------------------------------------------------------------- small screens */
+
+@media (max-width: 820px) {
+  #app { grid-template-columns: minmax(0, 1fr); }
+  #main { grid-column: 1; }
+  #sidebarResize { display: none !important; }
+  #sidebar {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 30;
+    width: min(86vw, 320px);
+    max-width: 320px;
+    box-shadow: 8px 0 30px rgba(0, 0, 0, .45);
+  }
+  #sidebar.collapsed { width: 0 !important; box-shadow: none; }
+  #header { min-height: 48px; padding: 8px 12px; gap: 8px; }
+  #promptBox { width: calc(100% - 20px); margin-bottom: 10px; }
+  .hd-cv-scroll { padding: 14px 12px 10px; }
+  .prompt-side { flex-direction: column; align-items: stretch; }
+}

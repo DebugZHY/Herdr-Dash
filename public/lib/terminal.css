@@ -65,6 +65,48 @@
   content: "\00a0";
 }
 
+
+/* ANSI SGR (lib/ansi.js). The 16 base colours are classes so a theme can override them;
+   256-colour and 24-bit values arrive as inline colours from the parser. The hex values match
+   ansi.js BASE_HEX — change both together. */
+
+.hd-term-bold { font-weight: 600; }
+.hd-term-dim { opacity: .65; }
+
+.hd-term-fg-0 { color: #11151c; }
+.hd-term-fg-1 { color: #e5484d; }
+.hd-term-fg-2 { color: #3fb950; }
+.hd-term-fg-3 { color: #e0a02a; }
+.hd-term-fg-4 { color: #4aa3ff; }
+.hd-term-fg-5 { color: #a371f7; }
+.hd-term-fg-6 { color: #39c5cf; }
+.hd-term-fg-7 { color: #d6dee8; }
+.hd-term-fg-8 { color: #6e7681; }
+.hd-term-fg-9 { color: #ff7b72; }
+.hd-term-fg-10 { color: #56d364; }
+.hd-term-fg-11 { color: #f2cc60; }
+.hd-term-fg-12 { color: #79c0ff; }
+.hd-term-fg-13 { color: #d2a8ff; }
+.hd-term-fg-14 { color: #56d4dd; }
+.hd-term-fg-15 { color: #ffffff; }
+
+.hd-term-bg-0 { background-color: #11151c; }
+.hd-term-bg-1 { background-color: #e5484d; }
+.hd-term-bg-2 { background-color: #3fb950; }
+.hd-term-bg-3 { background-color: #e0a02a; }
+.hd-term-bg-4 { background-color: #4aa3ff; }
+.hd-term-bg-5 { background-color: #a371f7; }
+.hd-term-bg-6 { background-color: #39c5cf; }
+.hd-term-bg-7 { background-color: #d6dee8; }
+.hd-term-bg-8 { background-color: #6e7681; }
+.hd-term-bg-9 { background-color: #ff7b72; }
+.hd-term-bg-10 { background-color: #56d364; }
+.hd-term-bg-11 { background-color: #f2cc60; }
+.hd-term-bg-12 { background-color: #79c0ff; }
+.hd-term-bg-13 { background-color: #d2a8ff; }
+.hd-term-bg-14 { background-color: #56d4dd; }
+.hd-term-bg-15 { background-color: #ffffff; }
+
 .hd-term-row::selection,
 .hd-term-row *::selection {
   background: rgba(74, 163, 255, 0.35);
