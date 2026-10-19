@@ -21,8 +21,12 @@ const path = require('node:path');
 const mapping = require('./mapping.js');
 
 const VERSION = 1;
+const BRIDGE_ID = 'herdr-stream';
+const BRIDGE_PROTOCOL = 2;               // control commands + bridge-visible queue
 const AGENT = mapping.AGENT;
 const QUEUE_MAX = 20000;                 // §2 "a full queue drops the event"
+const QUEUE_ITEMS_MAX = 20;              // QUEUE-CONTRACT §C: one bounded list per kind
+const QUEUE_TEXT_MAX = 1024;            // QUEUE-CONTRACT §C: one bounded item text
 const KEEP_TURN_FILES = 20;              // §2 keep the newest 20 turn files per pane
 const MAX_AGE_MS = 2 * 60 * 60 * 1000;   // §2 delete files older than 2 hours
 const LOG_MIN_INTERVAL_MS = 1000;        // one log line per failure kind per second
@@ -64,6 +68,10 @@ function createWriter(opts) {
   let pending = { assistant: '', user: '' };
   let messageCounter = 0;
   let lastStopReason = '';
+  /* QUEUE-CONTRACT §C: the BRIDGE-VISIBLE queue — only messages accepted by
+     /herdr-steer and /herdr-followup in this process. pi's own TUI queue is not read
+     and not claimed; an item leaves when its user message starts, or on a clear. */
+  const queueState = { steering: [], followUp: [] };
   let cleaning = false;
   let cleanupPromise = Promise.resolve();
 
@@ -256,6 +264,8 @@ function createWriter(opts) {
     if (!enabled) return null;
     const out = {
       v: VERSION,
+      bridge: BRIDGE_ID,
+      protocol: BRIDGE_PROTOCOL,
       seq: nextSeq(),
       ts: now(),
       agent: AGENT,
@@ -289,6 +299,98 @@ function createWriter(opts) {
   function writeTurn(partial) {
     if (!turn) return null;
     return enqueueEnvelope(partial, turn.file, turn.id);
+  }
+
+  /* ── QUEUE-CONTRACT §C: the bridge-visible queue ─────────────────────────── */
+
+  /** §C: queue envelopes ALWAYS use `<session>__control.ndjson`, even with a turn open. */
+  function queueFile() {
+    return path.join(paneDir, mapping.controlFileName(sessionId));
+  }
+
+  function queueList(kind) {
+    return kind === 'steer' ? queueState.steering : queueState.followUp;
+  }
+
+  function queueItemCopy(item) {
+    return { id: item.id, kind: item.kind, text: item.text, at: item.at };
+  }
+
+  /**
+   * §C.4: one envelope per change, with the same async writer queue as the token path.
+   * Bounded: at most QUEUE_ITEMS_MAX items per list and QUEUE_TEXT_MAX bytes per item, so
+   * an envelope can never approach MAX_LINE_BYTES.
+   */
+  function writeQueue(reason) {
+    if (!enabled) return null;
+    return enqueueEnvelope({
+      type: 'queue',
+      session_id: sessionId,
+      steering: queueState.steering.map(queueItemCopy),
+      followUp: queueState.followUp.map(queueItemCopy),
+      updated_at: now(),
+      reason: reason === undefined || reason === null ? '' : String(reason),
+    }, queueFile(), mapping.CONTROL_TURN_ID);
+  }
+
+  /** §C.2 delivery signal: trim-normalized text equality (a truncated item matches its head). */
+  function sameQueueText(itemText, messageText) {
+    const a = mapping.str(itemText).trim();
+    const b = mapping.str(messageText).trim();
+    if (!a || !b) return false;
+    if (a === b) return true;
+    if (!a.endsWith(mapping.TRUNCATION_MARK)) return false;
+    const head = a.slice(0, a.length - mapping.TRUNCATION_MARK.length);
+    return !!head && b.startsWith(head);
+  }
+
+  /** §C.1: record an item the extension accepted (never invents one, never throws). */
+  function queueAdd(entry) {
+    if (!enabled) return null;
+    const e = entry || {};
+    const kind = e.kind === 'steer' ? 'steer' : (e.kind === 'followup' ? 'followup' : '');
+    const text = mapping.str(e.text);
+    if (!kind || !text.trim()) return null;
+    const list = queueList(kind);
+    list.push({
+      id: e.id === undefined || e.id === null ? '' : mapping.str(e.id),
+      kind,
+      text: mapping.boundText(text, QUEUE_TEXT_MAX) || '',
+      at: now(),
+    });
+    if (list.length > QUEUE_ITEMS_MAX) list.splice(0, list.length - QUEUE_ITEMS_MAX);
+    return writeQueue(kind);
+  }
+
+  /** §C.2: a user message that starts is delivered, so its item leaves the tray. */
+  function queueRemoveText(messageText) {
+    if (!enabled) return null;
+    const text = mapping.str(messageText);
+    if (!text.trim()) return null;
+    for (const kind of ['steer', 'followup']) {
+      const list = queueList(kind);
+      for (let i = 0; i < list.length; i += 1) {
+        if (!sameQueueText(list[i].text, text)) continue;
+        list.splice(i, 1);
+        return writeQueue('delivered');
+      }
+    }
+    return null;
+  }
+
+  /**
+   * §C.3/§C.4: `agent_settled`, `session_start`, `session_shutdown` empty both lists and
+   * write a fresh envelope after the clear. `force` writes that empty envelope even when the
+   * lists were already empty (a session boundary); without it an event that changed nothing
+   * writes nothing, so a repeated `agent_settled` cannot grow seq.
+   */
+  function queueClear(reason, force) {
+    if (!enabled) return null;
+    const had = queueState.steering.length > 0 || queueState.followUp.length > 0;
+    queueState.steering.length = 0;
+    queueState.followUp.length = 0;
+    if (!had && force !== true) return null;
+    return writeQueue(reason || 'clear');
   }
 
   /**
@@ -442,7 +544,10 @@ function createWriter(opts) {
       }
       const messageId = mapping.messageIdFor(message, turn.id, messageCounter || 1);
       pending[role] = messageId;
-      return writeTurn(mapping.mapMessageStart(message, messageId));
+      const out = writeTurn(mapping.mapMessageStart(message, messageId));
+      // §C.2: the delivery signal is a user message whose text matches a queued item.
+      if (role === 'user') queueRemoveText(mapping.messageText(message));
+      return out;
     },
 
     messageUpdate(event, ctx) {
@@ -502,6 +607,9 @@ function createWriter(opts) {
     settled(event, ctx) {
       if (!enabled) return null;
       if (ctx) updateSession(sessionOf(ctx));
+      // §C.3: the run is over, so the bridge-visible queue is empty — even when no turn
+      // file was open (an accepted steer/follow-up may outlive a turn that never started).
+      queueClear('settled', !!turn);
       if (!turn) return null;
       const status = mapping.turnEndStatus(event && event.aborted === true, lastStopReason);
       const out = writeTurn({ type: 'turn_end', status });
@@ -522,7 +630,9 @@ function createWriter(opts) {
     sessionStart(event, ctx) {
       if (!enabled) return null;
       updateSession(sessionOf(ctx));
-      return writeSettings({ type: 'settings', reason: (event && event.reason) || 'startup' });
+      const out = writeSettings({ type: 'settings', reason: (event && event.reason) || 'startup' });
+      queueClear('session_start', true);
+      return out;
     },
 
     thinkingLevelSelect(event, ctx) {
@@ -535,6 +645,7 @@ function createWriter(opts) {
     shutdown(event, ctx) {
       if (!enabled) return null;
       if (ctx) updateSession(sessionOf(ctx));
+      queueClear('shutdown', true);
       if (!turn) return null;
       const out = writeTurn({ type: 'turn_end', status: 'aborted' });
       push({ kind: 'close' }, true);
@@ -543,6 +654,17 @@ function createWriter(opts) {
       toolAlias = new Map();
       pending = { assistant: '', user: '' };
       return out;
+    },
+
+    /** §C.1/§C.2/§C.3 — used by the /herdr-steer and /herdr-followup commands. */
+    queueAdd,
+    queueRemoveText,
+    queueClear,
+    queueSnapshot() {
+      return {
+        steering: queueState.steering.map(queueItemCopy),
+        followUp: queueState.followUp.map(queueItemCopy),
+      };
     },
 
     /** Resolves when the queue and any pending cleanup are done, or after `timeoutMs`. */
@@ -569,6 +691,8 @@ function createWriter(opts) {
         turnId: turn ? turn.id : '',
         file: turn ? turn.file : '',
         sessionId,
+        queueSteering: queueState.steering.length,
+        queueFollowUp: queueState.followUp.length,
       };
     },
   };
@@ -617,6 +741,12 @@ function createPiBridge(opts) {
     stats: () => writer.stats(),
     flush: (timeoutMs) => writer.flush(timeoutMs),
 
+    /** QUEUE-CONTRACT §B/§C: the extension's queue commands write through these. */
+    queueAdd: guard(writer.queueAdd),
+    queueRemoveText: guard(writer.queueRemoveText),
+    queueClear: guard(writer.queueClear),
+    queueSnapshot: () => writer.queueSnapshot(),
+
     turnStart: guard(writer.turnStart),
     messageStart: guard(writer.messageStart),
     messageUpdate: guard(writer.messageUpdate),
@@ -626,6 +756,8 @@ function createPiBridge(opts) {
     toolEnd: guard(writer.toolEnd),
     modelSelect: guard(writer.modelSelect),
     thinkingLevelSelect: guard(writer.thinkingLevelSelect),
+    /** `session_start`: settings + the §C.3 queue clear (index.ts has always called this). */
+    sessionStart: guard(writer.sessionStart),
 
     /** `agent_settled`: turn_end + close, then flush so the file is complete on return. */
     async settled(event, ctx) {
@@ -656,8 +788,13 @@ module.exports = {
   QUEUE_MAX,
   KEEP_TURN_FILES,
   MAX_AGE_MS,
+  QUEUE_ITEMS_MAX,
+  QUEUE_TEXT_MAX,
   createWriter,
   createPiBridge,
   sessionOf,
   noop,
+  /** QUEUE-CONTRACT §B: re-exported so `index.ts` reads the argument parser from the
+   *  module it already imports (both sides must parse the command the same way). */
+  parseQueueArgument: mapping.parseQueueArgument,
 };

@@ -554,7 +554,46 @@ function readTail(file, sessionId, limit, opts) {
   }
 }
 
+/**
+ * Read one session's model/provider/reasoning settings without touching the pane.
+ *
+ * The TUI stores the frozen session policy in `sessions.model_config` (the same
+ * JSON hermes' `config.get` reports); `sessions.model` is the model. A missing
+ * row means "not known yet", never a reason to type a command. Never throws.
+ *
+ * @param {string} file state.db path
+ * @param {string} sessionId hermes session id
+ * @returns {{model: string|null, provider: string|null, reasoning: string|null}}
+ */
+function sessionSettings(file, sessionId) {
+  const empty = { model: null, provider: null, reasoning: null };
+  const id = String(sessionId == null ? '' : sessionId).trim();
+  if (!id) return empty;
+  let db;
+  try {
+    db = openReadOnly(file);
+    const row = db.prepare('SELECT model, model_config FROM sessions WHERE id = ? LIMIT 1').get(id);
+    if (!row) return empty;
+    let cfg = {};
+    try { cfg = row.model_config ? JSON.parse(String(row.model_config)) : {}; } catch (e) { cfg = {}; }
+    const reasoning = cfg && cfg.reasoning_config && typeof cfg.reasoning_config === 'object'
+      ? (cfg.reasoning_config.enabled === false ? 'none' : (cfg.reasoning_config.effort || null))
+      : null;
+    const provider = (cfg && (cfg.provider || (cfg.gateway_runtime && cfg.gateway_runtime.provider))) || null;
+    const model = (cfg && cfg.model) || (row.model == null ? null : String(row.model));
+    return {
+      model: model ? String(model) : null,
+      provider: provider ? String(provider) : null,
+      reasoning: reasoning ? String(reasoning) : null,
+    };
+  } catch (e) {
+    return empty;
+  } finally {
+    try { if (db) db.close(); } catch (e) { /* already gone */ }
+  }
+}
+
 module.exports = {
   SOURCE_KIND, dbPath, readOnlyUri, openReadOnly, parseToolCalls, parseRow, readWindow, readTail,
-  recentSessions, listSessions, sessionKnown,
+  recentSessions, listSessions, sessionKnown, sessionSettings,
 };

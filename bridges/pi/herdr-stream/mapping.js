@@ -364,6 +364,33 @@ function mapTurnStart(turnIndex) {
   return out;
 }
 
+/* ── QUEUE-CONTRACT §B: the command argument ───────────────────────────────── */
+
+/**
+ * `/herdr-steer <argument>` -> `{ id, text, json }`.
+ *
+ * The dashboard writes one compact JSON object after the command name:
+ *
+ *   /herdr-steer {"id":"q-...","text":"focus on the failing test"}
+ *
+ * A human may type `/herdr-steer focus on the failing test` instead. Only a valid JSON
+ * OBJECT that carries a string `text` is the structured form; anything else — invalid
+ * JSON, an array, a JSON object without `text` — is the plain-text form, where the WHOLE
+ * argument (JSON punctuation included) is the text and the id is empty (§B). Total: no
+ * input shape throws.
+ */
+function parseQueueArgument(argument) {
+  const raw = str(argument);
+  const plain = { id: '', text: raw, json: false };
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.charAt(0) !== '{') return plain;
+  let doc;
+  try { doc = JSON.parse(trimmed); } catch (err) { return plain; }
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return plain;
+  if (typeof doc.text !== 'string') return plain;
+  return { id: typeof doc.id === 'string' ? doc.id.trim() : '', text: doc.text, json: true };
+}
+
 module.exports = {
   AGENT,
   SAFE_LEN,
@@ -401,4 +428,5 @@ module.exports = {
   mapSettingsThinking,
   turnEndStatus,
   mapTurnStart,
+  parseQueueArgument,
 };

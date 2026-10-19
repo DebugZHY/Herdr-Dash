@@ -297,6 +297,29 @@ html, body {
 #promptText:focus { outline: none; border-color: var(--accent); }
 .prompt-side { display: flex; flex-direction: column; gap: 4px; align-items: stretch; flex: 0 0 auto; }
 
+/* the streaming pi composer and the bridge-visible queue tray above #promptTextRow.
+   The tray keeps the panel compact and scrolls internally; .hidden hides it when empty. */
+.queue-btn { border-color: var(--line); }
+.queue-tray {
+  display: flex; align-items: flex-start; gap: 8px;
+  margin: 0 0 6px; padding: 4px 8px;
+  max-height: 88px; overflow-y: auto;
+  background: var(--bg-panel2); border: 1px solid var(--line); border-radius: 4px;
+  font-size: 11.5px;
+}
+.queue-label { flex: 0 0 auto; color: var(--fg-dim); font-family: var(--mono); }
+.queue-list { display: flex; flex-direction: column; gap: 2px; flex: 1 1 auto; min-width: 0; }
+.queue-row { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.queue-kind {
+  flex: 0 0 auto; padding: 0 6px; border: 1px solid var(--line); border-radius: 8px;
+  color: var(--accent); font-family: var(--mono); font-size: 10.5px;
+}
+.queue-row[data-kind="followup"] .queue-kind { color: var(--st-unknown); }
+.queue-text {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--fg); font-family: var(--mono);
+}
+
 .chk { display: flex; align-items: center; gap: 4px; color: var(--fg-dim); font-size: 11.5px; white-space: nowrap; }
 
 .btn {

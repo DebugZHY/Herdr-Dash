@@ -490,6 +490,9 @@ function renderHeader() {
   if (typeof window.__hdUpdateModelSel === 'function') window.__hdUpdateModelSel();
   if (typeof window.__hdUpdateEffortSel === 'function') window.__hdUpdateEffortSel();
   if (typeof window.__hdSessionFollowSelection === 'function') window.__hdSessionFollowSelection();
+  /* the queue controls follow the selected pane's agent and status; a broken queue read
+     must never break the header */
+  try { updateQueueControls(); } catch (e) { /* the queue UI is additive */ }
 }
 
 function renderAge() {
@@ -817,6 +820,188 @@ async function sendPrompt() {
   if (plan.paths && plan.paths.length && cv && typeof cv.clearAttachments === 'function') {
     try { cv.clearAttachments(); } catch (e) { /* a broken chat view must not break sending */ }
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * pi steer / follow-up / bridge-visible tray
+ *
+ * Only a pi pane whose agent_status is "working" gets the queued composer: steer
+ * delivers after the current step, follow-up after the run settles. The tray shows
+ * what the bridge reports in its control NDJSON — never pi's own TUI queue — and
+ * there is deliberately no clear/recall control.
+ * ------------------------------------------------------------------ */
+
+let queuePaneId = null;      // the pi pane the tray currently follows
+let queueTimer = null;       // 2 s refresh interval (only while that pane is working)
+let queueSig = null;         // the last rendered rows (kind/id/text)
+let queueInFlight = false;   // one GET /api/queue at a time
+let queueAgain = false;      // a forced refresh arrived while one was in flight
+
+function workingPiPane() {
+  const pane = state.selected ? findPane(state.selected) : null;
+  return (pane && pane.agent === 'pi' && statusOf(pane) === 'working') ? pane : null;
+}
+
+/* Enter = steer, Alt+Enter = follow-up — but only on a working pi pane. Every other
+   pane (and Shift+Enter) keeps the pre-existing behaviour. */
+function queueActionForEnter(pane, ev) {
+  if (!pane || pane.agent !== 'pi' || statusOf(pane) !== 'working') return null;
+  if (!ev || ev.key !== 'Enter' || ev.shiftKey) return null;
+  return ev.altKey ? 'followup' : 'steer';
+}
+
+function stopQueueTimer() {
+  if (queueTimer !== null) {
+    try { window.clearInterval(queueTimer); } catch (e) { /* ignore */ }
+    queueTimer = null;
+  }
+}
+
+function startQueueTimer() {
+  if (queueTimer !== null) return;
+  queueTimer = window.setInterval(function () { refreshQueue(false); }, 2000);
+}
+
+/* Show the streaming composer only for a working pi pane; everything else keeps the
+   normal send button. Called from renderHeader(), so a pane or status change lands
+   here; entering the streaming state reads the queue at once. */
+function updateQueueControls() {
+  const pane = workingPiPane();
+  const streaming = !!pane;
+  const send = $('promptSend');
+  const steer = $('promptSteer');
+  const follow = $('promptFollowup');
+  if (send) send.classList.toggle('hidden', streaming);
+  if (steer) steer.classList.toggle('hidden', !streaming);
+  if (follow) follow.classList.toggle('hidden', !streaming);
+
+  if (!streaming) {
+    stopQueueTimer();
+    if (queuePaneId !== null) { queuePaneId = null; queueSig = null; }
+    showQueueTray([], []);
+    return;
+  }
+
+  if (queuePaneId !== pane.pane_id) {
+    queuePaneId = pane.pane_id;
+    queueSig = null;
+    refreshQueue(true);            // immediate read on pane/status change
+  }
+  startQueueTimer();
+}
+
+function queueExcerpt(text) {
+  return String(text == null ? '' : text).replace(/\s+/g, ' ').trim().slice(0, 120);
+}
+
+function queueItems(list, kind) {
+  if (!Array.isArray(list)) return [];
+  return list.filter(function (item) { return item && typeof item === 'object'; })
+    .map(function (item) {
+      return { kind: kind, id: String(item.id == null ? '' : item.id), text: String(item.text == null ? '' : item.text) };
+    });
+}
+
+/* Rebuild the tray only when the visible rows changed; a malformed/missing array simply
+   contributes no rows — never an exception. */
+function showQueueTray(steering, followUp) {
+  const rows = queueItems(steering, 'steer').concat(queueItems(followUp, 'followup'));
+  const sig = JSON.stringify(rows);
+  if (sig === queueSig) return;
+  queueSig = sig;
+
+  const tray = $('queueTray');
+  const list = $('queueList');
+  if (!tray || !list) return;
+  list.textContent = '';
+  for (let i = 0; i < rows.length; i++) {
+    const row = document.createElement('div');
+    row.className = 'queue-row';
+    row.dataset.kind = rows[i].kind;
+    const kind = document.createElement('span');
+    kind.className = 'queue-kind';
+    kind.textContent = rows[i].kind === 'followup' ? 'follow-up' : 'steer';
+    const text = document.createElement('span');
+    text.className = 'queue-text';
+    text.textContent = queueExcerpt(rows[i].text) || '(empty)';
+    row.appendChild(kind);
+    row.appendChild(text);
+    list.appendChild(row);
+  }
+  tray.classList.toggle('hidden', rows.length === 0);
+}
+
+async function refreshQueue(force) {
+  const pane = workingPiPane();
+  if (!pane) return;
+  if (queueInFlight) { if (force) queueAgain = true; return; }
+  queueInFlight = true;
+  const paneId = pane.pane_id;
+  const body = await api('/api/queue?pane_id=' + encodeURIComponent(paneId));
+  queueInFlight = false;
+  if (queueAgain) { queueAgain = false; refreshQueue(true); }
+  /* the selection may have moved while the read was in flight */
+  const now = workingPiPane();
+  if (!now || now.pane_id !== paneId || queuePaneId !== paneId) return;
+  if (!body || body.ok !== true) return;   // keep the last good rows; never invent an empty tray
+  showQueueTray(body.steering, body.followUp);
+}
+
+async function sendQueued(mode) {
+  const kind = (mode === 'followup') ? 'followup' : 'steer';
+  const ta = $('promptText');
+  if (!ta || !needPane()) return false;
+  if (!workingPiPane()) {
+    flashResult(false, 'steer/follow-up are only available while a pi pane is working');
+    return false;
+  }
+  const typed = ta.value;
+  /* The chat view owns the composed text, so attachments take exactly the same path as a
+     normal prompt. A blocked upload sends NOTHING. */
+  const cv = attachApi();
+  const plan = (cv && typeof cv.composeSend === 'function')
+    ? cv.composeSend(state.selected, typed)
+    : { ok: true, text: typed, paths: [] };
+  if (!plan || plan.ok !== true) {
+    flashResult(false, (plan && plan.why) || 'sending is blocked — an attachment is not ready');
+    return false;
+  }
+  const text = plan.text;
+  if (!String(text).trim()) { flashResult(false, 'nothing to send (empty prompt)'); return false; }
+
+  const btn = $(kind === 'steer' ? 'promptSteer' : 'promptFollowup');
+  if (btn) btn.disabled = true;
+  flashResult(true, kind === 'steer' ? 'steering…' : 'queuing follow-up…');
+  const body = await postJSON('/api/pane/prompt', { pane_id: state.selected, text: text, mode: kind });
+  if (btn) btn.disabled = false;
+
+  if (!body.ok) {
+    /* A 409 not_streaming leaves the text exactly where it is. */
+    const code = body.error && body.error.code;
+    flashResult(false, (code === 'not_streaming' ? 'not streaming — ' : (kind + ' failed — ')) + errText(body));
+    if (code === 'not_streaming') scheduleSnapshot();   // our agent_status is stale
+    return false;
+  }
+
+  const item = body.item || {};
+  flashResult(true, (kind === 'steer' ? 'steer queued' : 'follow-up queued') +
+    (item.id ? ' · ' + item.id : ''));
+  ta.value = '';                                     // only after the queue accepted it
+  if (plan.paths && plan.paths.length && cv && typeof cv.clearAttachments === 'function') {
+    try { cv.clearAttachments(); } catch (e) { /* a broken chat view must not break sending */ }
+  }
+  refreshQueue(true);                                // immediate post-action read
+  return true;
+}
+
+/* The textarea's Enter behaviour: Shift+Enter stays a newline (no preventDefault);
+   otherwise a working pi pane steers/follows and every other pane sends normally. */
+function handlePromptKeydown(ev) {
+  if (!ev || ev.key !== 'Enter' || ev.shiftKey) return null;
+  const mode = queueActionForEnter(findPane(state.selected), ev);
+  ev.preventDefault();
+  if (mode) return sendQueued(mode);
+  return sendPrompt();
 }
 
 /* ------------------------------------------------------------------ *
@@ -3115,11 +3300,15 @@ function init() {
 
   // prompt box
   const ta = $('promptText');
-  if (ta) ta.addEventListener('keydown', function (e) {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendPrompt(); }
-  });
+  if (ta) ta.addEventListener('keydown', handlePromptKeydown);
   const ps = $('promptSend');
   if (ps) ps.addEventListener('click', sendPrompt);
+  /* the streaming pi composer: both buttons stay hidden until the selected pane is working */
+  const pSteer = $('promptSteer');
+  if (pSteer) pSteer.addEventListener('click', function () { sendQueued('steer'); });
+  const pFollow = $('promptFollowup');
+  if (pFollow) pFollow.addEventListener('click', function () { sendQueued('followup'); });
+  updateQueueControls();
   wireAttachComposer();                          // CONTRACT-v2 §10: picker, drop and paste
   const kr = $('keysRow');
   if (kr) kr.addEventListener('click', function (e) {
@@ -3167,11 +3356,11 @@ function init() {
     o.textContent = text; o.value = '';
     modelSel.appendChild(o);
   }
-  /* what the option carries: hermes switches by model NAME, pi by provider + NUL + model (one flat
+  /* what the option carries: hermes and pi switch by provider + NUL + model (one flat
      string survives <option>), claude by the numbered row */
   function optionValue(m, agent) {
-    if (agent === 'pi') return String(m.provider) + '\u0000' + String(m.model);
-    return agent === 'hermes' ? String(m.model) : String(m.n);
+    if (agent === 'pi' || agent === 'hermes') return String(m.provider) + '\u0000' + String(m.model);
+    return String(m.n);
   }
   /* the text of the option currently carrying `val` — the label pi reports in its toast */
   function modelOptionLabel(val) {
@@ -3251,10 +3440,14 @@ function init() {
       else if (body.confirmed === false) { toast('model → ' + label + ' (unconfirmed — check the pane)', 'error'); }
       else { toast('model → ' + label, 'ok'); }
     } else if (agent === 'hermes') {
-      body = await postJSON('/api/model', { pane_id: paneId, model: val });
+      const at = String(val).indexOf('\u0000');
+      const provider = at < 0 ? '' : String(val).slice(0, at);
+      const model = at < 0 ? String(val) : String(val).slice(at + 1);
+      const label = modelOptionLabel(val) || model;
+      body = await postJSON('/api/model', { pane_id: paneId, model: model, provider: provider || undefined });
       if (!body || !body.ok) { toast('model switch failed — ' + errText(body), 'error'); }
-      else if (body.confirmed === false) { toast('model → ' + val + ' (unconfirmed — check the pane)', 'error'); }
-      else { toast('model → ' + val, 'ok'); }
+      else if (body.confirmed === false) { toast('model → ' + label + ' (unconfirmed — check the pane)', 'error'); }
+      else { toast('model → ' + label, 'ok'); }
     } else {
       const n = Number(val);
       if (!Number.isInteger(n) || n < 1) return;

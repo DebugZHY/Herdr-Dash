@@ -179,10 +179,22 @@ if (typeof window.HD.register !== 'function') {
       </div>
       <div id="hdAttachList" class="hd-cv-attach-list hidden"></div>
       <div id="hdAttachNote" class="hd-cv-attach-note hidden"></div>
+      <!-- the bridge-visible pi queue, immediately above the composer. Hidden when empty;
+           no clear/recall control. -->
+      <div id="queueTray" class="queue-tray hidden" aria-live="polite">
+        <span class="queue-label">queued (dash)</span>
+        <div id="queueList" class="queue-list"></div>
+      </div>
       <div class="prompt-line" id="promptTextRow">
         <textarea id="promptText" rows="2" spellcheck="false" placeholder="prompt the selected pane&hellip;  (Enter sends, Shift+Enter newline)"></textarea>
         <div class="prompt-side">
           <button id="promptSend" class="btn primary" type="button">send</button>
+          <!-- Streaming pi composer: normal send is hidden while these are shown.
+               Enter steers, Alt+Enter queues a follow-up. -->
+          <button id="promptSteer" class="btn queue-btn hidden" type="button"
+                  title="steer after the current step — Enter while a pi pane is working">steer</button>
+          <button id="promptFollowup" class="btn queue-btn hidden" type="button"
+                  title="queue for after this run settles — Alt+Enter while a pi pane is working">follow-up</button>
           <label class="chk"><input id="promptWait" type="checkbox"> wait for idle</label>
         </div>
       </div>

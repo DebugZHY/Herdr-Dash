@@ -432,12 +432,58 @@ async function handlePane(req, res, url) {
   });
 }
 
-// POST /api/pane/prompt {pane_id, text, wait?, timeout_ms?}
+// POST /api/pane/prompt {pane_id, text, wait?, timeout_ms?, mode?}
+//
+// `mode` is optional and only pi accepts it: "prompt" (or absent) is the normal send;
+// "steer"/"followup" write ONE /herdr-steer|/herdr-followup extension command and answer
+// as soon as herdr accepted it — no wait, and `confirmed:false` because the tray, not this
+// reply, is the confirmation. A refused mode writes NOTHING.
 async function handlePrompt(req, res, body) {
   const paneId = requireString(body, 'pane_id');
   if (typeof body.text !== 'string') {
     throw { code: 'bad_request', message: '"text" is required and must be a string' };
   }
+
+  const mode = body.mode === undefined || body.mode === null ? 'prompt' : body.mode;
+  if (mode !== 'prompt') {
+    const plan = chatPi.planQueuePrompt({
+      mode,
+      agent: await agentFamilyOf(paneId),
+      status: await paneAgentStatus(paneId),
+      text: body.text,
+    });
+    if (!plan.ok) {
+      // A refused mode/text is 400; a pane that stopped streaming is 409. Nothing was
+      // written into the pane.
+      return sendJson(res, { ok: false, error: { code: plan.code, message: plan.message } }, plan.http);
+    }
+    await requirePiBridge(paneId);
+    const item = { id: chatPi.queueItemId(), kind: plan.kind, text: body.text, at: Date.now() };
+    const command = chatPi.queueCommand(plan.kind, item.id, item.text);
+    await hdr.request(
+      'agent.prompt',
+      { target: paneId, text: command },
+      { timeoutMs: DEFAULT_TIMEOUT_MS },
+    );
+    return ok(res, {
+      pane_id: paneId,
+      agent: 'pi',
+      mode: plan.kind,
+      command_sent: true,
+      confirmed: false,
+      item,
+    });
+  }
+
+  /* A normal prompt into a working pi pane would become an unqueued user turn while the
+     dashboard still shows the queue composer. Refuse it and let the client steer/follow-up. */
+  if (await agentFamilyOf(paneId) === 'pi' && await paneIsBusy(paneId)) {
+    return sendJson(res, {
+      ok: false,
+      error: { code: 'pane_busy', message: 'this pi pane is working — use steer or follow-up, not a normal prompt' },
+    }, 409);
+  }
+
   const useWait = body.wait === true;
 
   const params = { target: paneId, text: body.text };
@@ -452,6 +498,38 @@ async function handlePrompt(req, res, body) {
 
   const result = await hdr.request('agent.prompt', params, { timeoutMs: socketTimeout });
   ok(res, { result });
+}
+
+/* GET /api/queue?pane_id=<id> — QUEUE-CONTRACT §D.
+ *
+ * The bridge-visible queue for a pi pane: the last `type:"queue"` envelope of the newest
+ * control file. A pane with no record still answers 200 with empty lists and a note. This
+ * never types into the pane and never claims to read pi's internal queue. */
+async function handleQueueGet(req, res, url) {
+  const paneId = url.searchParams.get('pane_id');
+  if (!paneId) throw { code: 'bad_request', message: '"pane_id" query parameter is required' };
+  const agent = await agentFamilyOf(paneId);
+  if (agent !== 'pi') {
+    return sendJson(res, {
+      ok: false,
+      error: {
+        code: 'unsupported_agent',
+        message: 'the queued tray is pi-only (this pane is ' + (agent ? String(agent) : 'unknown') + ')',
+      },
+    }, 400);
+  }
+  const state = await chatPi.readQueueState(paneId);
+  const bridge = await chatPi.bridgeStateForPane(paneId);
+  return ok(res, {
+    pane_id: paneId,
+    agent: 'pi',
+    source: 'bridge',
+    bridge_ready: bridge.ready,
+    steering: state.steering,
+    followUp: state.followUp,
+    updated_at: state.updated_at,
+    note: state.note || (bridge.ready ? '' : bridge.note),
+  });
 }
 
 // POST /api/pane/keys {pane_id, keys:["enter"] | "enter ctrl+c"}
@@ -686,19 +764,20 @@ async function hermesModels() {
     return hermesModelCache.models;
   }
   const provs = await readHermesProviders();
-  const byName = new Map();
-  // fetch in parallel but merge in config order, so the provider shown for a shared model name
-  // is stable rather than whichever request happened to finish first
+  // One row per provider/model pair: the same model name can live behind several gateways,
+  // and `/model <name> --provider <name>` chooses among them. Deduping by model name would
+  // silently drop every provider but the first.
+  const byPair = new Map();
   const lists = await Promise.all(provs.map((p) => fetchProviderModels(p)));
   for (let i = 0; i < provs.length; i++) {
     for (const id of lists[i]) {
-      if (!byName.has(id)) byName.set(id, { model: id, providers: [] });
-      byName.get(id).providers.push(provs[i].name);
+      const key = provs[i].name + '\u0000' + id;
+      if (!byPair.has(key)) byPair.set(key, { model: id, provider: provs[i].name, providers: [provs[i].name] });
     }
   }
-  const models = Array.from(byName.values())
-    .sort((a, b) => (a.model < b.model ? -1 : a.model > b.model ? 1 : 0))
-    .map((m, i) => ({ n: i + 1, model: m.model, provider: m.providers[0] || null, providers: m.providers }));
+  const models = Array.from(byPair.values())
+    .sort((a, b) => (a.model < b.model ? -1 : a.model > b.model ? 1 : a.provider < b.provider ? -1 : a.provider > b.provider ? 1 : 0))
+    .map((m, i) => ({ n: i + 1, model: m.model, provider: m.provider, providers: m.providers }));
   if (models.length) hermesModelCache = { at: now, models };
   return models;
 }
@@ -909,6 +988,7 @@ async function handleSessionsPost(req, res, body) {
     if (!hit.path || !path.isAbsolute(hit.path)) {
       throw { code: 'no_sessions', message: 'the pi session file for ' + id + ' is not an absolute path' };
     }
+    await requirePiBridge(paneId);
     await hdr.request('agent.prompt', { target: paneId, text: chatPi.resumeCommand(hit.path), timeoutMs: DEFAULT_TIMEOUT_MS });
     /* The extension applies the switch inside pi, so herdr's record will keep naming the old
        session. Remember the requested id exactly as a hermes switch does: /api/chat then reads
@@ -1089,9 +1169,22 @@ async function handleModelGet(req, res, url) {
   if (family === 'hermes') {
     const models = await hermesModels();
     if (!models.length) throw { code: 'no_models', message: 'no custom provider models found in ' + path.join(HERMES_HOME, 'config.yaml') };
-    const cur = await hermesCurrentModel(paneId);
-    const marked = models.map((m) => Object.assign({}, m, { current: !!cur && m.model === cur }));
-    return ok(res, { pane_id: paneId, agent: 'hermes', current: cur, models: marked });
+    const info = await paneSessionInfo(paneId);
+    const stored = chatHermes.sessionSettings(chatHermes.dbPath(), info.sessionId);
+    const cur = stored.model || await hermesCurrentModel(paneId);
+    const curProvider = stored.provider ? stored.provider.replace(/^custom:/, '') : null;
+    let marked = false;
+    const rows = models.map((m) => {
+      const modelMatch = !!cur && m.model === cur;
+      const providerMatch = !curProvider || m.provider === curProvider;
+      const isCurrent = !marked && modelMatch && providerMatch;
+      if (isCurrent) marked = true;
+      return Object.assign({}, m, { current: isCurrent });
+    });
+    return ok(res, {
+      pane_id: paneId, agent: 'hermes', current: cur, provider: curProvider,
+      models: rows,
+    });
   }
 
   /* pi (wave 2): the catalogue comes from pi's own models.json — the file its model registry is
@@ -1104,16 +1197,18 @@ async function handleModelGet(req, res, url) {
     /* The bridge records the last /herdr-model in its control file; the footer is the
        fallback when pi has not been switched through the dash yet. Both are reads, never
        commands. */
-    const sinkModel = await chatPi.sinkModelForPane(paneId);
+    const settings = await chatPi.sinkSettingsForPane(paneId);
+    const bridge = await chatPi.bridgeStateForPane(paneId);
     const line = piStatusLine(await readRecent(paneId, 40));
-    const cur = sinkModel || (line ? line.model : null);
+    const cur = (line && line.model) || settings.model || null;
     return ok(res, {
       pane_id: paneId, agent: 'pi', current: cur, source: cat.file,
+      bridge_ready: bridge.ready,
       models: cat.models.map((m) => ({
         provider: m.provider, model: m.model, label: m.label,
         current: !!cur && (m.model === cur || m.label === cur),
       })),
-      note: cat.note || undefined,
+      note: cat.note || (bridge.ready ? undefined : bridge.note) || undefined,
     });
   }
 
@@ -1139,13 +1234,45 @@ async function handleModelPost(req, res, body) {
     if (typeof body.model !== 'string' || !body.model.trim()) {
       throw { code: 'bad_request', message: '"model" (a model name) is required for a hermes pane' };
     }
-    const model = body.model.trim();
-    await hdr.request('agent.prompt', { target: paneId, text: '/model ' + model }, { timeoutMs: DEFAULT_TIMEOUT_MS });
-    await sleep(4000);                                 // hermes answers the command, then repaints its status line
+    const model = chatPi.safeCommandToken(body.model.trim());
+    if (!model || model.indexOf('--') === 0) {
+      throw { code: 'bad_request', message: '"model" must be a single token that does not start with "--"' };
+    }
+    let provider = '';
+    if (body.provider !== undefined && body.provider !== null && String(body.provider).trim()) {
+      provider = chatPi.safeCommandToken(String(body.provider).trim()) || '';
+      if (!provider || provider.indexOf('--') === 0) {
+        throw { code: 'bad_request', message: '"provider" must be a single token that does not start with "--"' };
+      }
+    }
+    if (await paneIsBusy(paneId)) {
+      throw { code: 'pane_busy', message: 'this pane is working — switching its model now would change the run; wait until it is idle' };
+    }
+    const command = '/model ' + model + (provider ? ' --provider ' + provider : '');
+    await hdr.request('agent.prompt', { target: paneId, text: command, timeoutMs: DEFAULT_TIMEOUT_MS });
+    /* The TUI writes the frozen session policy into state.db; read that instead of
+       assuming the fixed-delay repaint is proof. A 4-second wait remains as a fallback
+       for the status line, but the decision uses the durable record. */
+    let stored = { model: null, provider: null };
+    for (let i = 0; i < 16; i++) {
+      await sleep(250);
+      const info = await paneSessionInfo(paneId);
+      stored = chatHermes.sessionSettings(chatHermes.dbPath(), info.sessionId);
+      if (stored.model === model && (!provider || (stored.provider || '').replace(/^custom:/, '') === provider)) break;
+    }
     const text = await readRecent(paneId, 200);
-    const confirmed = text.indexOf('Model switched: ' + model) >= 0
-      || new RegExp('[\\u263c\\u2e1d\\u25cf]\\s*' + model.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*[\\u2502|]').test(text);
-    return ok(res, { pane_id: paneId, model: model, confirmed: confirmed, result: { type: 'ok' } });
+    const escaped = model.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const modelConfirmed = stored.model === model
+      || text.indexOf('Model switched: ' + model) >= 0
+      || new RegExp('[\\u263c\\u2e1d\\u25cf]\\s*' + escaped + '\\s*[\\u2502|]').test(text);
+    const providerConfirmed = !provider
+      || (stored.provider || '').replace(/^custom:/, '') === provider
+      || new RegExp('Provider:\\s*' + provider.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).test(text);
+    return ok(res, {
+      pane_id: paneId, model: model, provider: provider || null,
+      current: stored.model || null, current_provider: stored.provider || null,
+      confirmed: modelConfirmed && providerConfirmed, result: { type: 'ok' },
+    });
   }
 
   /* pi (wave 2): `/herdr-model <provider>/<model>` through the extension. Never `/model`, never
@@ -1160,8 +1287,21 @@ async function handleModelPost(req, res, body) {
     if (!provider || !model) {
       throw { code: 'bad_request', message: '"provider" and "model" must be non-empty single tokens (no whitespace)' };
     }
+    await requirePiBridge(paneId);
     await hdr.request('agent.prompt', { target: paneId, text: chatPi.modelCommand(provider, model), timeoutMs: DEFAULT_TIMEOUT_MS });
-    return ok(res, { pane_id: paneId, provider: provider, model: model, command_sent: true, confirmed: false });
+    /* The extension applies the switch and writes a settings line. Poll the sink
+       briefly so the answer says whether the pane really moved, instead of always
+       reporting "unconfirmed" for a switch that worked. */
+    let current = null;
+    let confirmed = false;
+    for (let i = 0; i < 8 && !confirmed; i++) {
+      await sleep(250);
+      const settings = await chatPi.sinkSettingsForPane(paneId);
+      const line = piStatusLine(await readRecent(paneId, 40));
+      current = (line && line.model) || settings.model || null;
+      confirmed = current === model;
+    }
+    return ok(res, { pane_id: paneId, provider: provider, model: model, command_sent: true, current: current, confirmed: confirmed });
   }
 
   if (family !== 'claude') throw { code: 'bad_request', message: 'model switching by option number is claude-only (this pane is ' + family + ')' };
@@ -1225,6 +1365,18 @@ async function paneIsBusy(paneId) {
   return (await paneAgentStatus(paneId)) === 'working';
 }
 
+/* A control slash command that the pi extension did not register is ordinary user
+   text and starts a model turn. Refuse before sending when the pane's bridge is
+   absent or older than this dashboard; the pane itself is never touched. */
+async function requirePiBridge(paneId) {
+  const state = await chatPi.bridgeStateForPane(paneId);
+  if (state.ready) return state;
+  throw {
+    code: 'bridge_missing',
+    message: (state.note || 'the pi bridge is not ready') + ' — install/reload the herdr-stream extension, then try again',
+  };
+}
+
 /* a pi status line reads `(provider) model • level` */
 function piStatusLine(text) {
   const lines = String(text || '').split('\n');
@@ -1258,8 +1410,8 @@ async function piThinkingLevels(modelId) {
         return true;
       });
     }
-  } catch (e) { /* no catalogue: offer the whole set and let pi refuse what it will not take */ }
-  return PI_THINKING_LEVELS.slice();
+  } catch (e) { /* no catalogue: return no levels rather than inventing a superset pi may reject */ }
+  return [];
 }
 
 /* claude's /effort is a slider: a ruler line carries a ▲ under the level it is set to and the
@@ -1343,26 +1495,31 @@ async function loadEffortLevel(paneId) {
   const family = await agentFamilyOf(paneId);
 
   if (family === 'pi') {
+    const settings = await chatPi.sinkSettingsForPane(paneId);
     const line = piStatusLine(await readRecent(paneId, 40));
+    /* The footer is what the running pi actually shows; the bridge record covers panes whose
+       footer has scrolled out of the read window. Prefer the live footer, then the record. */
+    const model = (line && line.model) || settings.model || null;
+    const current = (line && line.level) || settings.thinking_level || null;
+    const levels = await piThinkingLevels(model);
     return {
-      pane_id: paneId, agent: 'pi', current: line ? line.level : null,
-      levels: await piThinkingLevels(line && line.model), source: 'status line',
+      pane_id: paneId, agent: 'pi', current: current || 'off', levels: levels,
+      source: line ? 'status line' : 'bridge',
+      note: levels.length ? undefined : 'the current model is not in pi models.json, so its thinking levels are unknown',
     };
   }
 
   if (family === 'hermes') {
-    if (await paneIsBusy(paneId)) {
-      return {
-        pane_id: paneId, agent: 'hermes', current: null, levels: EFFORT_LEVELS.hermes,
-        source: 'command', note: 'the pane is working — reading its level means asking it, which would interrupt',
-      };
-    }
-    await hdr.request('agent.prompt', { target: paneId, text: '/reasoning' }, { timeoutMs: DEFAULT_TIMEOUT_MS });
-    await sleep(2500);
-    const m = lastMatch(/Reasoning effort:\s*([a-z]+)/gi, await readRecent(paneId, 80));
+    /* The TUI's own last answer is the live value; state.db can lag until the next turn
+       freezes the session policy. Reading pane text is non-invasive and exact. */
+    const text = await readVisible(paneId);
+    const m = lastMatch(/Reasoning effort(?:\s+set to)?\s*:?\s*'?([a-z]+)'?/gi, text);
+    const info = await paneSessionInfo(paneId);
+    const stored = chatHermes.sessionSettings(chatHermes.dbPath(), info.sessionId);
     return {
-      pane_id: paneId, agent: 'hermes', current: m ? m[1].toLowerCase() : null,
-      levels: EFFORT_LEVELS.hermes, source: 'command',
+      pane_id: paneId, agent: 'hermes', current: (m ? m[1].toLowerCase() : null) || stored.reasoning || null,
+      levels: EFFORT_LEVELS.hermes, source: m ? 'pane text' : 'state.db',
+      note: (m || stored.reasoning) ? undefined : 'no reasoning setting recorded for this session yet',
     };
   }
 
@@ -1388,9 +1545,8 @@ async function loadEffortLevel(paneId) {
 }
 
 /* GET /api/effort?pane_id=.. -> { ok, agent, current, levels:[..] }
-   The current level is read where that agent keeps it: pi's own status line, or the answer to a
-   plain command for hermes and, through its slider, for claude. A read writes into the pane, so
-   repeated renders share one cached answer and concurrent reads share one command. */
+   The current level is read where that agent keeps it: pi's footer/bridge record, hermes'
+   state.db session policy, or claude's footer/slider. Reading hermes or pi never types. */
 async function handleEffortGet(req, res, url) {
   const paneId = url.searchParams.get('pane_id');
   if (!paneId) throw { code: 'bad_request', message: '"pane_id" query parameter is required' };
@@ -1436,7 +1592,7 @@ async function handleEffortPost(req, res, body) {
   effortReadCache.delete(paneId);
   effortReadEpoch.set(paneId, (effortReadEpoch.get(paneId) || 0) + 1);
   const family = await agentFamilyOf(paneId);
-  if (await paneIsBusy(paneId)) {
+  if (family !== 'pi' && await paneIsBusy(paneId)) {
     throw { code: 'pane_busy', message: 'this pane is working — switching its think effort now would interrupt the turn; try again when it is idle' };
   }
 
@@ -1444,22 +1600,46 @@ async function handleEffortPost(req, res, body) {
     if (EFFORT_LEVELS.hermes.indexOf(level) < 0) {
       throw { code: 'bad_request', message: 'no hermes reasoning level "' + level + '" (one of ' + EFFORT_LEVELS.hermes.join(', ') + ')' };
     }
-    await hdr.request('agent.prompt', { target: paneId, text: '/reasoning ' + level }, { timeoutMs: DEFAULT_TIMEOUT_MS });
-    await sleep(3000);
-    const text = await readRecent(paneId, 150);
-    return ok(res, { pane_id: paneId, agent: 'hermes', level: level, confirmed: text.indexOf("Reasoning effort set to '" + level + "'") >= 0 });
+    await hdr.request('agent.prompt', { target: paneId, text: '/reasoning ' + level, timeoutMs: DEFAULT_TIMEOUT_MS });
+    let current = null;
+    let confirmed = false;
+    for (let i = 0; i < 16 && !confirmed; i++) {
+      await sleep(250);
+      const text = await readVisible(paneId);
+      const m = lastMatch(/Reasoning effort(?:\s+set to)?\s*:?\s*'?([a-z]+)'?/gi, text);
+      current = m ? m[1].toLowerCase() : null;
+      if (current === level) { confirmed = true; break; }
+      const info = await paneSessionInfo(paneId);
+      const stored = chatHermes.sessionSettings(chatHermes.dbPath(), info.sessionId);
+      if (!current) current = stored.reasoning || null;
+      if (current === level) confirmed = true;
+    }
+    if (!confirmed) {
+      const text = await readVisible(paneId);
+      confirmed = text.indexOf("Reasoning effort set to '" + level + "'") >= 0;
+    }
+    return ok(res, { pane_id: paneId, agent: 'hermes', level: level, current: current, confirmed: confirmed });
   }
 
   if (family === 'pi') {
-    const before = piStatusLine(await readRecent(paneId, 40));
-    const levels = await piThinkingLevels(before && before.model);
+    const settings = await chatPi.sinkSettingsForPane(paneId);
+    const beforeLine = piStatusLine(await readRecent(paneId, 40));
+    const beforeModel = (beforeLine && beforeLine.model) || settings.model;
+    const levels = await piThinkingLevels(beforeModel);
     if (levels.indexOf(level) < 0) {
       throw { code: 'bad_request', message: 'this model does not take thinking level "' + level + '" (one of ' + levels.join(', ') + ')' };
     }
-    await hdr.request('agent.prompt', { target: paneId, text: '/thinking ' + level }, { timeoutMs: DEFAULT_TIMEOUT_MS });
-    await sleep(3000);
-    const after = piStatusLine(await readRecent(paneId, 40));
-    return ok(res, { pane_id: paneId, agent: 'pi', level: level, confirmed: !!after && after.level === level });
+    await hdr.request('agent.prompt', { target: paneId, text: '/thinking ' + level, timeoutMs: DEFAULT_TIMEOUT_MS });
+    let confirmed = false;
+    let current = null;
+    for (let i = 0; i < 12 && !confirmed; i++) {
+      await sleep(250);
+      const afterSettings = await chatPi.sinkSettingsForPane(paneId);
+      const afterLine = piStatusLine(await readRecent(paneId, 40));
+      current = (afterLine && afterLine.level) || afterSettings.thinking_level || null;
+      confirmed = current === level;
+    }
+    return ok(res, { pane_id: paneId, agent: 'pi', level: level, current: current, confirmed: confirmed });
   }
 
   if (family === 'claude') {
@@ -3547,6 +3727,7 @@ async function handle(req, res) {
     if (pathname === '/api/chat') return handleChat(req, res, url); // §8.2
     if (pathname === '/api/status') return handleStatus(req, res, url); // §12.3
     if (pathname === '/api/prompt') return handlePromptDetect(req, res, url);
+    if (pathname === '/api/queue') return handleQueueGet(req, res, url);   // QUEUE-CONTRACT §D
     if (pathname === '/api/model') return handleModelGet(req, res, url);
     if (pathname === '/api/sessions') return handleSessionsGet(req, res, url);
     if (pathname === '/api/effort') return handleEffortGet(req, res, url);

@@ -71,6 +71,7 @@ export default function herdrStreamExtension(pi: ExtensionAPI) {
 	on("session_shutdown", (event, ctx) => bridge.shutdown(event, ctx));
 
 	registerControlCommands(pi);
+	registerQueueCommands(pi, bridge);
 }
 
 /* ── wave 2: the pi control plane ─────────────────────────────────────────────
@@ -201,4 +202,100 @@ export function registerControlCommands(pi: ExtensionAPI): void {
 			if (result && result.cancelled) return { line: "herdr-new: cancelled", type: "warning" };
 			return { line: "herdr-new: new session" };
 		});
+}
+
+/* ── queue control plane (QUEUE-CONTRACT §B/§C) ──────────────────────────────
+ *
+ * The dashboard's composer cannot type into pi's TUI while a run streams, so steer and
+ * follow-up go through pi's own delivery API:
+ *
+ *   /herdr-steer {"id":"q-...","text":"..."}     pi.sendUserMessage(text,{deliverAs:"steer"})
+ *   /herdr-followup {"id":"q-...","text":"..."}  pi.sendUserMessage(text,{deliverAs:"followUp"})
+ *
+ * A human may type plain text after the command name instead of the JSON object; the
+ * whole argument is then the text and the id is empty (§B).
+ *
+ * Rules: a no-op outside a Herdr pane, NEVER a new run (an idle pane refuses), never
+ * ctx.abort(), never throw into pi, and exactly one short notify line. The item enters
+ * the sink's bridge-visible tray only after sendUserMessage returned without throwing
+ * (§C.1) — the extension never invents a queue entry.
+ */
+
+type QueueContext = ControlContext & { isIdle?(): boolean };
+
+/** §B: the command's kind -> pi's delivery mode. */
+const QUEUE_DELIVER: Record<string, "steer" | "followUp"> = {
+	steer: "steer",
+	followup: "followUp",
+};
+
+export function registerQueueCommands(pi: ExtensionAPI, bridge: unknown): void {
+	const api = pi as any;
+	/* Both halves are required, and either one missing must still load the extension:
+	   without registerCommand there is no command name, and without sendUserMessage there
+	   is no way to deliver — a dead /herdr-steer would be worse than none. */
+	if (!api || typeof api.registerCommand !== "function" || typeof api.sendUserMessage !== "function") return;
+
+	const say = (line: string, type?: "info" | "warning" | "error"): Say => ({ line, type });
+
+	const run = async (name: string, kind: string, argument: string, ctx: QueueContext): Promise<Say> => {
+		if (!inHerdrPane()) return say(name + ": not a Herdr pane — nothing was queued");
+		// §B: JSON {id,text} when it parses, otherwise the whole argument is the text.
+		const parsed = (herdrStream as any).parseQueueArgument(argument);
+		const text = parsed && typeof parsed.text === "string" ? parsed.text : "";
+		if (!text.trim()) return say(name + ": usage /" + name + " <text>", "warning");
+		/* §B: sendUserMessage while idle STARTS A RUN, which is not a queue operation.
+		   An isIdle() that throws (or is absent) is treated as idle and refuses. */
+		let idle = true;
+		try {
+			idle = typeof ctx.isIdle === "function" ? Boolean(ctx.isIdle()) : true;
+		} catch (err) {
+			idle = true;
+		}
+		if (idle) return say(name + ": nothing is running — the message was not queued", "warning");
+		try {
+			api.sendUserMessage(text, { deliverAs: QUEUE_DELIVER[kind] });
+		} catch (err) {
+			return say(name + ": pi refused the message — " + (err instanceof Error ? err.message : String(err)), "error");
+		}
+		// §C.1: only now is the item real, and the tray is best-effort.
+		try {
+			const queue = bridge as any;
+			if (queue && typeof queue.queueAdd === "function") {
+				queue.queueAdd({ id: parsed && typeof parsed.id === "string" ? parsed.id : "", kind, text });
+			}
+		} catch (err) {
+			// a tray that cannot be written must not cost the delivered message
+		}
+		return say(name + ": " + (kind === "steer" ? "steering" : "follow-up") + " queued");
+	};
+
+	const register = (name: string, kind: string, description: string) => {
+		try {
+			api.registerCommand(name, {
+				description,
+				handler: async (args: string, ctx: unknown) => {
+					const c = (ctx || {}) as QueueContext;
+					let line: Say;
+					try {
+						line = await run(name, kind, String(args === undefined || args === null ? "" : args), c);
+					} catch (err) {
+						line = say(name + ": failed — " + (err instanceof Error ? err.message : String(err)), "error");
+					}
+					try {
+						c.ui?.notify(line.line, line.type || "info");
+					} catch (err) {
+						// no UI (print/RPC mode): the line is simply not shown
+					}
+				},
+			});
+		} catch (err) {
+			// an older pi without registerCommand must still load this extension
+		}
+	};
+
+	register("herdr-steer", "steer",
+		"Herdr-Dash: steer the running turn with <text> (JSON {id,text} or plain text)");
+	register("herdr-followup", "followup",
+		"Herdr-Dash: queue <text> as a follow-up for after the current run settles");
 }

@@ -210,16 +210,17 @@ async function sinkSessionForPane(paneId, opts) {
 }
 
 /**
- * The last model recorded by this pane's own bridge. The extension writes a `settings`
- * envelope (with `model`) to the per-session control file after `/herdr-model`; reading
- * it is the quietest way to mark the current row without typing into pi. Only the newest
- * control file is opened, and only its last complete lines are parsed.
+ * The newest `<session>__control.ndjson` in a pane's sink directory, or null.
+ *
+ * Shared by the model reader and the queue reader: both answer with the LAST line of the
+ * newest control file. Path handling mirrors `sinkSessionForPane` (§2 `safe()` + a
+ * root-prefix check), so a pane id can never escape the stream root. Never throws.
  *
  * @param {string} paneId
  * @param {{streamRoot?: string}} [opts]
- * @returns {Promise<string|null>}
+ * @returns {Promise<{file: string, name: string, mtimeMs: number, dir: string}|null>}
  */
-async function sinkModelForPane(paneId, opts) {
+async function newestControlFile(paneId, opts) {
   try {
     const o = opts || {};
     const rawPane = String(paneId === undefined || paneId === null ? '' : paneId);
@@ -238,9 +239,31 @@ async function sinkModelForPane(paneId, opts) {
       try { st = await fsp.stat(file); } catch (e) { continue; }
       if (!st.isFile()) continue;
       const mtimeMs = st.mtimeMs || 0;
-      if (!best || mtimeMs > best.mtimeMs) best = { file, mtimeMs };
+      if (!best || mtimeMs > best.mtimeMs || (mtimeMs === best.mtimeMs && name > best.name)) {
+        best = { file, name, mtimeMs, dir };
+      }
     }
+    return best;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * The last model recorded by this pane's own bridge. The extension writes a `settings`
+ * envelope (with `model`) to the per-session control file after `/herdr-model`; reading
+ * it is the quietest way to mark the current row without typing into pi. Only the newest
+ * control file is opened, and only its last complete lines are parsed.
+ *
+ * @param {string} paneId
+ * @param {{streamRoot?: string}} [opts]
+ * @returns {Promise<string|null>}
+ */
+async function sinkModelForPane(paneId, opts) {
+  try {
+    const best = await newestControlFile(paneId, opts);
     if (!best) return null;
+    const rawPane = String(paneId === undefined || paneId === null ? '' : paneId);
     let text;
     try {
       const st = await fsp.stat(best.file);
@@ -260,6 +283,101 @@ async function sinkModelForPane(paneId, opts) {
     return null;
   } catch (e) {
     return null;
+  }
+}
+
+/**
+ * The last bridge settings envelope for a pane: the model and thinking level the
+ * extension last reported. A model switch and a thinking-level switch each write a
+ * settings line; reading both from the same source keeps the dashboard from pairing
+ * a new model with a level that belonged to the previous one. Never throws.
+ *
+ * @param {string} paneId
+ * @param {{streamRoot?: string}} [opts]
+ * @returns {Promise<{model: string|null, thinking_level: string|null, protocol: number, file: string}>}
+ */
+async function sinkSettingsForPane(paneId, opts) {
+  const empty = { model: null, thinking_level: null, protocol: 0, file: '' };
+  try {
+    const best = await newestControlFile(paneId, opts);
+    if (!best) return empty;
+    const rawPane = String(paneId === undefined || paneId === null ? '' : paneId);
+    let text;
+    try {
+      const st = await fsp.stat(best.file);
+      if (st.size > SINK_LINE_MAX * 20) return Object.assign({}, empty, { file: best.file });
+      text = await fsp.readFile(best.file, 'utf8');
+    } catch (e) { return Object.assign({}, empty, { file: best.file }); }
+    const lines = String(text).split(/\r?\n/);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i]) continue;
+      let env;
+      try { env = JSON.parse(lines[i]); } catch (e) { continue; }
+      if (!env || env.v !== 1 || env.pane_id !== rawPane || env.type !== 'settings') continue;
+      const model = env.model || (env.data && env.data.model);
+      const level = env.thinking_level || env.thinkingLevel || (env.data && (env.data.thinking_level || env.data.thinkingLevel));
+      if (!model && !level) continue;
+      return {
+        model: typeof model === 'string' && model.trim() ? model.trim() : null,
+        thinking_level: typeof level === 'string' && level.trim() ? level.trim() : null,
+        protocol: Number.isFinite(Number(env.protocol)) ? Number(env.protocol) : 0,
+        file: best.file,
+      };
+    }
+    return Object.assign({}, empty, { file: best.file });
+  } catch (e) {
+    return empty;
+  }
+}
+
+/** The protocol the control commands (model, resume, steer, follow-up) require. */
+const PI_BRIDGE_PROTOCOL = 2;
+const PI_BRIDGE_ID = 'herdr-stream';
+
+/**
+ * Is the pane's pi bridge new enough to accept control commands?
+ *
+ * A slash command that nobody registered is ordinary user text in pi: sending
+ * `/herdr-model` to a pane with an old or missing extension would start a model
+ * turn instead of switching anything. The bridge stamps every control envelope
+ * with its id and protocol, so the last envelope is a cheap readiness proof.
+ * A pane with no control file is not ready (start one turn, or reload the
+ * extension after installing it). Never throws.
+ *
+ * @param {string} paneId
+ * @param {{streamRoot?: string}} [opts]
+ * @returns {Promise<{ready: boolean, protocol: number, file: string, note: string}>}
+ */
+async function bridgeStateForPane(paneId, opts) {
+  const notReady = (note, file) => ({ ready: false, protocol: 0, file: file || '', note: note || '' });
+  try {
+    const best = await newestControlFile(paneId, opts);
+    if (!best) return notReady('no bridge control record for this pane yet — start a turn or reload the pi extension');
+    let text;
+    try {
+      const st = await fsp.stat(best.file);
+      if (!st.isFile() || st.size > SINK_LINE_MAX * 512) return notReady('the bridge control record is too large to inspect', best.file);
+      text = await fsp.readFile(best.file, 'utf8');
+    } catch (e) {
+      return notReady('the bridge control record for this pane is unreadable', best.file);
+    }
+    const rawPane = String(paneId === undefined || paneId === null ? '' : paneId);
+    const lines = String(text).split(/\r?\n/);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i]) continue;
+      let env;
+      try { env = JSON.parse(lines[i]); } catch (e) { continue; }
+      if (!env || (env.type !== 'settings' && env.type !== 'queue')) continue;
+      if (typeof env.pane_id === 'string' && env.pane_id !== rawPane) continue;
+      const protocol = Number(env.protocol);
+      if (env.bridge === PI_BRIDGE_ID && Number.isFinite(protocol) && protocol >= PI_BRIDGE_PROTOCOL) {
+        return { ready: true, protocol: protocol, file: best.file, note: '' };
+      }
+      // Keep looking: a later settings line may come from the same old bridge.
+    }
+    return notReady('the pi bridge is older than this dashboard — reload the extension', best.file);
+  } catch (e) {
+    return notReady('the pi bridge state could not be read');
   }
 }
 
@@ -1048,6 +1166,191 @@ async function listSessionsForCwd(paneCwd, opts) {
   return out;
 }
 
+/* ── wave 3: the queued tray (QUEUE-CONTRACT §A/§B/§C/§D) ────────────────────
+ *
+ * The composer-side control plane: the dashboard writes ONE extension command for a steer
+ * or follow-up message, and reads back the bridge's own queue record. Nothing here types
+ * into a pane, and nothing here reads pi's internal queue — the tray is explicitly the
+ * bridge-visible queue (§C.5).
+ *
+ * The command strings live here so the route and the tests share one builder (§B), and the
+ * control-file reader lives here so a malformed line answers empty lists, never a throw.
+ */
+
+/** The two commands the extension registers for queued delivery (§B). */
+const PI_STEER_COMMAND = '/herdr-steer';
+const PI_FOLLOWUP_COMMAND = '/herdr-followup';
+
+/** §D: bounded reads/rows. The control file is append-only and may be long; only its tail
+ *  is inspected, and one row's text is cut for the tray (never for delivery). */
+const QUEUE_ID_MAX = 200;
+const QUEUE_ITEM_TEXT_MAX = 4096;
+const QUEUE_ITEMS_MAX = 100;
+const QUEUE_TAIL_BYTES = 256 * 1024;
+
+/** §A.4: an opaque item id, unique per pane/process (no counter the UI may arithmetic on). */
+function queueItemId(nowMs) {
+  const at = Number.isFinite(nowMs) ? Math.floor(nowMs) : Date.now();
+  let rnd = '';
+  try {
+    rnd = require('node:crypto').randomBytes(6).toString('hex');
+  } catch (e) {
+    rnd = Math.random().toString(36).slice(2, 14);
+  }
+  return 'q-' + at.toString(36) + '-' + rnd;
+}
+
+/**
+ * §B: one command line. `JSON.stringify` is the escaping — quotes, backslashes, newlines,
+ * control characters and any unicode text survive; the line itself stays one line.
+ *
+ * @param {'steer'|'followup'} kind
+ * @param {string} id   the opaque item id (may be empty for manual use)
+ * @param {string} text the user's message, verbatim
+ */
+function queueCommand(kind, id, text) {
+  const command = kind === 'followup' ? PI_FOLLOWUP_COMMAND : PI_STEER_COMMAND;
+  const doc = {
+    id: id === undefined || id === null ? '' : String(id),
+    text: text === undefined || text === null ? '' : String(text),
+  };
+  return command + ' ' + JSON.stringify(doc);
+}
+
+/**
+ * §A.1–A.3: the pure decision for a `mode:"steer"|"followup"` prompt. The route resolves
+ * the pane's agent family and live `agent_status` first, then obeys this — so the frozen
+ * error codes (`unsupported_mode`, `bad_request`, `not_streaming`) and their HTTP statuses
+ * are testable without a herdr connection.
+ *
+ * @param {{mode?: string, agent?: string|null, status?: string|null, text?: string}} input
+ * @returns {{ok: true, kind: 'steer'|'followup', deliverAs: 'steer'|'followUp'}
+ *          | {ok: false, http: 400|409, code: string, message: string}}
+ */
+function planQueuePrompt(input) {
+  const o = input || {};
+  const mode = o.mode === undefined || o.mode === null ? '' : String(o.mode);
+  if (mode !== 'steer' && mode !== 'followup') {
+    return {
+      ok: false, http: 400, code: 'bad_request',
+      message: '"mode" must be "steer" or "followup" for a queued message (plain prompts omit it)',
+    };
+  }
+  if (o.agent !== 'pi') {
+    return {
+      ok: false, http: 400, code: 'unsupported_mode',
+      message: '"mode":"' + mode + '" is pi-only (this pane is ' + (o.agent ? String(o.agent) : 'unknown') + ')',
+    };
+  }
+  if (typeof o.text !== 'string' || !o.text.trim()) {
+    return {
+      ok: false, http: 400, code: 'bad_request',
+      message: '"text" must contain at least one non-whitespace character',
+    };
+  }
+  if (o.status !== 'working') {
+    return {
+      ok: false, http: 409, code: 'not_streaming',
+      message: 'this pane is not working/streaming — nothing was queued',
+    };
+  }
+  return { ok: true, kind: mode, deliverAs: mode === 'steer' ? 'steer' : 'followUp' };
+}
+
+/** Rows the tray may show: unknown shapes are skipped, everything stays bounded. */
+function normalizeQueueItems(list) {
+  if (!Array.isArray(list)) return null;
+  const out = [];
+  for (const entry of list) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const kind = entry.kind === 'steer' || entry.kind === 'followup' ? entry.kind : '';
+    if (!kind) continue;
+    const text = typeof entry.text === 'string' ? entry.text : '';
+    if (!text) continue;
+    out.push({
+      id: typeof entry.id === 'string' ? entry.id.slice(0, QUEUE_ID_MAX) : '',
+      kind,
+      text: text.length > QUEUE_ITEM_TEXT_MAX ? text.slice(0, QUEUE_ITEM_TEXT_MAX) : text,
+      at: Number.isFinite(entry.at) ? entry.at : null,
+    });
+    if (out.length >= QUEUE_ITEMS_MAX) break;
+  }
+  return out;
+}
+
+/**
+ * §D: the last `type:"queue"` envelope of the pane's newest control file.
+ *
+ * Answers with empty lists + a short `note` when there is no control file, no queue line,
+ * or a malformed record; never throws, never types into the pane. Only the file's tail is
+ * read, and the arrays keep the order the bridge wrote (as queued).
+ *
+ * @param {string} paneId
+ * @param {{streamRoot?: string}} [opts]
+ * @returns {Promise<{steering: Array<object>, followUp: Array<object>, updated_at: number|null,
+ *                    note: string, file: string}>}
+ */
+async function readQueueState(paneId, opts) {
+  const empty = (note, file) => ({ steering: [], followUp: [], updated_at: null, note: note || '', file: file || '' });
+  try {
+    const rawPane = String(paneId === undefined || paneId === null ? '' : paneId);
+    const best = await newestControlFile(rawPane, opts);
+    if (!best) return empty('no queue record for this pane yet');
+
+    let fh;
+    try { fh = await fsp.open(best.file, 'r'); } catch (e) { return empty('the queue record for this pane is unreadable', best.file); }
+    let text = '';
+    try {
+      const size = (await fh.stat()).size || 0;
+      if (!size) return empty('no queue record for this pane yet', best.file);
+      const start = Math.max(0, size - QUEUE_TAIL_BYTES);
+      const want = size - start;
+      const buf = Buffer.alloc(want);
+      const { bytesRead } = await fh.read(buf, 0, want, start);
+      text = buf.subarray(0, bytesRead).toString('utf8');
+      if (start > 0) {
+        // The first line of a tail read is probably cut: it is not a record.
+        const nl = text.indexOf('\n');
+        text = nl < 0 ? '' : text.slice(nl + 1);
+      }
+    } finally {
+      await fh.close().catch(() => {});
+    }
+
+    const lines = String(text).split(/\r?\n/);
+    let sawMalformedQueueLine = false;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      if (!line || !line.trim()) continue;
+      let env;
+      try {
+        env = JSON.parse(line);
+      } catch (e) {
+        if (line.includes('"queue"')) sawMalformedQueueLine = true;
+        continue;
+      }
+      if (!env || typeof env !== 'object' || Array.isArray(env)) continue;
+      if (env.type !== 'queue') continue;
+      // A control file is per session, but a mis-copied line must not bind this pane.
+      if (typeof env.pane_id === 'string' && env.pane_id !== rawPane) continue;
+      const steering = normalizeQueueItems(env.steering);
+      const followUp = normalizeQueueItems(env.followUp);
+      if (!steering || !followUp) return empty('the queue record for this pane is malformed', best.file);
+      return {
+        steering,
+        followUp,
+        updated_at: Number.isFinite(env.updated_at) ? env.updated_at : null,
+        note: '',
+        file: best.file,
+      };
+    }
+    if (sawMalformedQueueLine) return empty('the queue record for this pane is malformed', best.file);
+    return empty('no queue record for this pane yet', best.file);
+  } catch (e) {
+    return empty('the queue record for this pane could not be read');
+  }
+}
+
 /** Would adding this plan to `messages` stay inside the count and byte caps? */
 function fits(messages, plan, limit, bytes) {
   const max = limit == null ? LIMITS.LIMIT_DEFAULT : limit;
@@ -1058,10 +1361,14 @@ function fits(messages, plan, limit, bytes) {
 module.exports = {
   SOURCE_KIND, EXCLUDED_TYPES, KNOWN_TYPES, MESSAGE_TYPES, sessionsRoot, findSessionFile,
   verifyCwd, sameCwd, parseRecord, readWindow, readTail, candidatesForCwd,
-  sinkSessionForPane, sinkModelForPane, sinkSafeSegment, sinkStreamRoot,
+  sinkSessionForPane, sinkModelForPane, sinkSettingsForPane, sinkSafeSegment, sinkStreamRoot, bridgeStateForPane,
   /* wave 2 control plane (pure helpers; the routes only send these strings) */
   PI_RESUME_COMMAND, PI_MODEL_COMMAND, PI_ABORT_COMMAND, PI_NEW_COMMAND,
   resumeCommand, modelCommand, safeCommandToken,
   piAgentDir, piModelsFile, listModelCatalogue,
   firstUserTitle, listSessionsForCwd,
+  /* wave 3 queue control plane (pure builders + a bounded control-file reader) */
+  PI_STEER_COMMAND, PI_FOLLOWUP_COMMAND, QUEUE_ITEM_TEXT_MAX, QUEUE_ITEMS_MAX,
+  queueItemId, queueCommand, planQueuePrompt, readQueueState, newestControlFile,
+  normalizeQueueItems,
 };
