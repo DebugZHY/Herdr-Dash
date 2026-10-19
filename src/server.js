@@ -1087,6 +1087,13 @@ const EFFORT_LEVELS = {
   hermes: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
   claude: ['low', 'medium', 'high', 'xhigh', 'max'],
 };
+/* Reading an effort level writes a command into the pane (hermes`/reasoning`, claude`s
+   `/effort` slider). A dashboard render must not turn that read into a poll: cache the answer,
+   coalesce concurrent reads, and never cache a failed probe. */
+const EFFORT_READ_CACHE_MS = 5 * 60 * 1000;
+const effortReadCache = new Map();       // paneId -> { at, body }
+const effortReadInflight = new Map();    // paneId -> Promise<body>
+const effortReadEpoch = new Map();       // paneId -> generation, bumped by a switch
 const PI_THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 /* what the pane's own agent is doing. A read that writes a command into a busy pane — or that
@@ -1217,36 +1224,33 @@ function lastMatch(re, text) {
   return hit;
 }
 
-/* GET /api/effort?pane_id=.. -> { ok, agent, current, levels:[..] }
-   The current level is read where that agent keeps it: pi's own status line, or the answer to a
-   plain command for hermes and, through its slider, for claude. */
-async function handleEffortGet(req, res, url) {
-  const paneId = url.searchParams.get('pane_id');
-  if (!paneId) throw { code: 'bad_request', message: '"pane_id" query parameter is required' };
+/* Read the current effort level from the agent. This is the slow part: hermes and claude have to
+   be asked with a command, so the caller must cache/coalesce it. */
+async function loadEffortLevel(paneId) {
   const family = await agentFamilyOf(paneId);
 
   if (family === 'pi') {
     const line = piStatusLine(await readRecent(paneId, 40));
-    return ok(res, {
+    return {
       pane_id: paneId, agent: 'pi', current: line ? line.level : null,
       levels: await piThinkingLevels(line && line.model), source: 'status line',
-    });
+    };
   }
 
   if (family === 'hermes') {
     if (await paneIsBusy(paneId)) {
-      return ok(res, {
+      return {
         pane_id: paneId, agent: 'hermes', current: null, levels: EFFORT_LEVELS.hermes,
         source: 'command', note: 'the pane is working — reading its level means asking it, which would interrupt',
-      });
+      };
     }
     await hdr.request('agent.prompt', { target: paneId, text: '/reasoning' }, { timeoutMs: DEFAULT_TIMEOUT_MS });
     await sleep(2500);
     const m = lastMatch(/Reasoning effort:\s*([a-z]+)/gi, await readRecent(paneId, 80));
-    return ok(res, {
+    return {
       pane_id: paneId, agent: 'hermes', current: m ? m[1].toLowerCase() : null,
       levels: EFFORT_LEVELS.hermes, source: 'command',
-    });
+    };
   }
 
   if (family === 'claude') {
@@ -1254,20 +1258,57 @@ async function handleEffortGet(req, res, url) {
        sits at the bottom of the viewport: the scrollback window is wrapped differently and can
        leave it outside. */
     const foot = claudeEffortFooter(await readVisible(paneId));
-    if (foot) return ok(res, { pane_id: paneId, agent: 'claude', current: foot, levels: EFFORT_LEVELS.claude, source: 'footer' });
+    if (foot) return { pane_id: paneId, agent: 'claude', current: foot, levels: EFFORT_LEVELS.claude, source: 'footer' };
     if (await paneIsBusy(paneId)) {
-      return ok(res, {
+      return {
         pane_id: paneId, agent: 'claude', current: null, levels: EFFORT_LEVELS.claude,
         source: 'slider', note: 'the pane is working, and its level is only visible in a selector it is not showing',
-      });
+      };
     }
     const level = await openClaudeEffort(paneId);
     await hdr.request('pane.send_keys', { pane_id: paneId, keys: ['esc'] }, { timeoutMs: DEFAULT_TIMEOUT_MS });
     if (!level) throw { code: 'no_slider', message: 'the /effort slider did not appear (is this claude pane at an idle prompt?)' };
-    return ok(res, { pane_id: paneId, agent: 'claude', current: level, levels: EFFORT_LEVELS.claude, source: 'slider' });
+    return { pane_id: paneId, agent: 'claude', current: level, levels: EFFORT_LEVELS.claude, source: 'slider' };
   }
 
   throw { code: 'no_effort', message: 'no think-effort control is known for this pane (' + family + ')' };
+}
+
+/* GET /api/effort?pane_id=.. -> { ok, agent, current, levels:[..] }
+   The current level is read where that agent keeps it: pi's own status line, or the answer to a
+   plain command for hermes and, through its slider, for claude. A read writes into the pane, so
+   repeated renders share one cached answer and concurrent reads share one command. */
+async function handleEffortGet(req, res, url) {
+  const paneId = url.searchParams.get('pane_id');
+  if (!paneId) throw { code: 'bad_request', message: '"pane_id" query parameter is required' };
+  const fresh = url.searchParams.get('fresh') === '1';
+
+  if (!fresh) {
+    const hit = effortReadCache.get(paneId);
+    if (hit && (Date.now() - hit.at) < EFFORT_READ_CACHE_MS) return ok(res, hit.body);
+  }
+
+  let pending = effortReadInflight.get(paneId);
+  if (!pending) {
+    const epoch = effortReadEpoch.get(paneId) || 0;
+    const remember = (body) => {
+      if ((effortReadEpoch.get(paneId) || 0) === epoch) effortReadCache.set(paneId, { at: Date.now(), body: body });
+      return body;
+    };
+    pending = loadEffortLevel(paneId).then(remember, (e) => {
+      if (e && e.code === 'no_slider') {
+        return remember({
+          pane_id: paneId, agent: 'claude', current: null, levels: EFFORT_LEVELS.claude, source: 'slider',
+          note: 'the /effort slider did not appear; the pane may be busy or between prompts — the level is unchanged',
+        });
+      }
+      throw e;
+    }).finally(() => {
+      if (effortReadInflight.get(paneId) === pending) effortReadInflight.delete(paneId);
+    });
+    effortReadInflight.set(paneId, pending);
+  }
+  return ok(res, await pending);
 }
 
 /* POST /api/effort {pane_id, level}
@@ -1277,6 +1318,10 @@ async function handleEffortGet(req, res, url) {
 async function handleEffortPost(req, res, body) {
   const paneId = requireString(body, 'pane_id');
   const level = requireString(body, 'level').trim().toLowerCase();
+  /* a switch invalidates the cached read and any read already in flight: its answer describes the
+     level from before this request. */
+  effortReadCache.delete(paneId);
+  effortReadEpoch.set(paneId, (effortReadEpoch.get(paneId) || 0) + 1);
   const family = await agentFamilyOf(paneId);
   if (await paneIsBusy(paneId)) {
     throw { code: 'pane_busy', message: 'this pane is working — switching its think effort now would interrupt the turn; try again when it is idle' };

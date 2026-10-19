@@ -3224,7 +3224,9 @@ function init() {
      from here: hermes and pi take the level as their command's argument, claude is walked along
      its own slider. The current level comes from the agent itself (see GET /api/effort). */
   const effortSel = $('agentEffortSel');
-  let effortCache = { paneId: null, agent: null, levels: null, current: null };
+  let effortCache = { paneId: null, agent: null, levels: null, current: null, at: 0 };
+  let effortLoadingPane = null;
+  let effortLastProbe = { paneId: null, at: 0 };
   function setEffortSelPlaceholder(text) {
     if (!effortSel) return;
     effortSel.innerHTML = '';
@@ -3251,26 +3253,46 @@ function init() {
   }
   async function refreshEffortList(paneId, agent, force) {
     if (!effortSel) return;
-    if (!force && effortCache.paneId === paneId && effortCache.levels) {
+    /* A read types a command into the pane, so one answer is kept for as long as the same pane
+       and agent are selected. Re-reading on a timer would make the dashboard probe the agent
+       forever; the level is refreshed by a switch or by the reader's own selection instead. */
+    if (!force && effortCache.paneId === paneId && effortCache.agent === agent && effortCache.levels) {
       fillEffortSel(effortCache.levels, effortCache.current);
       return;
     }
-    effortSel.disabled = true;
-    setEffortSelPlaceholder('loading\u2026');
-    const body = await api('/api/effort?pane_id=' + encodeURIComponent(paneId));
-    if (!body || !body.ok) {
-      setEffortSelPlaceholder('think: \u2014');
-      effortSel.disabled = true;
-      effortCache = { paneId: null, agent: null, levels: null, current: null };
+    /* A read types a command into the pane. Never launch a second read for the same pane, and
+       do not retry a failed one on every header render: the retry is what turned a transient
+       probe failure into a visible /effort or /reasoning loop. */
+    if (effortLoadingPane === paneId) return;
+    if (!force && effortLastProbe.paneId === paneId &&
+        (Date.now() - effortLastProbe.at) < 30000) {
+      fillEffortSel(effortCache.levels, effortCache.current);
       return;
     }
-    effortCache = { paneId: paneId, agent: agent, levels: body.levels || [], current: body.current || null };
-    /* the server hedges when it cannot read the level without disturbing the pane: say so rather
-       than passing a blank off as "unknown" */
-    effortSel.title = body.note
-      ? ('think effort \u2014 ' + body.note)
-      : "the selected pane's think effort \u2014 pick another level to switch it live (claude, hermes, pi)";
-    fillEffortSel(effortCache.levels, effortCache.current);
+    effortLoadingPane = paneId;
+    effortLastProbe = { paneId: paneId, at: Date.now() };
+    effortSel.disabled = true;
+    setEffortSelPlaceholder('loading\u2026');
+    try {
+      const body = await api('/api/effort?pane_id=' + encodeURIComponent(paneId) +
+                             (force ? '&fresh=1' : ''));
+      if (!body || !body.ok) {
+        setEffortSelPlaceholder('think: \u2014');
+        effortSel.disabled = true;
+        effortCache = { paneId: null, agent: null, levels: null, current: null, at: 0 };
+        return;
+      }
+      effortCache = { paneId: paneId, agent: agent, levels: body.levels || [], current: body.current || null,
+                      at: Date.now() };
+      /* the server hedges when it cannot read the level without disturbing the pane: say so rather
+         than passing a blank off as "unknown" */
+      effortSel.title = body.note
+        ? ('think effort \u2014 ' + body.note)
+        : "the selected pane's think effort \u2014 pick another level to switch it live (claude, hermes, pi)";
+      fillEffortSel(effortCache.levels, effortCache.current);
+    } finally {
+      if (effortLoadingPane === paneId) effortLoadingPane = null;
+    }
   }
   function updateEffortSel() {
     if (!effortSel) return;
@@ -3297,10 +3319,21 @@ function init() {
     if (!paneId || !val) return;
     effortSel.disabled = true;
     const body = await postJSON('/api/effort', { pane_id: paneId, level: val });
-    if (!body || !body.ok) { toast('think effort failed \u2014 ' + errText(body), 'error'); }
-    else if (body.confirmed === false) { toast('think \u2192 ' + val + ' (unconfirmed \u2014 check the pane)', 'error'); }
+    if (!body || !body.ok) {
+      toast('think effort failed \u2014 ' + errText(body), 'error');
+      effortSel.disabled = false;
+      return;
+    }
+    if (body.confirmed === false) { toast('think \u2192 ' + val + ' (unconfirmed \u2014 check the pane)', 'error'); }
     else { toast('think \u2192 ' + val, 'ok'); }
-    refreshEffortList(paneId, effortCache.agent, true);
+    /* the POST already carries the answer; re-reading it with GET /api/effort would type another
+       /effort or /reasoning into the pane just to learn what we already know. */
+    effortCache = {
+      paneId: paneId, agent: body.agent || effortCache.agent, levels: effortCache.levels,
+      current: (body.confirmed === false ? effortCache.current : (body.level || val)), at: Date.now(),
+    };
+    fillEffortSel(effortCache.levels, effortCache.current);
+    effortSel.disabled = false;
   });
 
   /* the session switcher: a side panel listing the selected pane's sessions and resuming the one
