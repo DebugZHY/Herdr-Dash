@@ -292,12 +292,14 @@
 
 .prompt-side {
   display: flex;
-  flex-direction: row;
-  align-items: center;
+  flex-direction: column;
+  justify-content: center;
+  align-items: stretch;
   gap: 6px;
   flex: 0 0 auto;
   padding-bottom: 2px;
 }
+.prompt-side .btn { width: 100%; min-width: 78px; }
 
 .btn {
   padding: 7px 13px;
@@ -356,10 +358,37 @@
 }
 .tool-btn:hover,
 .tool-select:hover { color: var(--fg); border-color: #35425a; }
-.tool-select { max-width: 280px; }
+
+/* DEFECT-17 — the droplists are real <select>s, so they kept the platform's light chrome: the UA
+   arrow is drawn dark and vanishes on the dark pill, and the option popup is a white sheet whose
+   rows inherit `color: var(--fg-dim)` — light grey on white, i.e. unreadable. Give the control a
+   dark well with light text (`appearance: none` + our own chevron, so the arrow no longer depends
+   on the platform), and paint the popup rows to match. `color-scheme: dark` on the element is what
+   tells Chromium/Windows to render the popup surface dark; the explicit option colors are the
+   fallback for engines that ignore it. */
+.tool-select {
+  max-width: 280px;
+  padding-right: 24px;
+  background-color: var(--bg-input);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='9' height='6' viewBox='0 0 9 6'%3E%3Cpath d='M1 1l3.5 3.5L8 1' fill='none' stroke='%238b97a6' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  color: var(--fg);
+  text-overflow: ellipsis;
+  color-scheme: dark;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.tool-select:hover { background-color: var(--bg-panel2); }
+.tool-select option {
+  background-color: var(--bg-panel2);
+  color: var(--fg);
+}
+.tool-select option:checked { background-color: #14304d; color: var(--fg); }
 #agentModelSel { min-width: 190px; max-width: 300px; }
 #agentEffortSel { min-width: 74px; }
 .tool-select:disabled { opacity: .55; cursor: default; }
+.tool-select:disabled:hover { background-color: var(--bg-input); border-color: var(--line); }
 
 #promptResult { margin-top: 8px; }
 

@@ -1040,10 +1040,12 @@ function showQueueTray(steering, followUp, note) {
     list.appendChild(row);
   }
   if (noteEl) {
-    noteEl.textContent = noteText;
-    noteEl.classList.toggle('hidden', !noteText);
+    noteEl.textContent = rows.length ? noteText : '';
+    noteEl.classList.toggle('hidden', rows.length === 0 || !noteText);
   }
-  tray.classList.toggle('hidden', rows.length === 0 && !noteText);
+  /* The tray is a queue, not a status badge: with no actual queued row it stays out of the
+     composer even when the agent has a note to explain what the echo means. */
+  tray.classList.toggle('hidden', rows.length === 0);
 }
 
 async function refreshQueue(force) {
