@@ -692,6 +692,7 @@ const HERMES_STEER_COMMAND = '/steer';
 const HERMES_FOLLOWUP_COMMAND = '/queue';
 const HERMES_ECHO_NOTE = 'commands sent from herdr-dash while the pane worked; Hermes keeps its own queue';
 const ECHO_ITEMS_MAX = 100;                 // bounded like the pi tray (QUEUE_ITEMS_MAX)
+const ECHO_TTL_MS = 6000;                   // an echo is an acknowledgement, not a queue row
 
 /** The literal hermes command line: `/steer <text>` or `/queue <text>`. */
 function steerCommand(text) {
@@ -772,9 +773,10 @@ function rememberEcho(paneId, item) {
   const id = String(paneId == null ? '' : paneId);
   const row = echoBucket(id) || { steering: [], followUp: [], updated_at: null };
   const kind = item && item.kind === 'followup' ? 'followup' : 'steer';
+  const echoId = String(item && item.id ? item.id : '');
   const list = kind === 'steer' ? row.steering : row.followUp;
   list.push({
-    id: String(item && item.id ? item.id : ''),
+    id: echoId,
     kind,
     text: item && typeof item.text === 'string' ? item.text : '',
     at: item && Number.isFinite(item.at) ? item.at : Date.now(),
@@ -782,6 +784,18 @@ function rememberEcho(paneId, item) {
   if (list.length > ECHO_ITEMS_MAX) list.splice(0, list.length - ECHO_ITEMS_MAX);
   row.updated_at = list[list.length - 1].at;
   paneEcho.set(id, row);
+  /* The row has served its purpose once Hermes has had time to consume the command.
+     Other tabs that refresh later must not see a permanent "queued" badge. */
+  const timer = setTimeout(function () {
+    const bucket = echoBucket(id);
+    if (!bucket) return;
+    for (const key of ['steering', 'followUp']) {
+      const at = bucket[key].findIndex(function (entry) { return entry.id === echoId; });
+      if (at >= 0) bucket[key].splice(at, 1);
+    }
+    if (!bucket.steering.length && !bucket.followUp.length) paneEcho.delete(id);
+  }, ECHO_TTL_MS);
+  if (timer.unref) timer.unref();
   return row;
 }
 

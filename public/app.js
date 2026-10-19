@@ -600,6 +600,9 @@ function renderHeader() {
   /* the queue controls follow the selected pane's agent and status; a broken queue read
      must never break the header */
   try { updateQueueControls(); } catch (e) { /* the queue UI is additive */ }
+  /* the approval banner follows the same rule: it belongs to one pane, so a switch or a
+     status change re-opens (or retires) it right here */
+  try { updateApprovalControls(); } catch (e) { /* the approval banner is additive */ }
 }
 
 function renderAge() {
@@ -939,10 +942,12 @@ async function sendPrompt() {
  * ------------------------------------------------------------------ */
 
 let queuePaneId = null;      // the working pane the tray currently follows
-let queueTimer = null;       // 2 s refresh interval (only while that pane is working)
+let queueTimer = null;       // 1.2 s refresh interval (only while that pane is working)
 let queueSig = null;         // the last rendered rows (kind/id/text)
 let queueInFlight = false;   // one GET /api/queue at a time
 let queueAgain = false;      // a forced refresh arrived while one was in flight
+let queueDone = new Set();    // rows this composer sent; hidden until a queue read has shown them
+let queueSeen = new Set();    // …and then stops naming them (so a slow bridge cannot make one reappear)
 
 function workingQueuePane() {
   const pane = state.selected ? findPane(state.selected) : null;
@@ -968,7 +973,7 @@ function stopQueueTimer() {
 
 function startQueueTimer() {
   if (queueTimer !== null) return;
-  queueTimer = window.setInterval(function () { refreshQueue(false); }, 2000);
+  queueTimer = window.setInterval(function () { refreshQueue(false); }, 1200);
 }
 
 /* Show the streaming composer only for a working pi or hermes pane; everything else
@@ -986,7 +991,7 @@ function updateQueueControls() {
 
   if (!streaming) {
     stopQueueTimer();
-    if (queuePaneId !== null) { queuePaneId = null; queueSig = null; }
+    if (queuePaneId !== null) { queuePaneId = null; queueSig = null; queueDone.clear(); queueSeen.clear(); }
     showQueueTray([], []);
     return;
   }
@@ -994,6 +999,8 @@ function updateQueueControls() {
   if (queuePaneId !== pane.pane_id) {
     queuePaneId = pane.pane_id;
     queueSig = null;
+    queueDone.clear();
+    queueSeen.clear();
     refreshQueue(true);            // immediate read on pane/status change
   }
   startQueueTimer();
@@ -1014,7 +1021,18 @@ function queueItems(list, kind) {
 /* Rebuild the tray only when the visible rows changed; a malformed/missing array simply
    contributes no rows — never an exception. */
 function showQueueTray(steering, followUp, note) {
-  const rows = queueItems(steering, 'steer').concat(queueItems(followUp, 'followup'));
+  const all = queueItems(steering, 'steer').concat(queueItems(followUp, 'followup'));
+  /* A row this composer just sent is no longer a queued row. Keep it out until the
+     bridge's own list stops naming it; prune the buried id as soon as it does. */
+  const present = {};
+  for (let i = 0; i < all.length; i++) present[all[i].id] = true;
+  if (queueDone.size) {
+    Array.from(queueDone).forEach(function (id) {
+      if (present[id]) queueSeen.add(id);
+      else if (queueSeen.has(id)) { queueDone.delete(id); queueSeen.delete(id); }
+    });
+  }
+  const rows = all.filter(function (row) { return !queueDone.has(row.id); });
   const noteText = String(note == null ? '' : note).trim();
   const sig = JSON.stringify({ rows: rows, note: noteText });
   if (sig === queueSig) return;
@@ -1029,6 +1047,7 @@ function showQueueTray(steering, followUp, note) {
     const row = document.createElement('div');
     row.className = 'queue-row';
     row.dataset.kind = rows[i].kind;
+    row.dataset.id = rows[i].id;
     const kind = document.createElement('span');
     kind.className = 'queue-kind';
     kind.textContent = rows[i].kind === 'followup' ? 'follow-up' : 'steer';
@@ -1046,6 +1065,27 @@ function showQueueTray(steering, followUp, note) {
   /* The tray is a queue, not a status badge: with no actual queued row it stays out of the
      composer even when the agent has a note to explain what the echo means. */
   tray.classList.toggle('hidden', rows.length === 0);
+}
+
+/* Remove one row from the tray as soon as its send was accepted; the next queue read
+   supplies the truth. This is a display update only — it never changes what was sent. */
+function forgetQueuedRow(id) {
+  const key = String(id == null ? '' : id);
+  if (!key) return;
+  queueDone.add(key);
+  queueSeen.delete(key);
+  const list = $('queueList');
+  if (list) {
+    const rows = list.querySelectorAll('.queue-row');
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].dataset.id === key) rows[i].remove();
+    }
+    const tray = $('queueTray');
+    if (tray) tray.classList.toggle('hidden', !list.querySelector('.queue-row'));
+    const note = $('queueNote');
+    if (note && !list.querySelector('.queue-row')) { note.textContent = ''; note.classList.add('hidden'); }
+  }
+  queueSig = null;
 }
 
 async function refreshQueue(force) {
@@ -1106,11 +1146,204 @@ async function sendQueued(mode) {
   flashResult(true, (kind === 'steer' ? 'steer queued' : 'follow-up queued') +
     (item.id ? ' · ' + item.id : ''));
   ta.value = '';                                     // only after the queue accepted it
+  forgetQueuedRow(item.id);                          // sent means gone from the tray now
   if (plan.paths && plan.paths.length && cv && typeof cv.clearAttachments === 'function') {
     try { cv.clearAttachments(); } catch (e) { /* a broken chat view must not break sending */ }
   }
   refreshQueue(true);                                // immediate post-action read
   return true;
+}
+
+/* ------------------------------------------------------------------ *
+ * Claude Code tool approvals — a banner in the composer while a tool call
+ * waits for a decision. A request belongs to one pane, so the banner follows
+ * the selected pane and nothing of another pane's request survives a switch.
+ * ------------------------------------------------------------------ */
+
+const APPROVAL_POLL_MS = 1500;       // one read, and only while a claude pane is selected
+const APPROVAL_PREVIEW_MAX = 4000;   // characters painted from one preview
+
+let approvalPaneId = null;    // the pane the banner follows (null: not a claude pane)
+let approvalTimer = null;     // the read interval, running only while that pane is selected
+let approvalSig = null;       // the last painted request, so an unchanged read repaints nothing
+let approvalInFlight = false; // one read at a time
+let approvalAgain = false;    // a forced read arrived while one was in flight
+let approvalPosting = false;  // a decision is in flight — both buttons stay disabled
+let approvalPendingId = '';   // the request the two buttons decide on
+let approvalStatus = '';      // the status last seen for that pane; a change re-reads at once
+
+function approvalPane() {
+  const pane = state.selected ? findPane(state.selected) : null;
+  return (pane && pane.agent === 'claude') ? pane : null;
+}
+
+function stopApprovalTimer() {
+  if (approvalTimer !== null) {
+    try { window.clearInterval(approvalTimer); } catch (e) { /* ignore */ }
+    approvalTimer = null;
+  }
+}
+
+function startApprovalTimer() {
+  if (approvalTimer !== null) return;
+  approvalTimer = window.setInterval(function () { refreshApprovals(false); }, APPROVAL_POLL_MS);
+}
+
+/* Two buttons, one request: while a decision is in flight neither may fire again, and a
+   banner with no request keeps both disabled. */
+function setApprovalBusy(busy) {
+  approvalPosting = !!busy;
+  const blocked = approvalPosting || !approvalPendingId;
+  const allow = $('approvalAllow');
+  const deny = $('approvalDeny');
+  if (allow) allow.disabled = blocked;
+  if (deny) deny.disabled = blocked;
+  const box = $('approvalBanner');
+  if (box) {
+    if (approvalPosting) box.setAttribute('aria-busy', 'true');
+    else box.removeAttribute('aria-busy');
+  }
+}
+
+/* Paint one request, or clear the banner with null. Every string here came from the
+   server and is written as text: a preview is display data, never markup. Nothing in
+   here takes focus — the composer keeps the keyboard while Claude works. */
+function showApprovalBanner(req) {
+  const box = $('approvalBanner');
+  const shell = $('promptBox');
+  if (!box) return;
+  if (!req) {
+    approvalPendingId = '';
+    approvalSig = null;
+    box.classList.add('hidden');
+    box.removeAttribute('data-request-id');
+    if (shell) shell.classList.remove('approval-open');
+    setText($('approvalTitle'), '');
+    setText($('approvalMeta'), '');
+    setText($('approvalSummary'), '');
+    setText($('approvalPreview'), '');
+    setText($('approvalTrunc'), '');
+    hide($('approvalPreview'));
+    hide($('approvalTrunc'));
+    setApprovalBusy(approvalPosting);
+    return;
+  }
+  approvalPendingId = req.id;
+  setText($('approvalTitle'), req.title);
+  setText($('approvalMeta'), req.meta);
+  setText($('approvalSummary'), req.summary);
+  const pre = $('approvalPreview');
+  if (pre) {
+    pre.textContent = req.preview;
+    pre.classList.toggle('hidden', !req.preview);
+  }
+  const trunc = $('approvalTrunc');
+  if (trunc) {
+    trunc.textContent = req.truncated ? 'the tool input was too long to show in full' : '';
+    trunc.classList.toggle('hidden', !req.truncated);
+  }
+  box.setAttribute('data-request-id', approvalPendingId);
+  box.classList.remove('hidden');
+  /* The composer can be pinned to a stored height; a banner inside it must not be clipped. */
+  if (shell) shell.classList.add('approval-open');
+  setApprovalBusy(approvalPosting);
+}
+
+/* The first pending request, plus how many are queued behind it. */
+function paintApproval(list) {
+  const rows = (Array.isArray(list) ? list : []).filter(function (a) { return a && typeof a === 'object'; });
+  if (!rows.length) { showApprovalBanner(null); return; }
+  const req = rows[0];
+  const more = rows.length - 1;
+  const id = String(req.id == null ? '' : req.id);
+  const title = String(req.title == null ? '' : req.title).trim();
+  const summary = String(req.summary == null ? '' : req.summary).trim();
+  const tool = String(req.tool_name == null ? '' : req.tool_name).trim();
+  const mode = String(req.permission_mode == null ? '' : req.permission_mode).trim();
+  const preview = String(req.preview == null ? '' : req.preview).slice(0, APPROVAL_PREVIEW_MAX);
+  const truncated = req.input_truncated === true || req.tool_input_truncated === true;
+  const sig = JSON.stringify([id, title, summary, tool, mode, preview, truncated, more, approvalPosting]);
+  if (sig === approvalSig) return;
+  approvalSig = sig;
+  showApprovalBanner({
+    id: id,
+    title: title || ('Claude wants to use ' + (tool || 'a tool')),
+    meta: [tool, mode, more > 0 ? '+' + more + ' more' : '', truncated ? 'preview truncated' : ''].filter(Boolean).join('  ·  '),
+    summary: summary,
+    preview: preview,
+    truncated: truncated
+  });
+}
+
+/* Read the selected claude pane's pending requests. `force` is a selection/status change
+   or a post-decision read, and it retries a read that overlapped another. */
+async function refreshApprovals(force) {
+  const pane = approvalPane();
+  if (!pane) return;
+  if (approvalInFlight) { if (force) approvalAgain = true; return; }
+  approvalInFlight = true;
+  const paneId = pane.pane_id;
+  const body = await api('/api/approvals?pane_id=' + encodeURIComponent(paneId));
+  approvalInFlight = false;
+  if (approvalAgain) { approvalAgain = false; refreshApprovals(true); }
+  /* the selection may have moved while the read was in flight */
+  if (approvalPaneId !== paneId || state.selected !== paneId) return;
+  if (!body || body.ok !== true) return;   // a failed read keeps the last banner; it never invents one
+  paintApproval(body.approvals);
+}
+
+/* One request, one decision. The POST names the pane the request was read for, so a
+   selection that moved on can never answer for another pane. */
+async function decideApproval(decision) {
+  const id = approvalPendingId;
+  const paneId = approvalPaneId;
+  if (!id || !paneId || approvalPosting) return false;
+  if (state.selected !== paneId) { showApprovalBanner(null); return false; }
+  setApprovalBusy(true);
+  const body = await postJSON('/api/approvals/' + encodeURIComponent(id),
+    { pane_id: paneId, decision: decision === 'deny' ? 'deny' : 'allow' });
+  setApprovalBusy(false);
+  const ok = !!(body && body.ok === true);
+  flashResult(ok, ok
+    ? (decision === 'deny' ? 'denied — the tool call will not run' : 'allowed once — this tool call runs')
+    : 'approval — ' + errText(body));
+  approvalSig = null;          // the next read repaints even if the request is unchanged
+  refreshApprovals(true);      // immediate post-decision read
+  return ok;
+}
+
+/* Called from the header on every pane/status change. It never focuses anything, and it
+   never asks the view: the composer is shared by chat, raw and the terminal view, so a
+   request that is pending there is pending here too. */
+function updateApprovalControls() {
+  const pane = approvalPane();
+  if (!pane) {
+    if (approvalPaneId !== null) { approvalPaneId = null; approvalStatus = ''; approvalSig = null; }
+    stopApprovalTimer();
+    showApprovalBanner(null);
+    return;
+  }
+  const paneId = pane.pane_id;
+  const status = statusOf(pane);
+  if (approvalPaneId !== paneId) {
+    approvalPaneId = paneId;
+    approvalStatus = status;
+    approvalSig = null;
+    showApprovalBanner(null);      // a switch never leaves the previous pane's request on screen
+    refreshApprovals(true);        // immediate read on selection change
+  } else if (approvalStatus !== status) {
+    approvalStatus = status;
+    refreshApprovals(true);        // a turn starting or ending can bring or retire a request
+  }
+  startApprovalTimer();
+}
+
+function wireApprovals() {
+  const allow = $('approvalAllow');
+  const deny = $('approvalDeny');
+  if (allow) allow.addEventListener('click', function () { decideApproval('allow'); });
+  if (deny) deny.addEventListener('click', function () { decideApproval('deny'); });
+  updateApprovalControls();
 }
 
 /* The textarea's Enter behaviour: Shift+Enter stays a newline (no preventDefault);
@@ -3434,6 +3667,7 @@ function init() {
   const pFollow = $('promptFollowup');
   if (pFollow) pFollow.addEventListener('click', function () { sendQueued('followup'); });
   updateQueueControls();
+  wireApprovals();                               // the Claude approval banner above the queue tray
   wireAttachComposer();                          // CONTRACT-v2 §10: picker, drop and paste
   const kr = $('keysRow');
   if (kr) kr.addEventListener('click', function (e) {

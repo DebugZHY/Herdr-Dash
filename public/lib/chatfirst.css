@@ -338,6 +338,94 @@
 
 #hdAttachList, #hdAttachNote { margin-bottom: 8px; }
 
+/* ---------------------------------------------------------------- approvals */
+
+/* A Claude tool call waiting for a decision, above the queue tray. The two buttons are
+   the only answer; the preview is inert display data. The banner sizes itself, so a
+   composer pinned to a stored height opens up instead of clipping it. */
+#promptBox.approval-open { height: auto; }
+
+.approval-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin: 0 0 9px;
+  padding: 8px 10px 9px;
+  border: 1px solid rgba(224, 160, 42, .45);
+  border-left: 3px solid var(--st-working);
+  border-radius: 10px;
+  background: var(--bg-panel2);
+}
+.approval-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+.approval-badge {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: rgba(224, 160, 42, .16);
+  color: var(--st-working);
+  font: 600 10px/1.6 system-ui, "Segoe UI", Roboto, sans-serif;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+.approval-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--fg);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.approval-meta {
+  flex: 0 0 auto;
+  color: var(--fg-dim);
+  font: 11px/1.4 var(--mono);
+}
+.approval-body { min-width: 0; }
+.approval-summary {
+  color: var(--fg);
+  font: 12px/1.45 var(--mono);
+  overflow-wrap: anywhere;
+}
+.approval-summary:empty { display: none; }
+.approval-preview {
+  max-height: 132px;
+  margin: 4px 0 0;
+  padding: 6px 8px;
+  overflow: auto;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--bg-input);
+  color: var(--fg-dim);
+  font: 11px/1.45 var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.approval-trunc {
+  margin-top: 4px;
+  color: var(--st-working);
+  font-size: 10.5px;
+}
+.approval-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.approval-actions .btn { min-width: 92px; }
+.approval-deny {
+  border-color: rgba(229, 72, 77, .5);
+  color: #f2a6a8;
+}
+.approval-deny:hover {
+  background: rgba(229, 72, 77, .16);
+  color: var(--fg);
+}
+
 .composer-tools {
   display: flex;
   align-items: center;

@@ -108,6 +108,25 @@ if (typeof window.HD.register !== 'function') {
     <section id="promptBox">
       <div id="hdAttachList" class="hd-cv-attach-list hidden"></div>
       <div id="hdAttachNote" class="hd-cv-attach-note hidden"></div>
+      <div id="approvalBanner" class="approval-banner hidden" role="group" aria-live="polite"
+           aria-labelledby="approvalTitle">
+        <div class="approval-head">
+          <span class="approval-badge">claude</span>
+          <span id="approvalTitle" class="approval-title"></span>
+          <span id="approvalMeta" class="approval-meta"></span>
+        </div>
+        <div id="approvalBody" class="approval-body">
+          <div id="approvalSummary" class="approval-summary"></div>
+          <pre id="approvalPreview" class="approval-preview hidden"></pre>
+          <div id="approvalTrunc" class="approval-trunc hidden"></div>
+        </div>
+        <div class="approval-actions">
+          <button id="approvalDeny" class="btn approval-deny" type="button"
+                  title="refuse this tool call — nothing runs">Deny</button>
+          <button id="approvalAllow" class="btn primary approval-allow" type="button"
+                  title="run this one tool call, this once">Allow once</button>
+        </div>
+      </div>
       <div id="queueTray" class="queue-tray hidden" aria-live="polite">
         <span class="queue-label">queued (dash)</span>
         <div id="queueList" class="queue-list"></div>

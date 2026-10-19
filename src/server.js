@@ -32,6 +32,7 @@ const chatSession = require('./chat/session');   // §9 pane→session binding (
 const attach = require('./attach');              // §10 POST /api/attach (round 7.7)
 const pathsApi = require('./paths');             // §13.2 POST /api/pathinfo, /api/open (round 9)
 const statusView = require('./status');          // §12.3 GET /api/status (round 8)
+const approvals = require('./approvals');        // Claude Code PreToolUse approval bridge
 const promptdetect = require('./promptdetect');   // agent question detection from terminal text
 const paneCacheModule = require('./pane-cache'); // §8 pane/session read caches (W1)
 /* Stream bridge (wave 1): the NDJSON sink the pi extension / hermes plugin writes, served
@@ -59,6 +60,15 @@ const CLI_TIMEOUT_MS = 15000;            // §4 body default for /api/cli
 const CLI_MAX_OUTPUT = 8 * 1024 * 1024;  // safety valve on captured stdout/stderr
 const HERDR_BIN = process.env.HERDR_BIN_PATH || 'herdr';
 const STARTED_AT = Date.now();
+
+// Claude Code approval bridge: a hook can wait up to 115 s; the store expires at 110 s and
+// answers null, which leaves Claude's own permission flow in charge.
+const APPROVAL_HOME = process.env.HERDR_DASH_HOME || path.join(os.homedir(), '.herdr-dash');
+const approvalBridge = approvals.createApprovalBridge({
+  dir: APPROVAL_HOME,
+  timeoutMs: Number(process.env.HERDR_DASH_APPROVAL_TIMEOUT_MS) || undefined,
+});
+const UI_COOKIE = 'hd_approval';
 
 // §7.1 (v2 round 5): the read-only git view. GIT_BIN is overridable so a test can
 // point it at a missing binary (git_missing) or at a wrapper; the subcommands it
@@ -107,6 +117,33 @@ const err = (res, code, message, extra) =>
   sendJson(res, Object.assign({ ok: false, error: { code, message } }, extra || {}));
 // Unknown paths are the one non-200 JSON response (§4): 404 + {code:"not_found"}.
 const notFound = (res, message) => sendJson(res, { ok: false, error: { code: 'not_found', message } }, 404);
+
+/* The approval UI is same-origin only. The browser sends a SameSite=Strict cookie that this
+   process created at startup; the hook uses a separate bearer token from a file. Neither
+   credential is accepted on the other route. */
+function approvalCookie() {
+  return UI_COOKIE + '=' + approvalBridge.uiToken + '; Path=/; HttpOnly; SameSite=Strict';
+}
+
+function requestOriginAllowed(req) {
+  const origin = req.headers.origin;
+  if (origin) {
+    const host = req.headers.host || '';
+    if (origin !== 'http://' + host && origin !== 'https://' + host) return false;
+  }
+  const site = req.headers['sec-fetch-site'];
+  if (site && site !== 'same-origin' && site !== 'none') return false;
+  return true;
+}
+
+function requireApprovalUi(req) {
+  if (!requestOriginAllowed(req)) {
+    throw { code: 'forbidden', message: 'the approval routes only accept the dashboard origin' };
+  }
+  if (!approvalBridge.authorizedUi(req.headers.cookie)) {
+    throw { code: 'unauthorized', message: 'reload the dashboard to renew its approval session' };
+  }
+}
 
 function sendJson(res, body, statusCode, extraHeaders) {
   if (res.writableEnded) return;
@@ -596,6 +633,67 @@ async function handleQueueGet(req, res, url) {
     followUp: state.followUp,
     updated_at: state.updated_at,
     note: state.note || (bridge.ready ? '' : bridge.note),
+  });
+}
+
+/* GET /api/approvals?pane_id=<id> — the selected Claude pane's pending tool calls.
+   The first call establishes the SameSite=Strict UI cookie and returns no rows; the page's
+   next poll sees them. A cross-origin page cannot read either response. */
+function handleApprovalsGet(req, res, url) {
+  if (!requestOriginAllowed(req)) {
+    throw { code: 'forbidden', message: 'the approval routes only accept the dashboard origin' };
+  }
+  const paneId = String(url.searchParams.get('pane_id') || '').trim();
+  if (!paneId) throw { code: 'bad_request', message: '"pane_id" query parameter is required' };
+  if (!approvalBridge.authorizedUi(req.headers.cookie)) {
+    return sendJson(res, { ok: true, pane_id: paneId, approvals: [] }, 200, { 'set-cookie': approvalCookie() });
+  }
+  return ok(res, { pane_id: paneId, approvals: approvalBridge.list(paneId) });
+}
+
+/* POST /api/approvals/<id> {pane_id, decision} — the only writer of a human decision. */
+function handleApprovalDecision(req, res, body, id) {
+  requireApprovalUi(req);
+  const paneId = requireString(body, 'pane_id');
+  const decision = requireString(body, 'decision');
+  const result = approvalBridge.decide(id, paneId, decision);
+  return ok(res, {
+    id: result.id,
+    decision: result.decision,
+    reason: result.reason,
+  });
+}
+
+/* POST /api/claude/approval — the PreToolUse hook's long poll. The hook's bearer token is
+   separate from the UI cookie. A request must name a live Claude pane; a stale or forged
+   pane id cannot create a banner. */
+async function handleClaudeApproval(req, res, body) {
+  if (!approvalBridge.authorized(req.headers.authorization)) {
+    throw { code: 'unauthorized', message: 'the approval hook token is missing or invalid' };
+  }
+  const paneId = requireString(body, 'pane_id');
+  const info = await paneSessionInfo(paneId);
+  if (!info.entry || info.family !== 'claude') {
+    throw { code: 'not_claude_pane', message: 'the approval request did not come from a Claude pane' };
+  }
+  if (info.sessionId && body.session_id && String(body.session_id) !== info.sessionId) {
+    throw { code: 'session_mismatch', message: 'the approval request names a different Claude session' };
+  }
+  const rec = approvalBridge.create(body);
+  let closed = false;
+  const onClose = () => {
+    if (res.writableEnded) return;
+    closed = true;
+    approvalBridge.cancel(rec.id, 'client_closed');
+  };
+  res.on('close', onClose);
+  const result = await rec.wait;
+  res.off('close', onClose);
+  if (closed || res.writableEnded) return;
+  return ok(res, {
+    id: rec.id,
+    decision: result.decision,
+    reason: result.reason,
   });
 }
 
@@ -4093,6 +4191,7 @@ async function handle(req, res) {
     if (pathname === '/api/status') return handleStatus(req, res, url); // §12.3
     if (pathname === '/api/prompt') return handlePromptDetect(req, res, url);
     if (pathname === '/api/queue') return handleQueueGet(req, res, url);   // native queue endpoint
+    if (pathname === '/api/approvals') return handleApprovalsGet(req, res, url);
     if (pathname === '/api/model') return handleModelGet(req, res, url);
     if (pathname === '/api/sessions') return handleSessionsGet(req, res, url);
     if (pathname === '/api/effort') return handleEffortGet(req, res, url);
@@ -4112,6 +4211,18 @@ async function handle(req, res) {
 
   // POST routes (all take a JSON body)
   if (method === 'POST') {
+    if (pathname === '/api/claude/approval') {
+      const body = await readJson(req);
+      return handleClaudeApproval(req, res, body);
+    }
+    if (pathname.startsWith('/api/approvals/')) {
+      const id = decodeURIComponent(pathname.slice('/api/approvals/'.length));
+      if (!/^ap-[A-Za-z0-9-]{1,120}$/.test(id)) {
+        throw { code: 'not_found', message: 'no approval request with that id' };
+      }
+      const body = await readJson(req);
+      return handleApprovalDecision(req, res, body, id);
+    }
     const handlers = {
       '/api/pane/prompt': handlePrompt,
       '/api/pane/keys': handleKeys,
