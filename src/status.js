@@ -3,9 +3,12 @@
  * src/status.js — CONTRACT-v2 §12.3 `GET /api/status?pane_id=<id>` (round 8, owner: W1)
  *
  * INTERPRETATION ONLY. This module owns no transport: src/server.js performs the
- * only reads §12.3.5 allows (one `pane.read` of the pane's visible text, plus one
- * bounded read of a claude session log's tail) and hands the bytes here. Every
- * function below is pure over that input, which is why the parsers can be pinned
+ * only reads §12.3.5 allows: one `pane.read` of the pane's visible text for the
+ * families whose figures are printed there, plus one bounded read of a claude
+ * session log's tail. pi's block comes from its jsonl alone and never reads the
+ * pane, so a status poll cannot make a pi TUI redraw and scroll. Those bytes are
+ * handed here. Every function below is pure over that input, which is why the
+ * parsers can be pinned
  * against §12.3's verbatim fixtures without a pipe and without a pane.
  *
  * THE RULE THIS FILE IS BUILT AROUND: NEVER INVENT A NUMBER.

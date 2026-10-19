@@ -3046,9 +3046,9 @@ async function liveSessionFor(paneId, entry, agent, herdrSessionId, agents, read
   }
 }
 
-/** The cold path itself: the pane read, the store/log lookup, the resolver and
- *  the §9.3 heal. Only `liveSessionFor` calls this, so the sharing above is the
- *  only way in. */
+/** The cold path itself: the pane read (unless a pi sink already names the session),
+ *  the store/log lookup, the resolver and the §9.3 heal. Only `liveSessionFor` calls
+ *  this, so the sharing above is the only way in. */
 async function resolveLiveSession(paneId, entry, agent, herdrSessionId, agents, readerPick, mark) {
   if (SCAN_DELAY_MS) await new Promise((r) => setTimeout(r, SCAN_DELAY_MS));
   const cwd = typeof entry.cwd === 'string' ? entry.cwd.trim() : '';
@@ -3060,8 +3060,19 @@ async function resolveLiveSession(paneId, entry, agent, herdrSessionId, agents, 
     claimed: claimedByOtherPanes(agents, paneId),
     reader_pick: readerPick,
   };
-  const texts = await paneTexts(paneId);
-  if (mark) mark('paneTexts');
+  const reader = fileLogReader(agent);
+  /* A pi pane's bridge sink names the session outright. Reading 60 + 200 lines of its
+     TUI on every background refresh is not evidence we need, and a full-viewport read
+     makes pi redraw and scroll; so when the sink answers, no pane text is read. */
+  let piSink = null;
+  if (agent === 'pi' && reader && typeof reader.sinkSessionForPane === 'function') {
+    try { piSink = await reader.sinkSessionForPane(paneId); } catch (e) { piSink = null; }
+  }
+  let texts = { visible: null, recent: null, error: null };
+  if (!piSink) {
+    texts = await paneTexts(paneId);
+    if (mark) mark('paneTexts');
+  }
   inp.pane_text_visible = texts.visible;
   inp.pane_text_recent = texts.recent;
 
@@ -3081,19 +3092,13 @@ async function resolveLiveSession(paneId, entry, agent, herdrSessionId, agents, 
       } catch (e) { inp.store_known_ids = null; }
     }
   } else if ((agent === 'claude' || agent === 'pi') && cwd) {
-    const reader = fileLogReader(agent);
     inp.candidates = await fileLogs(agent, cwd);
     if (mark) mark('fileLogs');
     if (agent === 'pi') {
       // The pi bridge writes a pane-specific sink file; its first envelope names
       // the session this pane actually runs. It outranks the cwd-rank guess when
       // several pi panes share one cwd (and one of them has no log of its own).
-      try {
-        inp.sink_session = typeof reader.sinkSessionForPane === 'function'
-          ? await reader.sinkSessionForPane(paneId) : null;
-      } catch (e) {
-        inp.sink_session = null;
-      }
+      inp.sink_session = piSink;
       // herdr never publishes a pi session (verified live: its report is accepted
       // and the read-back stays empty), so when several pi panes share one cwd the
       // server assigns the cwd's newest logs to them itself — oldest pane first,
@@ -3838,15 +3843,10 @@ const STATUS_PANE_LINES = 400;
 /**
  * §12.3 `GET /api/status?pane_id=<id>` — read-only, and read-only BY CONSTRUCTION:
  * the only herdr calls on this path are `agent.list` / `session.snapshot` (both
- * served from the 5 s caches the rest of the view already keeps) and ONE
- * `pane.read` of the pane's visible text. Nothing here writes to a pane or to
- * herdr: in particular this route does NOT call `liveSessionFor`, because that
- * resolver can run §9's candidate scan and §9.3's heal (a
- * `pane.report_agent_session` write), while §12.3.5 caps the endpoint at one pane
- * read plus one jsonl tail read. The claude session id therefore comes from
- * herdr's own record in `agent.list` — the same starting point /api/chat uses —
- * and a pane herdr records no session for answers with an absent `context`
- * instead of paying for a scan.
+ * served from the 5 s caches the rest of the view already keeps) and, for the
+ * families whose blocks are printed in pane text, ONE `pane.read` of the visible
+ * text. A pi pane is never read here: its context comes from `pi_tail`, and a
+ * full-viewport read makes its TUI redraw and scroll.
  *
  * A pane herdr does not know at all is refused BEFORE any read, so a bogus id
  * cannot cost a `pane.read`. An agent that is neither family answers ok:true with
@@ -3889,7 +3889,10 @@ async function handleStatus(req, res, url) {
 
   let text = null;
   let textError = null;
-  if (family !== 'other') {
+  /* pi's block is built from its own jsonl (`pi_tail`), not from pane text: its
+     transcript is long and a full-viewport read makes the TUI redraw and scroll.
+     So the selectable pane is never read for a pi status. */
+  if (family !== 'other' && family !== 'pi') {
     try {
       const result = await timed(() => hdr.request(
         'pane.read',

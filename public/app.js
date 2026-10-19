@@ -638,6 +638,11 @@ function appendToBuffer(b, newLines) {
 }
 
 async function pollPane() {
+  /* Only the raw transcript reads the pane here. The chat view owns /api/chat and
+     the terminal view owns the engine; polling 1200 pane lines behind either one
+     is a second reader, and for pi it makes the TUI redraw and scroll. */
+  if (termActive) return;
+  if (effectiveMode() !== 'raw') return;
   const paneId = state.selected;
   if (!paneId || state.pollInFlight) return;
   state.pollInFlight = true;
@@ -3317,6 +3322,7 @@ function applyView(mode, opts) {
     if (chat) chat.classList.add('hidden');
     setViewChip('raw');
   }
+  if (next === 'raw') pollPane();
   updatePerfHud();
   return next;
 }
