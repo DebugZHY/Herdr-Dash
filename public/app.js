@@ -388,12 +388,48 @@ function renderTree() {
     return;
   }
 
+  const tabs = tabsAll();
   const panes = panesAll();
+
+  /* One pane row shape for every bucket: tab panes and the unassigned bucket must keep
+     the same click, selected, focused, agent, status and data-pane-id behaviour. */
+  const paneRow = function (p) {
+    const pr = rowEl('pane-row' + (p.pane_id === state.selected ? ' selected' : ''));
+    pr.title = 'pane ' + p.pane_id + (p.agent ? ' · ' + p.agent : '') +
+               (p.cwd ? '  cwd=' + p.cwd : '');
+    pr.dataset.paneId = p.pane_id;                       // lib/fanout.js reads this
+    pr.appendChild(dot(statusOf(p)));
+
+    const main = document.createElement('span');
+    main.className = 'pane-main';
+    main.appendChild(span('pane-name', paneShortName(p)));
+    const meta = document.createElement('span');
+    meta.className = 'pane-meta';
+    meta.appendChild(span('pane-id mono', p.pane_id));
+    if (p.agent) {
+      meta.appendChild(span('pane-sep', '·'));
+      meta.appendChild(span('pane-agent', p.agent));
+    }
+    main.appendChild(meta);
+    pr.appendChild(main);
+    pr.appendChild(span('pane-status small', statusOf(p)));
+    if (p.focused) pr.appendChild(span('focus-mark', '●'));
+
+    pr.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      selectPane(p.pane_id);
+    });
+    return pr;
+  };
 
   wss.forEach(function (w) {
     const wid = w.workspace_id;
     const wPanes = panes.filter(function (p) { return p && p.workspace_id === wid; });
     if (!wPanes.length) return;                    // the rail is an agent list: empty groups take no room
+
+    const wTabs = tabs.filter(function (t) { return t && t.workspace_id === wid; });
+    const tabIds = {};
+    wTabs.forEach(function (t) { if (t.tab_id != null) tabIds[t.tab_id] = true; });
 
     const collapsed = isCollapsed('ws', wid);
     const group = document.createElement('div');
@@ -401,6 +437,7 @@ function renderTree() {
 
     const wr = rowEl('ws-row');
     wr.title = 'workspace ' + wid + ' — click to ' + (collapsed ? 'expand' : 'collapse');
+    wr.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
     wr.appendChild(span('caret' + (collapsed ? '' : ' open'), collapsed ? '▸' : '▾'));
     wr.appendChild(span('ws-name', (w.number != null ? '#' + w.number + ' ' : '') + (w.label || wid)));
     wr.appendChild(span('ws-count', String(wPanes.length)));
@@ -415,35 +452,83 @@ function renderTree() {
 
     if (!collapsed) {
       const list = document.createElement('div');
-      list.className = 'ws-panes';
-      wPanes.forEach(function (p) {
-        const pr = rowEl('pane-row' + (p.pane_id === state.selected ? ' selected' : ''));
-        pr.title = 'pane ' + p.pane_id + (p.agent ? ' · ' + p.agent : '') +
-                   (p.cwd ? '  cwd=' + p.cwd : '');
-        pr.dataset.paneId = p.pane_id;                       // lib/fanout.js reads this
-        pr.appendChild(dot(statusOf(p)));
+      list.className = 'ws-tabs';
 
-        const main = document.createElement('span');
-        main.className = 'pane-main';
-        main.appendChild(span('pane-name', paneShortName(p)));
-        const meta = document.createElement('span');
-        meta.className = 'pane-meta';
-        meta.appendChild(span('pane-id mono', p.pane_id));
-        if (p.agent) {
-          meta.appendChild(span('pane-sep', '·'));
-          meta.appendChild(span('pane-agent', p.agent));
-        }
-        main.appendChild(meta);
-        pr.appendChild(main);
-        pr.appendChild(span('pane-status small', statusOf(p)));
-        if (p.focused) pr.appendChild(span('focus-mark', '●'));
+      wTabs.forEach(function (t) {
+        const tid = t.tab_id;
+        const tPanes = wPanes.filter(function (p) { return p && p.tab_id === tid; });
+        if (!tPanes.length) return;                // empty tabs take no room either
 
-        pr.addEventListener('click', function (ev) {
+        const tCollapsed = isCollapsed('tab', tid);
+        const tGroup = document.createElement('div');
+        tGroup.className = 'tab-group';
+
+        const num = t.number != null ? String(t.number) : '';
+        const label = String(t.label || '').trim();
+        const tabText = 'tab' + (num ? ' ' + num : '') +
+                        (label && label !== num ? ' · ' + label : '');
+
+        const tr = rowEl('tab-row');
+        tr.title = 'tab ' + tid + ' — click to ' + (tCollapsed ? 'expand' : 'collapse');
+        tr.setAttribute('aria-expanded', tCollapsed ? 'false' : 'true');
+        tr.appendChild(span('caret' + (tCollapsed ? '' : ' open'), tCollapsed ? '▸' : '▾'));
+        tr.appendChild(span('tab-name', tabText));
+        tr.appendChild(span('tab-count', String(tPanes.length)));
+        if (t.focused) tr.appendChild(span('focus-mark', '●'));
+        const tst = rollup(tPanes);
+        if (tst) tr.appendChild(dot(tst));
+        tr.addEventListener('click', function (ev) {
           ev.stopPropagation();
-          selectPane(p.pane_id);
+          setCollapsed('tab', tid, !tCollapsed);
+          renderTree();
         });
-        list.appendChild(pr);
+        tGroup.appendChild(tr);
+
+        if (!tCollapsed) {
+          const paneList = document.createElement('div');
+          paneList.className = 'tab-panes';
+          tPanes.forEach(function (p) { paneList.appendChild(paneRow(p)); });
+          tGroup.appendChild(paneList);
+        }
+        list.appendChild(tGroup);
       });
+
+      /* A pane whose tab is missing from tabs[] still belongs to its workspace. Keep the
+         bucket's collapse state in the existing state.collapsed.tabs map — no new key. */
+      const unassigned = wPanes.filter(function (p) {
+        return !p.tab_id || !tabIds[p.tab_id];
+      });
+      if (unassigned.length) {
+        const uid = '!unassigned:' + wid;
+        const uCollapsed = isCollapsed('tab', uid);
+        const uGroup = document.createElement('div');
+        uGroup.className = 'tab-group unassigned';
+
+        const ur = rowEl('tab-row unassigned');
+        ur.title = 'panes without a tab in this workspace — click to ' +
+                   (uCollapsed ? 'expand' : 'collapse');
+        ur.setAttribute('aria-expanded', uCollapsed ? 'false' : 'true');
+        ur.appendChild(span('caret' + (uCollapsed ? '' : ' open'), uCollapsed ? '▸' : '▾'));
+        ur.appendChild(span('tab-name', 'unassigned'));
+        ur.appendChild(span('tab-count', String(unassigned.length)));
+        const ust = rollup(unassigned);
+        if (ust) ur.appendChild(dot(ust));
+        ur.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          setCollapsed('tab', uid, !uCollapsed);
+          renderTree();
+        });
+        uGroup.appendChild(ur);
+
+        if (!uCollapsed) {
+          const upList = document.createElement('div');
+          upList.className = 'tab-panes';
+          unassigned.forEach(function (p) { upList.appendChild(paneRow(p)); });
+          uGroup.appendChild(upList);
+        }
+        list.appendChild(uGroup);
+      }
+
       group.appendChild(list);
     }
     host.appendChild(group);
@@ -845,29 +930,31 @@ async function sendPrompt() {
 }
 
 /* ------------------------------------------------------------------ *
- * pi steer / follow-up / bridge-visible tray
+ * steer / follow-up / bridge-visible tray
  *
- * Only a pi pane whose agent_status is "working" gets the queued composer: steer
- * delivers after the current step, follow-up after the run settles. The tray shows
- * what the bridge reports in its control NDJSON — never pi's own TUI queue — and
- * there is deliberately no clear/recall control.
+ * A pi OR hermes pane whose agent_status is "working" gets the queued composer:
+ * steer delivers after the current step, follow-up after the run settles. The tray
+ * shows what the bridge reports for pi and the echoed command rows plus note for
+ * hermes; there is deliberately no clear/recall control.
  * ------------------------------------------------------------------ */
 
-let queuePaneId = null;      // the pi pane the tray currently follows
+let queuePaneId = null;      // the working pane the tray currently follows
 let queueTimer = null;       // 2 s refresh interval (only while that pane is working)
 let queueSig = null;         // the last rendered rows (kind/id/text)
 let queueInFlight = false;   // one GET /api/queue at a time
 let queueAgain = false;      // a forced refresh arrived while one was in flight
 
-function workingPiPane() {
+function workingQueuePane() {
   const pane = state.selected ? findPane(state.selected) : null;
-  return (pane && pane.agent === 'pi' && statusOf(pane) === 'working') ? pane : null;
+  const queued = pane && (pane.agent === 'pi' || pane.agent === 'hermes');
+  return (queued && statusOf(pane) === 'working') ? pane : null;
 }
 
-/* Enter = steer, Alt+Enter = follow-up — but only on a working pi pane. Every other
-   pane (and Shift+Enter) keeps the pre-existing behaviour. */
+/* Enter = steer, Alt+Enter = follow-up — but only on a working pi or hermes pane.
+   Every other pane (and Shift+Enter) keeps the pre-existing behaviour. */
 function queueActionForEnter(pane, ev) {
-  if (!pane || pane.agent !== 'pi' || statusOf(pane) !== 'working') return null;
+  if (!pane || (pane.agent !== 'pi' && pane.agent !== 'hermes')) return null;
+  if (statusOf(pane) !== 'working') return null;
   if (!ev || ev.key !== 'Enter' || ev.shiftKey) return null;
   return ev.altKey ? 'followup' : 'steer';
 }
@@ -884,11 +971,11 @@ function startQueueTimer() {
   queueTimer = window.setInterval(function () { refreshQueue(false); }, 2000);
 }
 
-/* Show the streaming composer only for a working pi pane; everything else keeps the
-   normal send button. Called from renderHeader(), so a pane or status change lands
-   here; entering the streaming state reads the queue at once. */
+/* Show the streaming composer only for a working pi or hermes pane; everything else
+   keeps the normal send button. Called from renderHeader(), so a pane or status change
+   lands here; entering the streaming state reads the queue at once. */
 function updateQueueControls() {
-  const pane = workingPiPane();
+  const pane = workingQueuePane();
   const streaming = !!pane;
   const send = $('promptSend');
   const steer = $('promptSteer');
@@ -926,14 +1013,16 @@ function queueItems(list, kind) {
 
 /* Rebuild the tray only when the visible rows changed; a malformed/missing array simply
    contributes no rows — never an exception. */
-function showQueueTray(steering, followUp) {
+function showQueueTray(steering, followUp, note) {
   const rows = queueItems(steering, 'steer').concat(queueItems(followUp, 'followup'));
-  const sig = JSON.stringify(rows);
+  const noteText = String(note == null ? '' : note).trim();
+  const sig = JSON.stringify({ rows: rows, note: noteText });
   if (sig === queueSig) return;
   queueSig = sig;
 
   const tray = $('queueTray');
   const list = $('queueList');
+  const noteEl = $('queueNote');
   if (!tray || !list) return;
   list.textContent = '';
   for (let i = 0; i < rows.length; i++) {
@@ -950,11 +1039,15 @@ function showQueueTray(steering, followUp) {
     row.appendChild(text);
     list.appendChild(row);
   }
-  tray.classList.toggle('hidden', rows.length === 0);
+  if (noteEl) {
+    noteEl.textContent = noteText;
+    noteEl.classList.toggle('hidden', !noteText);
+  }
+  tray.classList.toggle('hidden', rows.length === 0 && !noteText);
 }
 
 async function refreshQueue(force) {
-  const pane = workingPiPane();
+  const pane = workingQueuePane();
   if (!pane) return;
   if (queueInFlight) { if (force) queueAgain = true; return; }
   queueInFlight = true;
@@ -963,18 +1056,20 @@ async function refreshQueue(force) {
   queueInFlight = false;
   if (queueAgain) { queueAgain = false; refreshQueue(true); }
   /* the selection may have moved while the read was in flight */
-  const now = workingPiPane();
+  const now = workingQueuePane();
   if (!now || now.pane_id !== paneId || queuePaneId !== paneId) return;
   if (!body || body.ok !== true) return;   // keep the last good rows; never invent an empty tray
-  showQueueTray(body.steering, body.followUp);
+  /* Hermes reports an ECHO plus a note; pi's response is unchanged (and carries no note). */
+  const note = now.agent === 'hermes' ? body.note : '';
+  showQueueTray(body.steering, body.followUp, note);
 }
 
 async function sendQueued(mode) {
   const kind = (mode === 'followup') ? 'followup' : 'steer';
   const ta = $('promptText');
   if (!ta || !needPane()) return false;
-  if (!workingPiPane()) {
-    flashResult(false, 'steer/follow-up are only available while a pi pane is working');
+  if (!workingQueuePane()) {
+    flashResult(false, 'steer/follow-up are only available while a pi or hermes pane is working');
     return false;
   }
   const typed = ta.value;
@@ -1017,7 +1112,7 @@ async function sendQueued(mode) {
 }
 
 /* The textarea's Enter behaviour: Shift+Enter stays a newline (no preventDefault);
-   otherwise a working pi pane steers/follows and every other pane sends normally. */
+   otherwise a working pi or hermes pane steers/follows and every other pane sends normally. */
 function handlePromptKeydown(ev) {
   if (!ev || ev.key !== 'Enter' || ev.shiftKey) return null;
   const mode = queueActionForEnter(findPane(state.selected), ev);

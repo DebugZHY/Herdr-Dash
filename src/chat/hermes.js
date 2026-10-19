@@ -673,8 +673,153 @@ async function configProviders(opts) {
   };
 }
 
+/* ── native steer / queue ────────────────────────────────────────────────────
+ *
+ * hermes already owns two slash commands, typed through the message channel
+ * (`agent.prompt`) — not into the terminal, exactly like `/model`:
+ *
+ *   /steer <text>   inject the text right after the next tool call
+ *   /queue <text>   run the text as the next turn
+ *
+ * The dashboard sends those two lines verbatim. There is no second protocol, no
+ * extension, no write to state.db and no read of hermes' internals: the only
+ * state kept here is an ECHO of what this server sent, so the tray can show what
+ * it did. That echo is an acknowledgement of our own writes, never a listing of
+ * hermes' queue — HERMES_ECHO_NOTE says so in the response.
+ */
+
+const HERMES_STEER_COMMAND = '/steer';
+const HERMES_FOLLOWUP_COMMAND = '/queue';
+const HERMES_ECHO_NOTE = 'commands sent from herdr-dash while the pane worked; Hermes keeps its own queue';
+const ECHO_ITEMS_MAX = 100;                 // bounded like the pi tray (QUEUE_ITEMS_MAX)
+
+/** The literal hermes command line: `/steer <text>` or `/queue <text>`. */
+function steerCommand(text) {
+  return HERMES_STEER_COMMAND + ' ' + (text === undefined || text === null ? '' : String(text));
+}
+function followupCommand(text) {
+  return HERMES_FOLLOWUP_COMMAND + ' ' + (text === undefined || text === null ? '' : String(text));
+}
+
+/** An opaque echo-row id (no counter the UI may arithmetic on), same shape as pi's. */
+function echoItemId(nowMs) {
+  const at = Number.isFinite(nowMs) ? Math.floor(nowMs) : Date.now();
+  let rnd = '';
+  try {
+    rnd = require('node:crypto').randomBytes(6).toString('hex');
+  } catch (e) {
+    rnd = Math.random().toString(36).slice(2, 14);
+  }
+  return 'h-' + at.toString(36) + '-' + rnd;
+}
+
+/**
+ * The pure decision for `mode:"steer"|"followup"` on a hermes pane.
+ *
+ * `agent` and `status` are resolved by the route from the live agent list, so the
+ * frozen codes (`unsupported_mode`, `bad_request`, `not_streaming`) are testable
+ * without a herdr connection. A refusal means the route writes nothing.
+ *
+ * @param {{mode?: string, agent?: string|null, status?: string|null, text?: string}} input
+ * @returns {{ok: true, kind: 'steer'|'followup', command: string}
+ *          | {ok: false, http: 400|409, code: string, message: string}}
+ */
+function planHermesQueuePrompt(input) {
+  const o = input || {};
+  const mode = o.mode === undefined || o.mode === null ? '' : String(o.mode);
+  if (mode !== 'steer' && mode !== 'followup') {
+    return {
+      ok: false, http: 400, code: 'bad_request',
+      message: '"mode" must be "steer" or "followup" for a queued message (plain prompts omit it)',
+    };
+  }
+  if (o.agent !== 'hermes') {
+    return {
+      ok: false, http: 400, code: 'unsupported_mode',
+      message: '"mode":"' + mode + '" is hermes-only here (this pane is ' + (o.agent ? String(o.agent) : 'unknown') + ')',
+    };
+  }
+  if (typeof o.text !== 'string' || !o.text.trim()) {
+    return {
+      ok: false, http: 400, code: 'bad_request',
+      message: '"text" must contain at least one non-whitespace character',
+    };
+  }
+  if (o.status !== 'working') {
+    return {
+      ok: false, http: 409, code: 'not_streaming',
+      message: 'this hermes pane is not working',
+    };
+  }
+  return {
+    ok: true,
+    kind: mode,
+    command: mode === 'steer' ? steerCommand(o.text) : followupCommand(o.text),
+  };
+}
+
+/* The echo store: pane id → the rows this process sent while the pane worked. In
+   memory only; a dashboard restart forgets them, which is honest — they were
+   never hermes' rows to begin with. */
+const paneEcho = new Map();
+
+function echoBucket(paneId) {
+  return paneEcho.get(String(paneId == null ? '' : paneId)) || null;
+}
+
+/** Remember one ACCEPTED command, for the tray to echo back. Bounded, newest kept. */
+function rememberEcho(paneId, item) {
+  const id = String(paneId == null ? '' : paneId);
+  const row = echoBucket(id) || { steering: [], followUp: [], updated_at: null };
+  const kind = item && item.kind === 'followup' ? 'followup' : 'steer';
+  const list = kind === 'steer' ? row.steering : row.followUp;
+  list.push({
+    id: String(item && item.id ? item.id : ''),
+    kind,
+    text: item && typeof item.text === 'string' ? item.text : '',
+    at: item && Number.isFinite(item.at) ? item.at : Date.now(),
+  });
+  if (list.length > ECHO_ITEMS_MAX) list.splice(0, list.length - ECHO_ITEMS_MAX);
+  row.updated_at = list[list.length - 1].at;
+  paneEcho.set(id, row);
+  return row;
+}
+
+/**
+ * The tray rows for a hermes pane.
+ *
+ * `working` is the caller's live read of `agent_status`. When the pane is no longer
+ * working its echo rows are DROPPED, so an idle pane never shows stale rows — the
+ * commands were consumed (or never could be) and hermes' queue is not ours to show.
+ *
+ * @returns {{steering: Array<object>, followUp: Array<object>, updated_at: number|null}}
+ */
+function echoRows(paneId, working) {
+  const id = String(paneId == null ? '' : paneId);
+  if (!working) {
+    paneEcho.delete(id);
+    return { steering: [], followUp: [], updated_at: null };
+  }
+  const row = echoBucket(id);
+  if (!row) return { steering: [], followUp: [], updated_at: null };
+  return {
+    steering: row.steering.slice(),
+    followUp: row.followUp.slice(),
+    updated_at: row.updated_at,
+  };
+}
+
+/** Forget the rows from the pane's previous run when a new normal prompt starts. */
+function clearEcho(paneId) {
+  paneEcho.delete(String(paneId == null ? '' : paneId));
+}
+
 module.exports = {
   SOURCE_KIND, dbPath, readOnlyUri, openReadOnly, parseToolCalls, parseRow, readWindow, readTail,
   recentSessions, listSessions, sessionKnown, sessionSettings,
   sessionPolicy, configPath, configProviders,
+  /* native steer/queue: the two command lines and the echo store */
+  HERMES_STEER_COMMAND, HERMES_FOLLOWUP_COMMAND, HERMES_ECHO_NOTE, ECHO_ITEMS_MAX,
+  steerCommand, followupCommand, echoItemId, planHermesQueuePrompt,
+  rememberEcho, echoRows, clearEcho,
 };

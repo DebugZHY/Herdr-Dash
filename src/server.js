@@ -442,10 +442,12 @@ async function handlePane(req, res, url) {
 
 // POST /api/pane/prompt {pane_id, text, wait?, timeout_ms?, mode?}
 //
-// `mode` is optional and only pi accepts it: "prompt" (or absent) is the normal send;
-// "steer"/"followup" write ONE /herdr-steer|/herdr-followup extension command and answer
-// as soon as herdr accepted it — no wait, and `confirmed:false` because the tray, not this
-// reply, is the confirmation. A refused mode writes NOTHING.
+// `mode` is optional and means "queued message" for two agent families:
+//   pi     — "steer"/"followup" write ONE /herdr-steer|/herdr-followup extension command;
+//   hermes — "steer"/"followup" write the pane's OWN command, `/steer <text>` or
+//            `/queue <text>`, through `agent.prompt`.
+// Both answer as soon as herdr accepted the line — no wait, and `confirmed:false` because
+// the tray, not this reply, is the confirmation. A refused mode writes NOTHING.
 async function handlePrompt(req, res, body) {
   const paneId = requireString(body, 'pane_id');
   if (typeof body.text !== 'string') {
@@ -453,10 +455,48 @@ async function handlePrompt(req, res, body) {
   }
 
   const mode = body.mode === undefined || body.mode === null ? 'prompt' : body.mode;
+  const family = await agentFamilyOf(paneId);
+
+  /* hermes already owns these two slash commands; the dashboard sends them verbatim and
+     never invents a second queue protocol. Only while the pane is `working`: on an idle
+     pane a steer/queue line would be ordinary user text, and a normal prompt mid-run would
+     start an unqueued turn — so both are refused and the running turn is never redirected. */
+  if (family === 'hermes') {
+    const status = await paneAgentStatus(paneId);
+    if (mode === 'steer' || mode === 'followup') {
+      const hermesPlan = chatHermes.planHermesQueuePrompt({ mode, agent: family, status, text: body.text });
+      if (!hermesPlan.ok) {
+        return sendJson(res, { ok: false, error: { code: hermesPlan.code, message: hermesPlan.message } }, hermesPlan.http);
+      }
+      const item = { id: chatHermes.echoItemId(), kind: hermesPlan.kind, text: body.text, at: Date.now() };
+      await hdr.request(
+        'agent.prompt',
+        { target: paneId, text: hermesPlan.command },
+        { timeoutMs: DEFAULT_TIMEOUT_MS },
+      );
+      // Echoed, not confirmed: hermes consumed the command into its own queue of one.
+      chatHermes.rememberEcho(paneId, item);
+      return ok(res, {
+        pane_id: paneId,
+        agent: 'hermes',
+        mode: hermesPlan.kind,
+        command_sent: true,
+        confirmed: false,
+        item,
+      });
+    }
+    if (status === 'working') {
+      return sendJson(res, {
+        ok: false,
+        error: { code: 'pane_busy', message: 'this hermes pane is working — use steer or follow-up, not a normal prompt' },
+      }, 409);
+    }
+  }
+
   if (mode !== 'prompt') {
     const plan = chatPi.planQueuePrompt({
       mode,
-      agent: await agentFamilyOf(paneId),
+      agent: family,
       status: await paneAgentStatus(paneId),
       text: body.text,
     });
@@ -505,18 +545,37 @@ async function handlePrompt(req, res, body) {
   }
 
   const result = await hdr.request('agent.prompt', params, { timeoutMs: socketTimeout });
+  /* A new normal prompt starts a new run; rows echoed from the previous run are no longer
+     part of the tray. Queue-mode writes never reach this line. */
+  if (family === 'hermes') chatHermes.clearEcho(paneId);
   ok(res, { result });
 }
 
-/* GET /api/queue?pane_id=<id> — QUEUE-CONTRACT §D.
+/* GET /api/queue?pane_id=<id>.
  *
- * The bridge-visible queue for a pi pane: the last `type:"queue"` envelope of the newest
- * control file. A pane with no record still answers 200 with empty lists and a note. This
- * never types into the pane and never claims to read pi's internal queue. */
+ * pi: the bridge-visible queue — the last `type:"queue"` envelope of the newest control
+ * file. hermes: `source:"pane-echo"` — the commands THIS server sent while the pane worked,
+ * which is an acknowledgement of our own writes, not a listing of hermes' queue (the `note`
+ * says exactly that; nothing here polls hermes or reads its internals). A pane that is no
+ * longer `working` has its echo rows dropped, so an idle pane never shows stale rows. */
 async function handleQueueGet(req, res, url) {
   const paneId = url.searchParams.get('pane_id');
   if (!paneId) throw { code: 'bad_request', message: '"pane_id" query parameter is required' };
   const agent = await agentFamilyOf(paneId);
+  if (agent === 'hermes') {
+    const working = (await paneAgentStatus(paneId)) === 'working';
+    const rows = chatHermes.echoRows(paneId, working);
+    return ok(res, {
+      pane_id: paneId,
+      agent: 'hermes',
+      source: 'pane-echo',
+      bridge_ready: false,
+      steering: rows.steering,
+      followUp: rows.followUp,
+      updated_at: rows.updated_at,
+      note: chatHermes.HERMES_ECHO_NOTE,
+    });
+  }
   if (agent !== 'pi') {
     return sendJson(res, {
       ok: false,
@@ -4033,7 +4092,7 @@ async function handle(req, res) {
     if (pathname === '/api/chat') return handleChat(req, res, url); // §8.2
     if (pathname === '/api/status') return handleStatus(req, res, url); // §12.3
     if (pathname === '/api/prompt') return handlePromptDetect(req, res, url);
-    if (pathname === '/api/queue') return handleQueueGet(req, res, url);   // QUEUE-CONTRACT §D
+    if (pathname === '/api/queue') return handleQueueGet(req, res, url);   // native queue endpoint
     if (pathname === '/api/model') return handleModelGet(req, res, url);
     if (pathname === '/api/sessions') return handleSessionsGet(req, res, url);
     if (pathname === '/api/effort') return handleEffortGet(req, res, url);

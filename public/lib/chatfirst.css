@@ -83,6 +83,43 @@
 .ws-row .dot { margin-left: auto; }
 .ws-panes { display: flex; flex-direction: column; gap: 2px; margin-top: 3px; }
 
+/* space -> tab -> pane. The rail stays readable at 280px: one caret column, then the
+   tab name/count/status, with pane rows on a short indent guide underneath. */
+.ws-tabs { display: flex; flex-direction: column; gap: 2px; margin-top: 2px; }
+.tab-group { display: flex; flex-direction: column; gap: 2px; margin: 2px 0 3px; }
+.tab-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 5px 8px 5px 18px;
+  border-radius: 8px;
+  cursor: pointer;
+  color: var(--fg-dim);
+  font-size: 11px;
+  user-select: none;
+}
+.tab-row:hover { background: var(--bg-panel2); color: var(--fg); }
+.tab-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg);
+  font-weight: 600;
+}
+.tab-count { flex: 0 0 auto; color: var(--fg-dim); font-size: 10px; }
+.tab-row .dot { margin-left: auto; }
+.tab-row.unassigned .tab-name { color: var(--fg-dim); font-style: italic; }
+.tab-panes {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 1px 0 3px 18px;
+  padding-left: 6px;
+  border-left: 1px solid var(--line-soft);
+}
+
 .pane-row {
   display: flex;
   align-items: center;
@@ -185,23 +222,55 @@
 
 /* ---------------------------------------------------------------- composer */
 
+/* the composer's top edge: a real, always-visible grip between the transcript and the card */
+#promptResize {
+  flex: 0 0 auto;
+  position: relative;
+  width: min(860px, calc(100% - 28px));
+  height: 10px;
+  margin: 0 auto;
+  border-radius: 5px;
+  background: transparent;
+  cursor: row-resize;
+  touch-action: none;
+}
+#promptResize:hover,
+#promptResize:focus { background: transparent; opacity: 1; outline: none; }
+#promptResize::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 46px;
+  height: 4px;
+  transform: translate(-50%, -50%);
+  border-radius: 2px;
+  background: var(--fg-dim);
+  opacity: .38;
+  transition: opacity .12s ease, background .12s ease;
+}
+#promptResize:hover::before,
+#promptResize:focus-visible::before { background: var(--accent); opacity: .9; }
+#promptResize:focus-visible { outline: 1px solid var(--accent); outline-offset: 0; }
+
 #promptBox {
   flex: 0 0 auto;
   width: min(860px, calc(100% - 28px));
-  height: auto;
+  height: var(--prompt-h, auto);
   min-height: 0;
   margin: 0 auto 14px;
   padding: 10px 12px 9px;
   background: var(--bg-panel);
   border: 1px solid var(--line);
   border-radius: 16px;
-  overflow: visible;
+  overflow: hidden;
   box-shadow: 0 12px 32px rgba(0, 0, 0, .28);
 }
 
 #promptTextRow {
   display: flex;
-  align-items: flex-end;
+  flex: 1 1 auto;
+  align-items: stretch;
   gap: 10px;
   margin: 0;
   min-height: 0;
@@ -209,7 +278,7 @@
 #promptText {
   flex: 1 1 auto;
   min-height: 44px;
-  max-height: 160px;
+  max-height: none;
   resize: none;
   padding: 10px 12px;
   background: var(--bg-input);
@@ -251,10 +320,18 @@
 .queue-btn { background: transparent; color: var(--fg); }
 
 #queueTray {
+  flex-wrap: wrap;
   margin: 0 0 9px;
   padding: 6px 10px;
   border-radius: 10px;
   background: var(--bg-panel2);
+}
+.queue-note {
+  flex: 1 0 100%;
+  margin-top: 3px;
+  color: var(--fg-dim);
+  font-size: 10.5px;
+  line-height: 1.35;
 }
 
 #hdAttachList, #hdAttachNote { margin-bottom: 8px; }
@@ -319,6 +396,7 @@
   }
   #sidebar.collapsed { width: 0 !important; box-shadow: none; }
   #header { min-height: 48px; padding: 8px 12px; gap: 8px; }
+  #promptResize { width: calc(100% - 20px); }
   #promptBox { width: calc(100% - 20px); margin-bottom: 10px; }
   .hd-cv-scroll { padding: 14px 12px 10px; }
   .prompt-side { flex-direction: column; align-items: stretch; }

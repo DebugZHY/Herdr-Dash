@@ -101,12 +101,16 @@ if (typeof window.HD.register !== 'function') {
       <div id="transcriptError" class="err overlay hidden"></div>
     </div>
 
+    <div id="promptResize" role="separator" aria-orientation="horizontal" tabindex="0"
+         aria-label="Resize message panel" title="Drag to resize the message panel"></div>
+
     <section id="promptBox">
       <div id="hdAttachList" class="hd-cv-attach-list hidden"></div>
       <div id="hdAttachNote" class="hd-cv-attach-note hidden"></div>
       <div id="queueTray" class="queue-tray hidden" aria-live="polite">
         <span class="queue-label">queued (dash)</span>
         <div id="queueList" class="queue-list"></div>
+        <div id="queueNote" class="queue-note hidden"></div>
       </div>
       <div id="promptTextRow">
         <textarea id="promptText" rows="2" spellcheck="false"
@@ -114,9 +118,9 @@ if (typeof window.HD.register !== 'function') {
         <div class="prompt-side">
           <button id="promptSend" class="btn primary" type="button">send</button>
           <button id="promptSteer" class="btn queue-btn hidden" type="button"
-                  title="steer after the current step — Enter while a pi pane is working">steer</button>
+                  title="steer after the current step — Enter while a pi or hermes pane is working">steer</button>
           <button id="promptFollowup" class="btn queue-btn hidden" type="button"
-                  title="queue for after this run settles — Alt+Enter while a pi pane is working">follow-up</button>
+                  title="queue for after this run settles — Alt+Enter while a pi or hermes pane is working">follow-up</button>
         </div>
       </div>
       <div id="composerTools" class="composer-tools">
