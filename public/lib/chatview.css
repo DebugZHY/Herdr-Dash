@@ -138,8 +138,6 @@
   max-height: 70vh;
   overflow: auto;
   overscroll-behavior: contain;
-  scrollbar-width: thin;
-  scrollbar-color: var(--line) transparent;
 }
 /* A3: hd-cv-open also marks the two bodies a reader expands by hand (a thinking record, a tool
    card). Both already carry a spine when closed, so the mark cannot be "a spine appears" — it is
@@ -196,15 +194,11 @@
   max-height: 340px;
   overflow: auto;
   overscroll-behavior: contain;
-  scrollbar-width: thin;
-  scrollbar-color: var(--line) transparent;
 }
 .hd-cv-json {
   max-height: 340px;
   overflow: auto;
   overscroll-behavior: contain;
-  scrollbar-width: thin;
-  scrollbar-color: var(--line) transparent;
 }
 .hd-cv-link {
   color: var(--accent);
@@ -246,8 +240,6 @@
   max-height: 340px;
   overflow: auto;
   overscroll-behavior: contain;
-  scrollbar-width: thin;
-  scrollbar-color: var(--line) transparent;
 }
 .hd-cv-think-body[hidden] { display: none !important; }
 
@@ -571,7 +563,6 @@
   overflow-x: hidden;
   margin: 0 0 6px;
   overscroll-behavior: contain;
-  scrollbar-color: var(--line) transparent;
 }
 
 /* A chip is a box until its name is long: max-width + a meta that may shrink below its own text
@@ -779,6 +770,4 @@
   line-height: 1.45;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  scrollbar-width: thin;
-  scrollbar-color: var(--line) transparent;
 }

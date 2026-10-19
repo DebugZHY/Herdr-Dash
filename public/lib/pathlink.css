@@ -58,8 +58,6 @@ a.hd-pl-link[data-hd-kind="dir"] { border-bottom-style: dashed; }   /* a folder 
   max-height: 30vh;
   overflow: auto;
   overscroll-behavior: contain;
-  scrollbar-width: thin;
-  scrollbar-color: var(--line) transparent;
 }
 .hd-pl-menu-btn {
   font: inherit;

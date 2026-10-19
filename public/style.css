@@ -20,9 +20,45 @@
   --mono: ui-monospace, "Cascadia Mono", "JetBrains Mono", Consolas, "Courier New", monospace;
   --sidebar-w: 300px;
   --dock-w: 320px;
+
+  /* every scroll region: a slim, dark thumb that sits on the surface instead of a
+     light OS stripe. WebKit uses the pseudo-elements below; Firefox gets the same
+     colours through the standard properties in the @supports block. */
+  --scrollbar-size: 10px;
+  --scrollbar-thumb: #3f5064;
+  --scrollbar-thumb-hover: #5a7188;
+  --scrollbar-thumb-active: #4aa3ff;
+  --scrollbar-track: transparent;
 }
 
 * { box-sizing: border-box; }
+
+/* One scrollbar treatment for the rail, chat, terminal, composer and dialogs. */
+*::-webkit-scrollbar {
+  width: var(--scrollbar-size, 10px);
+  height: var(--scrollbar-size, 10px);
+}
+*::-webkit-scrollbar-track { background: var(--scrollbar-track, transparent); }
+*::-webkit-scrollbar-corner { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  min-height: 36px;
+  border: 2px solid transparent;
+  border-radius: 10px;
+  background-color: var(--scrollbar-thumb, #3f5064);
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover { background-color: var(--scrollbar-thumb-hover, #5a7188); }
+*::-webkit-scrollbar-thumb:active { background-color: var(--scrollbar-thumb-active, #4aa3ff); }
+*::-webkit-scrollbar-button { display: none; }
+
+/* Firefox: keep the legacy pseudo-elements out of its parser and use the
+   standard properties it actually renders. */
+@supports (-moz-appearance: none) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollbar-thumb, #3f5064) var(--scrollbar-track, transparent);
+  }
+}
 
 html, body {
   margin: 0; padding: 0; height: 100%;

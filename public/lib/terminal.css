@@ -29,8 +29,6 @@
   line-height: 1.4;
   font-variant-ligatures: none;
   tab-size: 8;
-  scrollbar-color: var(--line, #263040) transparent;
-  scrollbar-width: thin;
   -webkit-text-size-adjust: 100%;
 }
 
