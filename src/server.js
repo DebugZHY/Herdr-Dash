@@ -34,6 +34,11 @@ const pathsApi = require('./paths');             // §13.2 POST /api/pathinfo, /
 const statusView = require('./status');          // §12.3 GET /api/status (round 8)
 const promptdetect = require('./promptdetect');   // agent question detection from terminal text
 const paneCacheModule = require('./pane-cache'); // §8 pane/session read caches (W1)
+/* Stream bridge (wave 1): the NDJSON sink the pi extension / hermes plugin writes, served
+   as SSE. Additive only — `/api/chat` stays the authoritative transcript (see
+   _scratch/stream-round/CONTRACT.md §1, §6). */
+const streamHubModule = require('./stream-hub');
+const streamHub = streamHubModule.createStreamHub();
 
 /** The jsonl reader for a file-log agent. claude and pi write different records
  *  but the server route is the same shape, so the path names one accessor instead
@@ -808,18 +813,48 @@ async function loadSessionsPayload(paneId) {
     return { pane_id: paneId, agent: 'hermes', current: info.sessionId || null, sessions: sessions };
   }
 
-  if (info.family === 'claude' || info.family === 'pi') {
+  /* pi (wave 2): the list comes from the pane cwd's session files, with NO pane I/O — no
+     /resume is typed, no selector is opened, and a busy pane can still be listed. Each row is
+     one file `candidatesForCwd` proved for this cwd (`/api/chat` uses the same proof), and its
+     title is the first user text in a bounded read (basename when there is none).
+     `current` is the sink session (the pane's own bridge) when it has written one, else the
+     binding `/api/chat` resolved. */
+  if (info.family === 'pi') {
+    const cwd = info.cwd || '';
+    if (!cwd) throw { code: 'no_cwd', message: 'herdr reports no cwd for this pi pane, so its sessions cannot be listed' };
+    const rows = await chatPi.listSessionsForCwd(cwd);
+    const sink = await chatPi.sinkSessionForPane(paneId);
+    const switched = switchedPanes.get(paneId);
+    /* A newer sink turn means the pane moved on (a manual pi switch or a new session);
+       the recorded dashboard switch is then stale and must not shadow the pane. */
+    if (switched && sink && sink.id !== switched.id && sink.mtimeMs > switched.at) {
+      switchedPanes.delete(paneId);
+      saveSwitchStore();
+    }
+    const currentId = (switchedPanes.get(paneId) && switchedPanes.get(paneId).id)
+      || (sink && sink.id) || info.sessionId || null;
+    return {
+      pane_id: paneId, agent: 'pi', current: currentId,
+      sink_session: sink ? sink.id : null,
+      sessions: rows.map((r) => ({
+        id: r.id, path: r.path, mtimeMs: r.mtimeMs, title: r.title,
+        detail: shortAge(Math.floor((r.mtimeMs || 0) / 1000)),
+        current: !!currentId && r.id === currentId,
+      })),
+    };
+  }
+
+  if (info.family === 'claude') {
     /* claude can only resume a session from the pane's OWN directory — offered a session that
        belongs elsewhere it answers "This conversation is from a different directory" and stops
-       — so its selector is read in the default project scope, never widened with Ctrl+A.
-       pi's selector lists the current folder and is short enough to read whole. */
-    const prompt = await readResumePicker(paneId, info.family, false);
+       — so its selector is read in the default project scope, never widened with Ctrl+A. */
+    const prompt = await readResumePicker(paneId, 'claude', false);
     await pressKeys(paneId, ['esc']);
     if (!prompt || !prompt.options.length) {
       throw { code: 'no_sessions', message: 'the /resume selector showed no sessions (is this pane at an idle prompt?)' };
     }
     return {
-      pane_id: paneId, agent: info.family, current: info.sessionId || null,
+      pane_id: paneId, agent: 'claude', current: info.sessionId || null,
       total: prompt.total,
       sessions: prompt.options.map((o) => ({
         id: null, n: o.n, title: o.label, detail: o.detail || null, current: false,
@@ -858,10 +893,34 @@ async function handleSessionsPost(req, res, body) {
     return ok(res, { pane_id: paneId, session_id: id, confirmed: confirmed, result: { type: 'ok' } });
   }
 
-  if (info.family === 'claude' || info.family === 'pi') {
+  /* pi (wave 2): resolve the id to an absolute file through the SAME list GET returns, then
+     ask the extension to switch. Nothing is typed into the composer, no selector is opened and
+     no arrow key is sent; the answer is "the command was handed to pi", not "it happened" —
+     the next /api/chat proves it by reporting the sink session. */
+  if (info.family === 'pi') {
+    const id = String(body.session_id == null ? '' : body.session_id).trim();
+    if (!id) throw { code: 'bad_request', message: '"session_id" is required for a pi pane' };
+    if (!/^[A-Za-z0-9._-]+$/.test(id)) throw { code: 'bad_request', message: '"session_id" is not a pi session id' };
+    const cwd = info.cwd || '';
+    if (!cwd) throw { code: 'no_cwd', message: 'herdr reports no cwd for this pi pane, so its sessions cannot be resolved' };
+    const rows = await chatPi.listSessionsForCwd(cwd);
+    const hit = rows.find((r) => r.id === id);
+    if (!hit) throw { code: 'no_sessions', message: 'no pi session ' + id + ' in this pane\'s working directory' };
+    if (!hit.path || !path.isAbsolute(hit.path)) {
+      throw { code: 'no_sessions', message: 'the pi session file for ' + id + ' is not an absolute path' };
+    }
+    await hdr.request('agent.prompt', { target: paneId, text: chatPi.resumeCommand(hit.path), timeoutMs: DEFAULT_TIMEOUT_MS });
+    /* The extension applies the switch inside pi, so herdr's record will keep naming the old
+       session. Remember the requested id exactly as a hermes switch does: /api/chat then reads
+       the file the user chose instead of the sink file the previous turn left behind. */
+    rememberSwitch(paneId, id, 'pi', 'dash_switch');
+    return ok(res, { pane_id: paneId, session_id: id, command_sent: true, confirmed: false });
+  }
+
+  if (info.family === 'claude') {
     const n = Number(body.n);
     if (!Number.isInteger(n) || n < 1) throw { code: 'bad_request', message: '"n" (the session number from GET) is required' };
-    const first = await openResumePicker(paneId, info.family, false);
+    const first = await openResumePicker(paneId, 'claude', false);
     if (!first) {
       await pressKeys(paneId, ['esc']);
       throw { code: 'no_picker', message: 'the /resume selector did not appear' };
@@ -882,11 +941,27 @@ async function handleSessionsPost(req, res, body) {
     const confirmed = !refused && !stillOpen;
     /* The new session's id lives inside the agent's own selector, so it cannot be named here —
        but everything this view remembered about the old binding is wrong now all the same. */
-    if (confirmed) rememberSwitch(paneId, '', info.family, 'dash_switch');
+    if (confirmed) rememberSwitch(paneId, '', 'claude', 'dash_switch');
     return ok(res, { pane_id: paneId, n: n, confirmed: confirmed, refused: refused, result: { type: 'ok' } });
   }
 
   throw { code: 'unsupported', message: 'session switching is not available for a ' + info.family + ' pane' };
+}
+
+/* POST /api/stop {pane_id} — stop the agent's current run.
+ *
+ * pi (wave 2) is stopped through its extension: `/herdr-abort` calls `ctx.abort()` and never
+ * `ctx.shutdown()`, so the pane and its session survive. Nothing here sends ctrl+c (herdr's own
+ * key path is /api/pane/keys, owned by the client) and nothing kills a process. Other agents are
+ * out of this round's scope and answer `unsupported` rather than pretending to stop. */
+async function handleStopPost(req, res, body) {
+  const paneId = requireString(body, 'pane_id');
+  const family = await agentFamilyOf(paneId);
+  if (family !== 'pi') {
+    throw { code: 'unsupported', message: 'stop is available for pi panes only (this pane is ' + family + ')' };
+  }
+  await hdr.request('agent.prompt', { target: paneId, text: chatPi.PI_ABORT_COMMAND, timeoutMs: DEFAULT_TIMEOUT_MS });
+  return ok(res, { pane_id: paneId, command_sent: true });
 }
 
 /* ── /resume pickers ──────────────────────────────────────────────────────
@@ -1019,8 +1094,30 @@ async function handleModelGet(req, res, url) {
     return ok(res, { pane_id: paneId, agent: 'hermes', current: cur, models: marked });
   }
 
-  /* only claude is opened-and-parsed. A pi pane is never touched here: its cancel key kills the
-     process, so the dash must not send it anything while merely reading a model list. */
+  /* pi (wave 2): the catalogue comes from pi's own models.json — the file its model registry is
+     built from — so reading it never types into the pane (pi's cancel key kills the process; a
+     mere list must not type anything). `current` is read from the footer as a plain pane read,
+     never a command; an unreadable footer leaves it null rather than guessing. An unreadable
+     catalogue is an empty list plus a note. */
+  if (family === 'pi') {
+    const cat = await chatPi.listModelCatalogue();
+    /* The bridge records the last /herdr-model in its control file; the footer is the
+       fallback when pi has not been switched through the dash yet. Both are reads, never
+       commands. */
+    const sinkModel = await chatPi.sinkModelForPane(paneId);
+    const line = piStatusLine(await readRecent(paneId, 40));
+    const cur = sinkModel || (line ? line.model : null);
+    return ok(res, {
+      pane_id: paneId, agent: 'pi', current: cur, source: cat.file,
+      models: cat.models.map((m) => ({
+        provider: m.provider, model: m.model, label: m.label,
+        current: !!cur && (m.model === cur || m.label === cur),
+      })),
+      note: cat.note || undefined,
+    });
+  }
+
+  /* only claude is opened-and-parsed. */
   if (family !== 'claude') throw { code: 'no_picker', message: 'the /model selector is only readable on a claude pane (this pane is ' + family + ')' };
 
   const prompt = await readModelPicker(paneId);
@@ -1049,6 +1146,22 @@ async function handleModelPost(req, res, body) {
     const confirmed = text.indexOf('Model switched: ' + model) >= 0
       || new RegExp('[\\u263c\\u2e1d\\u25cf]\\s*' + model.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*[\\u2502|]').test(text);
     return ok(res, { pane_id: paneId, model: model, confirmed: confirmed, result: { type: 'ok' } });
+  }
+
+  /* pi (wave 2): `/herdr-model <provider>/<model>` through the extension. Never `/model`, never
+     the numbered picker. The ids are validated as single tokens because they travel as one typed
+     line; the answer says the command was sent, not that the model changed. */
+  if (family === 'pi') {
+    if (typeof body.provider !== 'string' || typeof body.model !== 'string') {
+      throw { code: 'bad_request', message: '"provider" and "model" are required for a pi pane' };
+    }
+    const provider = chatPi.safeCommandToken(body.provider);
+    const model = chatPi.safeCommandToken(body.model);
+    if (!provider || !model) {
+      throw { code: 'bad_request', message: '"provider" and "model" must be non-empty single tokens (no whitespace)' };
+    }
+    await hdr.request('agent.prompt', { target: paneId, text: chatPi.modelCommand(provider, model), timeoutMs: DEFAULT_TIMEOUT_MS });
+    return ok(res, { pane_id: paneId, provider: provider, model: model, command_sent: true, confirmed: false });
   }
 
   if (family !== 'claude') throw { code: 'bad_request', message: 'model switching by option number is claude-only (this pane is ' + family + ')' };
@@ -2137,6 +2250,30 @@ const readMemory = new Map();           // pane_id -> {agent, session_id, file, 
    thing nobody has to infer: this view drove the switch itself. */
 const switchedPanes = new Map();         // pane_id -> {id, agent, at, from}
 const newSessionNotices = new Map();     // pane_id -> when this view FIRST saw the pane's "new session" line
+const SWITCH_STORE = path.join(os.homedir(), '.herdr-dash', 'switched.json');
+function loadSwitchStore() {
+  try {
+    const raw = require('node:fs').readFileSync(SWITCH_STORE, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return;
+    for (const row of parsed) {
+      if (!row || !row.pane_id || !row.id || row.agent !== 'pi') continue;
+      switchedPanes.set(String(row.pane_id), {
+        id: String(row.id), agent: 'pi', at: Number(row.at) || Date.now(), from: 'dash_switch',
+      });
+    }
+  } catch (e) { /* no store yet, or an unreadable one: the pane's own bridge still answers */ }
+}
+function saveSwitchStore() {
+  const rows = [];
+  for (const [paneId, sw] of switchedPanes) {
+    if (sw && sw.agent === 'pi') rows.push({ pane_id: paneId, id: sw.id, agent: 'pi', at: sw.at });
+  }
+  return fsp.mkdir(path.dirname(SWITCH_STORE), { recursive: true })
+    .then(() => fsp.writeFile(SWITCH_STORE, JSON.stringify(rows)))
+    .catch(() => {});
+}
+loadSwitchStore();
 const SWITCHED_TTL_MS = 12 * 60 * 60 * 1000;
 const NEW_SESSION_SLACK_MS = 180000;     // how far a store row may predate the notice and still be that session
 const NEW_SESSION_NOTICE = /New session started!/i;      // hermes' own line when it starts one
@@ -2319,6 +2456,15 @@ async function resolveLiveSession(paneId, entry, agent, herdrSessionId, agents, 
     inp.candidates = await fileLogs(agent, cwd);
     if (mark) mark('fileLogs');
     if (agent === 'pi') {
+      // The pi bridge writes a pane-specific sink file; its first envelope names
+      // the session this pane actually runs. It outranks the cwd-rank guess when
+      // several pi panes share one cwd (and one of them has no log of its own).
+      try {
+        inp.sink_session = typeof reader.sinkSessionForPane === 'function'
+          ? await reader.sinkSessionForPane(paneId) : null;
+      } catch (e) {
+        inp.sink_session = null;
+      }
       // herdr never publishes a pi session (verified live: its report is accepted
       // and the read-back stays empty), so when several pi panes share one cwd the
       // server assigns the cwd's newest logs to them itself — oldest pane first,
@@ -2721,6 +2867,16 @@ async function switchedSessionFor(paneId, agent, entry, agents) {
   if (!sw) return null;
   if (sw.agent !== agent) { switchedPanes.delete(paneId); return null; }
   if (Date.now() - sw.at > SWITCHED_TTL_MS) { switchedPanes.delete(paneId); return null; }
+  /* A pi pane that has written a newer turn for a different session has moved on inside
+     pi (a manual /resume or a new session); the dashboard's recorded switch is stale. */
+  if (agent === 'pi') {
+    const sink = await chatPi.sinkSessionForPane(paneId);
+    if (sink && sink.id !== sw.id && sink.mtimeMs > sw.at) {
+      switchedPanes.delete(paneId);
+      saveSwitchStore();
+      return null;
+    }
+  }
 
   /* A pane that has STARTED a session since the switch is not on the switched one any more.
      hermes prints "(^_^)v New session started!" and the store gains a row — one with no cwd, so
@@ -2776,6 +2932,7 @@ function newestUnclaimedSession(rows, agents, paneId, at) {
 function rememberSwitch(paneId, id, agent, from, seen) {
   if (id) switchedPanes.set(paneId, { id: String(id), agent: agent, at: Date.now(), from: from || 'dash_switch' });
   else switchedPanes.delete(paneId);
+  if (agent === 'pi') saveSwitchStore();
   readMemory.delete(paneId);        // it names the session the pane was on BEFORE the switch
   liveCache.clear();                // keyed on herdr's record, which did not move
   paneTextCache.clear();
@@ -3376,6 +3533,14 @@ async function handle(req, res) {
   if (method === 'GET') {
     if (pathname === '/api/health') return handleHealth(req, res);
     if (pathname === '/api/snapshot') return handleSnapshot(req, res);
+    /* Wave 1 token bridge (§6 of _scratch/stream-round/CONTRACT.md): an SSE tail of the
+       NDJSON stream sink. Dispatched BEFORE /api/events and independent of it — it never
+       touches the herdr hub, and a browser that never asks for it sees no change at all.
+       Its refusal path reuses this file's JSON writer, so a missing `pane_id` answers with
+       the same {ok:false,error:{code:'bad_request'}} shape as every other route. */
+    if (pathname === '/api/agent-stream') {
+      return streamHub.handleAgentStream(req, res, url, { sendJson });
+    }
     if (pathname === '/api/events') return handleEvents(req, res);
     if (pathname === '/api/pane') return handlePane(req, res, url);
     if (pathname === '/api/git') return handleGit(req, res, url);   // §7.1
@@ -3408,6 +3573,7 @@ async function handle(req, res) {
       '/api/model': handleModelPost,
       '/api/sessions': handleSessionsPost,
       '/api/effort': handleEffortPost,
+      '/api/stop': handleStopPost,
       '/api/rpc': handleRpc,
       '/api/cli': handleCli,
       '/api/fanout': handleFanout,

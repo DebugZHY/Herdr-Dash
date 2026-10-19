@@ -831,6 +831,7 @@
     }
 
     injectFallbackCss();
+    injectLiveCss();
     liveHost = host;
 
     var statusEl = el('div', 'chat-status');
@@ -852,6 +853,14 @@
     statusEl.appendChild(retryBtn);
     statusEl.appendChild(olderBtn);
     statusEl.appendChild(rawBtn);
+    /* stream-round §7: the live/records/reconnecting chip. Text only — no animation. It is set by
+       stream-live.js through paintLiveChip and is hidden whenever there is no live bridge to speak of. */
+    var liveChip = el('span', 'chat-live-chip hidden');
+    liveChip.id = 'hdChatLiveChip';
+    liveChip.setAttribute('data-state', 'records');
+    liveChip.textContent = 'records';
+    liveChip.title = 'record view (/api/chat) — no live bridge events';
+    statusEl.appendChild(liveChip);
 
     var scrollEl = el('div', 'hd-cv-scroll chat-scroll');     // W3 styles .hd-cv-scroll
     scrollEl.id = 'hdChatScroll';
@@ -870,10 +879,23 @@
     jumpBtn.type = 'button';
     scrollEl.appendChild(jumpBtn);                            // sticky inside the scroller (W3)
 
+    /* stream-round §7: the ephemeral live turn renders into this slot, which is kept last in the
+       list. It is a plain empty div when no live turn exists — it takes no room and no focus. */
+    var liveSlot = el('div', 'hd-live-slot');
+    liveSlot.id = 'hdChatLive';
+    listEl.appendChild(liveSlot);
+
     host.appendChild(statusEl);
     host.appendChild(scrollEl);
 
     var chip = document.getElementById('hViewMode');
+
+    /* stream-round §7 — the live turn. `live` is null when lib/stream-live.js is absent (the view
+       then works exactly as before and no chip is shown); `liveKey` is the pane|agent|session the
+       current EventSource belongs to, so a re-render cannot reopen a socket per poll. */
+    var live = null;
+    var liveKey = '';
+    var liveRetirePending = false;
 
     /* default CHAT for a first visit (the user asked for the conversation view); only an explicit
        stored 'raw' keeps the raw transcript — a missing key must not fall through to raw */
@@ -963,6 +985,106 @@
     function currentPaneId() {
       if (paneOverride) return paneOverride;
       try { return ctx.state.selectedPaneId || null; } catch (e) { return null; }
+    }
+
+    /* ---------------- stream-round §7: the live turn (token bridge, wave 1) ----------------
+       The record view above stays authoritative. This block only mirrors the SSE events into an
+       ephemeral node after the last record, and retires that node the moment the record lands. */
+    function paintLiveChip(info) {
+      if (!liveChip || !info) return;
+      var s = info.state || 'records';
+      liveChip.textContent = s;
+      liveChip.setAttribute('data-state', s);
+      var bits = [];
+      if (s === 'live') bits.push('live stream: ' + info.events + ' event' + (info.events === 1 ? '' : 's'));
+      else if (s === 'reconnecting') bits.push('live stream lost — reconnecting; the record view keeps polling');
+      else bits.push('record view (/api/chat) — no live bridge events');
+      if (info.cards) bits.push(info.cards + ' tool card' + (info.cards === 1 ? '' : 's'));
+      if (info.error) bits.push('error: ' + info.error);
+      if (info.waiting) bits.push(info.waiting);
+      if (info.malformed) bits.push(info.malformed + ' malformed line(s) ignored');
+      if (info.duplicates) bits.push(info.duplicates + ' duplicate(s) dropped');
+      liveChip.title = bits.join(' · ');
+      /* §7: a live turn can reach turn_end before the next /api/chat poll has drawn the
+         record. The status callback is the only notification after that point; compare
+         here too, or the completed live bubble stays stranded under the record. The
+         retire() call emits status again with state=records, which stops this branch. */
+      if (info.ended && s !== 'records') {
+        var st = paneState(currentPaneId());
+        if (st) retireLiveIfRecords(st, 1);
+      }
+    }
+
+    /** Keep the live slot last: a record render appends its own nodes after it. */
+    function ensureLiveLast() {
+      if (!liveSlot) return;
+      if (liveSlot.parentNode !== listEl || listEl.lastChild !== liveSlot) listEl.appendChild(liveSlot);
+    }
+
+    /** Open/close the EventSource from what is really true: chat visible, pane selected, pi/hermes. */
+    function syncLive() {
+      if (!live) return;
+      var id = currentPaneId();
+      var st = id ? paneState(id) : null;
+      var agent = (st && st.agent) ? String(st.agent) : '';
+      var eligible = !!(id && (agent === 'pi' || agent === 'hermes') && auto && !unmounted &&
+                        mode === 'chat' && !document.hidden);
+      if (!eligible) {
+        if (liveKey) { liveKey = ''; live.close('inactive'); }
+        liveChip.classList.add('hidden');
+        return;
+      }
+      liveChip.classList.remove('hidden');
+      var session = (st && (st.session || (st.source && st.source.session_id))) || '';
+      var key = id + '|' + agent + '|' + session;
+      if (key !== liveKey) {
+        liveKey = key;
+        live.open({ paneId: id, sessionId: session, agent: agent });
+      }
+      ensureLiveLast();
+    }
+
+    /** A record for the turn just arrived: the record is authoritative, so retire the live node.
+     *  A tool/thinking record lands mid-turn, so it only retires when the live turn has ENDED or
+     *  the record's text is the same text the stream was showing. */
+    function retireLiveIfRecords(st, added) {
+      if (!live || !st || !added) return false;
+      var last = st.messages.length ? st.messages[st.messages.length - 1] : null;
+      if (!last || last.role !== 'assistant') return false;
+      var s = live.status();
+      if (!s || s.state === 'records') return false;
+      var recText = text(last.text);
+      var seen = live.text ? live.text() : '';
+      var match = !!(recText && seen && (recText.indexOf(seen) === 0 || seen.indexOf(recText) === 0));
+      if (s.ended || match) { live.retire(); return true; }
+      return false;
+    }
+
+    function injectLiveCss() {
+      if (document.getElementById('hdChatLiveCss')) return;
+      var s = document.createElement('style');
+      s.id = 'hdChatLiveCss';
+      /* :where() keeps every rule at zero specificity, like the fallback sheet: chatview.css wins */
+      s.textContent = [
+        ':where(.hd-live-slot){display:flex;flex-direction:column;gap:6px;}',
+        ':where(.hd-live-turn){border:1px dashed #263040;border-radius:6px;padding:6px 8px;background:rgba(74,163,255,.03);}',
+        ':where(.hd-live-head){font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:#4aa3ff;}',
+        ':where(.hd-live-msg){white-space:pre-wrap;overflow-wrap:anywhere;color:#d6dee8;font-size:12.5px;}',
+        ':where(.hd-live-msg-done){opacity:.92;}',
+        ':where(.hd-live-think){margin:2px 0;font-size:11.5px;color:#8b97a6;}',
+        ':where(.hd-live-think-body){white-space:pre-wrap;max-height:160px;overflow:auto;}',
+        ':where(.hd-live-tool){margin-top:4px;border:1px solid #263040;border-radius:4px;padding:3px 6px;font-family:var(--mono,monospace);font-size:11.5px;color:#8b97a6;}',
+        ':where(.hd-live-tool-name){color:#d6dee8;}',
+        ':where(.hd-live-tool-args){white-space:pre-wrap;max-height:80px;overflow:auto;}',
+        ':where(.hd-live-tool-result){white-space:pre-wrap;max-height:120px;overflow:auto;}',
+        ':where(.hd-live-tool-error){border-color:#e5484d;}',
+        ':where(.hd-live-note){font-size:11px;color:#e0a02a;}',
+        ':where(.hd-live-foot){font-size:11px;color:#8b97a6;}',
+        ':where(.chat-live-chip){padding:0 6px;border:1px solid #263040;border-radius:9px;font-size:11px;color:#8b97a6;}',
+        ':where(.chat-live-chip[data-state="live"]){color:#3fb950;border-color:#3fb950;}',
+        ':where(.chat-live-chip[data-state="reconnecting"]){color:#e0a02a;border-color:#e0a02a;}'
+      ].join('\n');
+      document.head.appendChild(s);
     }
 
     /* The pane's session changed under this view: a session switch, a session the agent started,
@@ -1362,7 +1484,9 @@
                drag collapsed to nothing on the very next poll). leaveFreeze() draws the queue in one
                pass, in log order, the moment the reader is done. */
             frozenAdded += added;
+            if (added) liveRetirePending = true;      // §7: apply the retirement when the view thaws
           } else {
+            retireLiveIfRecords(st, added);         // §7: the record retires the live node
             renderNew(st, false);
             renderPendings(st);
             refreshWorking(st);
@@ -1388,6 +1512,7 @@
          repaint them either. leaveFreeze() refreshes both; a stale line is the honest cost of not
          moving a single node under a live selection. */
       if (id === currentPaneId() && !frozen) { renderState(st); renderStatus(st); }
+      syncLive();                                    // §7: the first body tells us the agent
     }
 
     /* ---------------- pending sends (§8.3) ---------------- */
@@ -1931,15 +2056,23 @@
       perf.renders++;
       perf.lastRenderMs = ms1(nowMs() - t0);
       perf.lastRenderPath = path;
+      /* §7: a full or incremental render is also the moment we can compare the record we
+         just drew with the live turn. `added` can be 0 when the opening tail already held the
+         final record (the live SSE only ended afterwards), so the poll-path check alone left
+         a completed live bubble stranded under an identical record. */
+      if (st && st.id === currentPaneId()) retireLiveIfRecords(st, 1);
+      ensureLiveLast();                              // §7: keep the live node at the end of the list
       scheduleDecorate();                             // §13.2.1 + §9: the nodes just drawn, as links
     }
     function renderPendings(st) {
       var id = currentPaneId();
       var nodes = listEl.querySelectorAll('.chat-pending');
       for (var i = nodes.length - 1; i >= 0; i--) if (nodes[i].parentNode) nodes[i].parentNode.removeChild(nodes[i]);
-      if (!st || st.id !== id || !st.pending.length) return;
+      if (!st || st.id !== id || !st.pending.length) { ensureLiveLast(); return; }
       var now = Date.now();
       for (var j = 0; j < st.pending.length; j++) noteDeco(listEl.appendChild(renderPendingGroup(st.pending[j], now, st)));
+      ensureLiveLast();                              // §7: pending bubbles go before the live turn
+
       scheduleDecorate();              // §9: the bubbles are new nodes too (a prompt can carry a path)
     }
     function refreshPendingNotes(st, now) {
@@ -2575,6 +2708,8 @@
       renderPendings(st);
       renderState(st);
       renderStatus(st);
+      if (liveRetirePending && st) { liveRetirePending = false; retireLiveIfRecords(st, 1); }
+      ensureLiveLast();                              // §7: the live turn stays after the last record
       if (follow) scrollToBottom();
       else {
         if (st && st.panelTop !== null) {
@@ -2608,6 +2743,7 @@
       }
       syncTimers();
       if (chat) { renderAll(); poll(); }
+      syncLive();                                  // §7: open only while chat is on screen
     }
     function setMode(m) {
       mode = (m === 'raw') ? 'raw' : 'chat';
@@ -2984,6 +3120,7 @@
           var st = currentPaneId() ? paneState(currentPaneId()) : null;
           if (st) { st.nextTryAt = 0; st.backoffMs = 0; }
         }
+        syncLive();                                  // §7: hidden closes, visible reopens
       } catch (e) { /* ignore */ }
     }
 
@@ -3062,6 +3199,16 @@
     applyMode();
     if (mode === 'raw') renderAll();
 
+    /* stream-round §7: the SSE source is created only now, so the slot and the chip exist. A page
+       without lib/stream-live.js keeps today's view and shows no chip at all. */
+    try {
+      var streamApi = window.HD && window.HD.streamLive;
+      if (streamApi && typeof streamApi.create === 'function') {
+        live = streamApi.create({ slot: liveSlot, onStatus: paintLiveChip });
+      }
+    } catch (e) { live = null; }
+
+
     return {
       show: function () { return setMode('chat'); },
       hide: function () { return setMode('raw'); },
@@ -3083,6 +3230,7 @@
         syncTimers();
         if (auto && mode === 'chat' && !unmounted && !document.hidden) poll();
         renderStatus(currentPaneId() ? paneState(currentPaneId()) : null);
+        syncLive();                                  // §7: setActive(false) must close the SSE source
         return auto;
       },
       /* §9: what the last render/decorate pass cost, and how much the polish walked. `decoratedNodes`
@@ -3107,7 +3255,9 @@
         var pid = id || currentPaneId();
         if (!pid || !panes[pid]) return false;
         resetForSession(panes[pid], '');
+        if (live) { live.retire(); liveKey = ''; }   // §7: a new session needs a new stream
         retryNow();
+        syncLive();
         return true;
       },
       /* §10: the composer's attachments. app.js owns the input paths (picker / drop / paste) and the
@@ -3127,6 +3277,8 @@
       refresh: function () { poll(); },
       unmount: function () {
         unmounted = true;
+        if (live) { try { live.destroy(); } catch (e) { /* already gone */ } live = null; liveKey = ''; }
+        if (liveChip) liveChip.classList.add('hidden');
         leaveFreeze(false);                          // §13.8 rule 3: no freeze outlives the mount
         cancelDeco();                                // §9: no decoration pass outlives the host
         decoQueue = [];
@@ -3197,7 +3349,20 @@
         if (!pid || !panes[pid]) return false;
         resetForSession(panes[pid], '');
         lastAsk = null;                          // the dedup window must not swallow the re-read
+        if (live) { live.retire(); liveKey = ''; }
         return true;
+      },
+      /* §7 seams: the live chip as the module holds it, and a synthetic-event feeder that goes
+         through the SAME reducer the EventSource uses (no network in the selftest). */
+      __live: function () { return live ? live.status() : null; },
+      __liveEvents: function (events) {
+        var st = live && live.__state ? live.__state() : null;
+        if (!st) return [];
+        var out = [];
+        for (var i = 0; i < (events || []).length; i += 1) out.push(window.HD.streamLive.reduce(st, events[i]));
+        if (live && live.flushNow) live.flushNow();
+        if (liveChip) paintLiveChip(live.status());
+        return out;
       },
       __tick: function (nowMs) { return pendingTick(typeof nowMs === 'number' ? nowMs : Date.now()); },
       /* DEFECT-12 seams: the latch is an object with a clock, so a test can age it and watch the
@@ -3278,6 +3443,7 @@
         if (!auto && workingTimer) { window.clearInterval(workingTimer); workingTimer = null; }
         if (!auto && slowTimer) { window.clearInterval(slowTimer); slowTimer = null; }
         syncTimers();
+        syncLive();                                  // §7: the hermetic selftest switch also closes the SSE
         renderStatus(currentPaneId() ? paneState(currentPaneId()) : null);
         return auto;
       },
@@ -3300,6 +3466,7 @@
         renderer: rendererName(), pollMs: POLL_MS, polling: !!pollTimer, pendingTimer: !!pendingTimer,
         workingTimer: !!workingTimer, slowTimer: !!slowTimer,
         agent: st ? st.agent : null, source: st ? st.source : null, cursor: st ? st.cursor : null,
+        live: live ? live.status() : null,
         messages: st ? st.messages.length : 0,
         rendered: st ? domLastOf(st) - domFirstOf(st) : 0,
         turns: st ? st.rendered.length : 0,
@@ -3426,6 +3593,8 @@
       backoffMaxMs: function () { return handle ? handle.__backoffMaxMs : 0; },
       lastAsk: function () { return handle ? handle.__lastAsk() : null; },
       dedupMs: function () { return handle ? handle.__dedupMs : 0; },
+      live: function () { return handle ? handle.__live() : null; },
+      liveEvents: function (events) { return handle ? handle.__liveEvents(events) : []; },
       attach: function () { return handle ? handle.__attach() : null; },
       attachFiles: function (files, paneId, opts) { return handle ? handle.__attachFiles(files, paneId, opts) : null; },
       attachRemove: function (id) { return handle ? handle.__attachRemove(id) : false; },

@@ -3126,6 +3126,18 @@ function init() {
     const t = e.target;
     if (t && t.dataset && t.dataset.key) sendKeys([t.dataset.key]);
   });
+  const stopBtn = $('stopBtn');
+  if (stopBtn) stopBtn.addEventListener('click', async function () {
+    const paneId = state.selected;
+    const pane = paneId ? findPane(paneId) : null;
+    if (!paneId || !pane) { toast('select a pane first', 'info'); return; }
+    if (pane.agent !== 'pi') { toast('stop is wired for pi panes only', 'info'); return; }
+    stopBtn.disabled = true;
+    const res = await postJSON('/api/stop', { pane_id: paneId });
+    stopBtn.disabled = false;
+    if (!res || !res.ok) toast('stop failed — ' + errText(res), 'error');
+    else toast('stop requested — the pi run should end without killing the pane', 'info');
+  });
   const lsb = $('literalSend');
   if (lsb) lsb.addEventListener('click', sendLiteral);
 
@@ -3137,13 +3149,16 @@ function init() {
   let modelCache = { paneId: null, agent: null, models: null };   // models for the pane the list was built for
   async function refreshModelList(paneId, agent, force) {
     if (!modelSel) return;
-    if (!force && modelCache.paneId === paneId && modelCache.models) { fillModelSel(modelCache.models, agent); return; }
+    if (!force && modelCache.paneId === paneId && modelCache.models) { fillModelSel(modelCache.models, agent, modelCache.note); return; }
     modelSel.disabled = true;
     setModelSelPlaceholder('loading…');
     const body = await api('/api/model?pane_id=' + encodeURIComponent(paneId));
-    if (!body || !body.ok) { setModelSelPlaceholder('model: —'); modelSel.disabled = true; modelCache = { paneId: null, agent: null, models: null }; return; }
-    modelCache = { paneId: paneId, agent: agent, models: body.models || [] };
-    fillModelSel(modelCache.models, agent);
+    if (!body || !body.ok) { setModelSelPlaceholder('model: —'); modelSel.disabled = true; modelCache = { paneId: null, agent: null, models: null, note: '' }; return; }
+    /* pi answers with its own list (GET /api/model reads the extension's catalogue) and may add a
+       note when there is nothing to pick — kept on the cache so the disabled droplist can explain
+       itself instead of showing a bare dash */
+    modelCache = { paneId: paneId, agent: agent, models: body.models || [], note: body.note || '' };
+    fillModelSel(modelCache.models, agent, modelCache.note);
   }
   function setModelSelPlaceholder(text) {
     if (!modelSel) return;
@@ -3152,20 +3167,39 @@ function init() {
     o.textContent = text; o.value = '';
     modelSel.appendChild(o);
   }
-  /* what the option carries: hermes switches by model NAME, claude by the numbered row */
-  function optionValue(m, agent) { return agent === 'hermes' ? String(m.model) : String(m.n); }
-  function fillModelSel(models, agent) {
+  /* what the option carries: hermes switches by model NAME, pi by provider + NUL + model (one flat
+     string survives <option>), claude by the numbered row */
+  function optionValue(m, agent) {
+    if (agent === 'pi') return String(m.provider) + '\u0000' + String(m.model);
+    return agent === 'hermes' ? String(m.model) : String(m.n);
+  }
+  /* the text of the option currently carrying `val` — the label pi reports in its toast */
+  function modelOptionLabel(val) {
+    const opts = (modelSel && modelSel.options) ? modelSel.options : [];
+    for (let i = 0; i < opts.length; i++) if (opts[i].value === val) return opts[i].textContent || '';
+    return '';
+  }
+  function fillModelSel(models, agent, note) {
     if (!modelSel) return;
     modelSel.innerHTML = '';
-    if (!models.length) { setModelSelPlaceholder('model: —'); modelSel.disabled = true; return; }
+    /* drop a note left by an earlier empty list: the tooltip under an enabled control would lie */
+    if (String(modelSel.title).indexOf('model — ') === 0) modelSel.title = '';
+    if (!models.length) {
+      setModelSelPlaceholder('model: —');
+      modelSel.disabled = true;
+      if (note) modelSel.title = 'model — ' + note;   // pi: the extension says why nothing is listed
+      return;
+    }
     const cur = currentModelText();
     models.forEach(function (m) {
       const o = document.createElement('option');
       o.value = optionValue(m, agent);
-      o.textContent = (agent === 'hermes' && m.provider) ? (m.model + ' — ' + m.provider) : m.label;
-      /* claude marks the current row in its picker; hermes has no such mark, so match the pane's
-         own reported model instead */
-      if (m.current || (agent === 'hermes' && cur && m.model === cur)) o.selected = true;
+      o.textContent = agent === 'pi'
+        ? (m.label || m.model)
+        : ((agent === 'hermes' && m.provider) ? (m.model + ' — ' + m.provider) : m.label);
+      /* claude marks the current row in its picker; hermes and pi have no such mark, so match the
+         pane's own reported model instead */
+      if (m.current || ((agent === 'hermes' || agent === 'pi') && cur && m.model === cur)) o.selected = true;
       modelSel.appendChild(o);
     });
     modelSel.disabled = false;
@@ -3186,9 +3220,10 @@ function init() {
     const agent = pane && pane.agent;
     const cur = currentModelText();
     if (!pane) { setModelSelPlaceholder('model…'); modelSel.disabled = true; modelCache = { paneId: null, agent: null, models: null }; return; }
-    /* claude and hermes both switch from the dash; pi does not — its /model input channel is
-       unreliable and its cancel key (ctrl+c) kills the process, so its droplist stays read-only */
-    if (agent !== 'claude' && agent !== 'hermes') {
+    /* claude and hermes both switch from the dash; pi switches through its extension's
+       /herdr-model command, so its list comes from GET /api/model and the control stays disabled
+       (with the server's note) when that list is empty. No /model is ever typed for pi. */
+    if (agent !== 'claude' && agent !== 'hermes' && agent !== 'pi') {
       setModelSelPlaceholder(cur ? ('model: ' + cur) : 'model: —');
       modelSel.disabled = true;
       modelCache = { paneId: null, agent: null, models: null };
@@ -3197,14 +3232,25 @@ function init() {
     refreshModelList(state.selected, agent, false);
   }
   window.__hdUpdateModelSel = updateModelSel;
-  if (modelSel) modelSel.addEventListener('change', async function () {
+  if (modelSel) modelSel.addEventListener('change', onModelChange);
+  async function onModelChange() {
     const paneId = state.selected;
     const agent = modelCache.agent;
     const val = modelSel.value;
     if (!paneId || !val) return;
     modelSel.disabled = true;
     let body;
-    if (agent === 'hermes') {
+    if (agent === 'pi') {
+      /* the option value is provider + NUL + model; the id pair goes back exactly as it came */
+      const at = String(val).indexOf('\u0000');
+      const provider = at < 0 ? '' : String(val).slice(0, at);
+      const model = at < 0 ? String(val) : String(val).slice(at + 1);
+      const label = modelOptionLabel(val) || model;
+      body = await postJSON('/api/model', { pane_id: paneId, provider: provider, model: model });
+      if (!body || !body.ok) { toast('model switch failed — ' + errText(body), 'error'); }
+      else if (body.confirmed === false) { toast('model → ' + label + ' (unconfirmed — check the pane)', 'error'); }
+      else { toast('model → ' + label, 'ok'); }
+    } else if (agent === 'hermes') {
       body = await postJSON('/api/model', { pane_id: paneId, model: val });
       if (!body || !body.ok) { toast('model switch failed — ' + errText(body), 'error'); }
       else if (body.confirmed === false) { toast('model → ' + val + ' (unconfirmed — check the pane)', 'error'); }
@@ -3217,7 +3263,7 @@ function init() {
       else { toast('model → ' + (body.label || ('option ' + n)), 'ok'); }
     }
     refreshModelList(paneId, agent, true);            // refetch so the current row is accurate
-  });
+  }
 
   /* the think-effort droplist: the same shape as the model one — it shows the selected pane's
      current level and switches when the reader picks another. All three agents can be switched
@@ -3373,9 +3419,13 @@ function init() {
       + (body.total && body.total !== list.length ? ' of ' + body.total : '') + ' sessions';
     sessionList.innerHTML = '';
     if (!list.length) { sessionNoteSet('the selector listed no sessions'); return; }
+    /* pi lists the sessions its extension knows about and resumes by id through that same
+       extension: no selector is opened in the pane and no row number is involved */
     sessionNoteSet(body.agent === 'claude'
       ? 'claude only resumes sessions from this pane\'s own directory'
-      : '');
+      : (body.agent === 'pi'
+        ? 'pi switches through its extension — no selector opens in the pane'
+        : ''));
     list.forEach(function (s) {
       const row = document.createElement('button');
       row.type = 'button';
@@ -3398,7 +3448,23 @@ function init() {
     const paneId = state.selected;
     if (!paneId) return;
     row.classList.add('busy');
-    /* hermes takes a session id; claude and pi are driven by the row number in their selector */
+    /* pi takes a session id (its extension sends /herdr-resume), and its answer is
+       command_sent + confirmed:false — a request the extension will apply, not a failure */
+    if (body.agent === 'pi') {
+      const res = await postJSON('/api/sessions', { pane_id: paneId, session_id: s.id });
+      row.classList.remove('busy');
+      if (!res || !res.ok) { toast('session switch failed — ' + errText(res), 'error'); return; }
+      const name = s.title || 'session';
+      if (res.confirmed === false) {
+        toast('switch requested — ' + name + ' (unconfirmed — the pi extension applies it)', 'info');
+      } else {
+        toast('resumed ' + name, 'ok');
+      }
+      closeSessionPanel();
+      resetChatPane(paneId, 'session-switch');
+      return;
+    }
+    /* hermes takes a session id; claude is driven by the row number in its selector */
     const res = body.agent === 'hermes'
       ? await postJSON('/api/sessions', { pane_id: paneId, session_id: s.id })
       : await postJSON('/api/sessions', { pane_id: paneId, n: s.n });

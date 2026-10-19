@@ -58,6 +58,10 @@ if (typeof window.HD.register !== 'function') {
      the view to work (a missing file leaves the text exactly as the agent wrote it, §13.2.8). -->
 <script src="/lib/copy.js" defer></script>
 <script src="/lib/pathlink.js" defer></script>
+<!-- stream-round §7: the live turn (token bridge). Loaded before chatview.js, which mounts it and
+     opens the SSE source only while the chat view is visible on a pi/hermes pane. A missing file
+     leaves the record view exactly as it is today (the chip is simply not shown). -->
+<script src="/lib/stream-live.js" defer></script>
 <script src="/lib/chatview.js" defer></script>
 
 <!-- §12.2.3: the side dock's content (W3). It registers itself before app.js runs, so it is then
@@ -188,6 +192,7 @@ if (typeof window.HD.register !== 'function') {
           <button class="key" data-key="enter" type="button">enter</button>
           <button class="key" data-key="esc" type="button">esc</button>
           <button class="key" data-key="ctrl+c" type="button">ctrl+c</button>
+          <button id="stopBtn" class="key" type="button" title="stop the current pi run without killing pi">stop</button>
           <button class="key" data-key="up" type="button">up</button>
           <button class="key" data-key="down" type="button">down</button>
           <button class="key" data-key="tab" type="button">tab</button>
@@ -196,7 +201,7 @@ if (typeof window.HD.register !== 'function') {
         </div>
         <span class="dim small">agent</span>
         <select id="agentModelSel" class="btn" disabled
-                title="the selected pane's model — pick another to switch it live (claude, hermes)">
+                title="the selected pane's model — pick another to switch it live (claude, hermes, pi)">
           <option>model…</option>
         </select>
         <span class="dim small">think</span>

@@ -31,6 +31,9 @@
  *
  * Signal order (documented; `detected_by` names the winner):
  *   0 reader        an explicit `?session_id=` pick, from the candidates listed
+ *   0.5 sink_session pi: the pane's OWN token-sink file names a session that is
+ *                   also one of the cwd's verified log candidates (pane-specific
+ *                   evidence; beats the rank/mtime guesses below)
  *   1 pane_banner   the pane's own text (on screen first, scrollback second)
  *   2 store_session hermes `sessions` table: this cwd, newest activity
  *   3 cwd_newest    claude: the newest jsonl under the pane's cwd that PROVES
@@ -63,6 +66,7 @@ const LIMITS = {
 
 const SIGNALS = {
   READER: 'reader',
+  SINK_SESSION: 'sink_session',
   PANE_BANNER: 'pane_banner',
   STORE_SESSION: 'store_session',
   CWD_NEWEST: 'cwd_newest',
@@ -197,7 +201,9 @@ function digestPaneText(text) {
  *   pane_text_recent     the pane's recent-unwrapped text, or null if unread
  *   store_sessions       hermes, newest first: [{id, cwd, started_at, last_activity_at}]
  *   store_known_ids      hermes: {[id]: true} — ids this store knows for this pane
- *   candidates           claude, newest first: [{id, path, mtimeMs}] verified against the cwd
+ *   candidates           claude/pi, newest first: [{id, path, mtimeMs}] verified against the cwd
+ *   sink_session         pi: {id, path, mtimeMs} from the pane's own token-sink file
+ *                        (pi.sinkSessionForPane), or null
  *   bound_mtime_ms       claude: mtime of herdr's bound file (null when it has none)
  *   claimed              {[sessionId]: paneId} — ids herdr binds to OTHER panes
  *   reader_pick          `?session_id=` — the reader's explicit choice
@@ -295,6 +301,33 @@ function resolvePaneSession(input) {
       : `the reader chose ${pick}${herdr ? ` (herdr records ${herdr})` : ''}`;
     out.corroborated = byId(pick).source !== SIGNALS.READER;
     return out;
+  }
+
+  // ── 0.5 the pane's own token sink (pi) ────────────────────────────────────
+  // The pi bridge writes <streams>/<safe(pane)>/<safe(session)>__<safe(turn)>.ndjson
+  // and the first envelope names the pane's session. That is the ONLY piece of
+  // evidence that is pane-specific when several pi panes share one cwd, so it
+  // outranks the rank/mtime guesses below. It is trusted only when the id is also
+  // one of the log candidates this resolver already verified for the cwd: a stale
+  // or mis-copied sink file must not bind a session the pane's logs do not
+  // corroborate. A rejected sink id is disclosed and then ignored — never guessed.
+  if (agent === 'pi' && inp.sink_session && typeof inp.sink_session === 'object') {
+    const sinkId = inp.sink_session.id == null ? '' : String(inp.sink_session.id);
+    if (sinkId) {
+      const corroborating = filerows.find((c) => String(c.id) === sinkId) || null;
+      if (corroborating) {
+        return Object.assign(out, {
+          resolved: true,
+          session_id: sinkId,
+          detected_by: SIGNALS.SINK_SESSION,
+          reason: null,
+          corroborated: true,
+          note: `the pane's own sink file named ${sinkId}`,
+        });
+      }
+      note(`the pane's sink file names ${sinkId}, which is not one of this cwd's verified log candidates — ignored`);
+      push(sinkId, SIGNALS.SINK_SESSION, 'not a log candidate for this cwd');
+    }
   }
 
   // ── 1. the pane's own banner (hermes; the claude TUI prints no such field) ──

@@ -1,0 +1,12 @@
+name: herdr-stream
+version: "1.0"
+description: Stream Hermes assistant text/reasoning, tool and turn events to the Herdr-Dash local NDJSON sink
+provides_hooks:
+  - on_stream_start
+  - on_stream_delta
+  - on_stream_end
+  - pre_tool_call
+  - post_tool_call
+  - on_session_start
+  - on_session_end
+  - on_session_reset
