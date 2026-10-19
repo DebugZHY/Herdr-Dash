@@ -920,6 +920,10 @@
     var offStatus = null;
     var unmounted = false;
     var mounted = false;
+    /* live growth pinning: at most one scheduled frame, and the observer that schedules it */
+    var listWatch = null;
+    var pinFrame = 0;
+    var pinFallback = 0;
 
     /* §10: the composer's attachments. The engine owns the chips and is the only thing that knows
        what the next send will be; app.js owns the three input paths and asks it. */
@@ -2435,6 +2439,15 @@
         var turn = ctrl.closest ? ctrl.closest('.hd-cv-turn') : null;
         return turn ? turn.querySelector('.hd-cv-process') : null;
       }
+      /* a run of consecutive tool cards: the head is the row above the body it folds away */
+      if (cls.indexOf('hd-cv-toolgroup-head') >= 0) {
+        var grp = ctrl.closest ? ctrl.closest('.hd-cv-toolgroup') : null;
+        if (!grp) return null;
+        var gbody = grp.querySelector('.hd-cv-toolgroup-body');
+        if (gbody) return gbody;
+        var gsib = ctrl.nextElementSibling;
+        return (gsib && gsib.classList && gsib.classList.contains('hd-cv-toolgroup-body')) ? gsib : null;
+      }
       /* the `show all` control is appended by the renderer right after the box it belongs to */
       var sib = ctrl.previousElementSibling;
       if (sib && sib.classList
@@ -2462,6 +2475,11 @@
         var caret = hit.querySelector ? hit.querySelector('.hd-cv-proccaret') : null;
         if (caret) caret.textContent = open ? '▾' : '▸';
         hit.title = open ? 'hide the records behind this answer' : 'show the records behind this answer';
+      }
+      else if (cls.indexOf('hd-cv-toolgroup-head') >= 0) {
+        /* a tool group's summary counts the cards; only the caret says whether they are shown */
+        var gcaret = hit.querySelector ? hit.querySelector('.hd-cv-toolgroup-caret') : null;
+        if (gcaret) gcaret.textContent = open ? '▾' : '▸';
       }
       var body = bodyForControl(hit);
       if (body) {
@@ -2745,6 +2763,37 @@
       var st = pid ? paneState(pid) : null;
       if (st) st.panelTop = follow ? null : scrollEl.scrollTop;
       updateJump();                     // pinned -> hidden; unpinned -> "N new ↓" / "jump to latest ↓"
+    }
+    /* A live turn grows by DOM changes, not by the record poll, so the reader watching it is kept at
+       the tail by the changes themselves. One frame is scheduled per burst of mutations, and the
+       pin is only applied if the view is still following when that frame runs: a reader who scrolled
+       up between the change and the frame keeps their place, and the jump chip stays theirs. */
+    function liveIsActive() {
+      if (!live) return false;
+      try {
+        var s = live.status();
+        return !!(s && s.state !== 'records');
+      } catch (e) { return false; }
+    }
+    function pinLiveTail() {
+      pinFrame = 0;
+      pinFallback = 0;
+      if (unmounted || !follow || !liveIsActive()) return;
+      scrollEl.scrollTop = scrollEl.scrollHeight;
+    }
+    function schedulePin() {
+      if (unmounted || !follow || !liveIsActive()) return;
+      if (pinFrame || pinFallback) return;
+      if (typeof window.requestAnimationFrame === 'function') {
+        pinFrame = window.requestAnimationFrame(pinLiveTail);
+      } else {
+        pinFallback = window.setTimeout(pinLiveTail, 16);
+      }
+    }
+    function stopLivePin() {
+      if (listWatch) { try { listWatch.disconnect(); } catch (e) { /* already gone */ } listWatch = null; }
+      if (pinFrame) { try { window.cancelAnimationFrame(pinFrame); } catch (e) { /* ignore */ } pinFrame = 0; }
+      if (pinFallback) { window.clearTimeout(pinFallback); pinFallback = 0; }
     }
     /* a scroll INSIDE a box does not bubble, so this is one listener on the list in the capture
        phase (the box does not exist yet at mount time, and there is one per block). The panel's own
@@ -3211,6 +3260,13 @@
     scrollEl.addEventListener('scroll', onScroll);
     listEl.addEventListener('scroll', onListScroll, true);   // capture: inner box scrolls do not bubble
     listEl.addEventListener('click', onListClick);
+    /* the list itself is the only place a live turn grows; every change there asks for one pin */
+    if (typeof MutationObserver === 'function') {
+      try {
+        listWatch = new MutationObserver(function () { schedulePin(); });
+        listWatch.observe(listEl, { childList: true, subtree: true, characterData: true });
+      } catch (e) { listWatch = null; }
+    }
     jumpBtn.addEventListener('click', function () { scrollToBottom(); });
     olderBtn.addEventListener('click', function () { loadOlder(); });
     retryBtn.addEventListener('click', function () { retryNow(); });
@@ -3369,6 +3425,7 @@
         try { if (pathApi && pathApi.unmount) pathApi.unmount(); } catch (e) { /* gone */ }
         document.removeEventListener('keydown', onKey);
         scrollEl.removeEventListener('scroll', onScroll);
+        stopLivePin();                               // no observer and no scheduled frame outlives the mount
         listEl.removeEventListener('scroll', onListScroll, true);
         listEl.removeEventListener('click', onListClick);
         clearReqTimer();                             // DEFECT-18(2): no timer outlives the mount

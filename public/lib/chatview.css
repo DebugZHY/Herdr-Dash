@@ -662,3 +662,123 @@
   box-shadow: inset 0 0 0 2px var(--accent);
   background-color: #10202f;
 }
+
+/* ---------------- code blocks: language, copy, tokens ---------------- */
+/* The head is part of the code block, not an overlay: the language stays readable at any scroll
+   position and the copy control keeps its own 20px hit area. Inside .hd-cv-codewrap the head and
+   the pre share one frame, so a fence reads as one object instead of a label floating on code. */
+.hd-cv-codewrap { display: flex; flex-direction: column; }
+.hd-cv-codehead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  padding: 2px 6px;
+  background: var(--bg-input);
+  border: 1px solid var(--line-soft);
+  border-bottom: 0;
+  border-radius: 6px 6px 0 0;
+}
+.hd-cv-codehead .hd-cv-lang {
+  position: static;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: .04em;
+  text-transform: lowercase;
+  color: var(--fg-dim);
+}
+.hd-cv-codecopy { opacity: .55; }
+.hd-cv-codewrap:hover .hd-cv-codecopy,
+.hd-cv-codecopy:focus-visible { opacity: 1; }
+.hd-cv-codewrap .hd-cv-code {
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+  border-top-color: transparent;
+}
+.hd-tok-str { color: #a8d48a; }
+.hd-tok-com { color: #6d7a8a; font-style: italic; }
+.hd-tok-num { color: #e0a02a; }
+.hd-tok-kw  { color: #c792ea; }
+.hd-tok-lit { color: #4aa3ff; }
+
+/* ---------------- consecutive tool calls in an open turn ---------------- */
+/* A run of tool cards is one visual object with a count, not a wall of identical frames. The group
+   is deliberately quiet: a hairline spine and a small head, so the prompt and the answer keep the
+   weight. The body keeps each card's own frame and every disclosure it carries. */
+.hd-cv-toolgroup {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 4px 0;
+  padding-left: 6px;
+  border-left: 2px solid var(--line-soft);
+}
+.hd-cv-toolgroup-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 2px 6px;
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+  color: var(--fg-dim);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.hd-cv-toolgroup-head:hover { color: var(--fg); border-color: var(--line); }
+.hd-cv-toolgroup-head:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.hd-cv-toolgroup-caret { flex: 0 0 auto; width: 10px; }
+.hd-cv-toolgroup-sum { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hd-cv-toolgroup-err { flex: 0 0 auto; color: var(--st-blocked); font-size: 10.5px; }
+.hd-cv-toolgroup-body { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.hd-cv-toolgroup-body[hidden] { display: none; }
+
+/* ---------------- live streaming markdown ---------------- */
+/* The live turn is ephemeral, so its markdown uses the smallest possible frame: prose keeps the
+   composer's line breaks, code gets an unfussy headed box, and nothing here competes with the
+   authoritative record view that replaces it. */
+.hd-live-text.hd-md { white-space: normal; }
+.hd-md { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.hd-md-p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.hd-md-code {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--bg-input);
+  overflow: hidden;
+}
+.hd-md-codehead {
+  display: flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 0 6px;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--fg-dim);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: .04em;
+}
+.hd-md-pre {
+  margin: 0;
+  padding: 6px 8px;
+  max-height: 260px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}

@@ -33,6 +33,10 @@
  *                  .hd-cv-sidechain .hd-cv-meta .hd-cv-who .hd-cv-time .hd-cv-side
  *                  .hd-cv-row .hd-cv-bubble .hd-cv-body .hd-cv-p .hd-cv-open .hd-cv-more
  *                  .hd-cv-code .hd-cv-codewrap .hd-cv-lang .hd-cv-icode .hd-cv-link
+ *                  .hd-cv-codehead .hd-cv-codecopy
+ *                  .hd-tok-str .hd-tok-com .hd-tok-num .hd-tok-kw .hd-tok-lit
+ *                  .hd-cv-toolgroup .hd-cv-toolgroup-head .hd-cv-toolgroup-caret
+ *                  .hd-cv-toolgroup-sum .hd-cv-toolgroup-err .hd-cv-toolgroup-body
  *                  .hd-cv-think .hd-cv-think-head .hd-cv-think-body
  *                  .hd-cv-card .hd-cv-card-head .hd-cv-card-body .hd-cv-name .hd-cv-sum
  *                  .hd-cv-toggle .hd-cv-sec .hd-cv-json .hd-cv-res .hd-cv-resbox
@@ -334,16 +338,241 @@
       else appendRich(parent, parts[i].text);
     }
   }
+  // ── code blocks: the language label, the copy control, and the token colours ─
+  // A fence is drawn as one object: a head that names its language and carries the copy control for
+  // exactly this block's code, then the code itself. Colouring scans the text into slices and wraps
+  // some of them in a span; the slices always concatenate back to the input, so what the `pre` holds
+  // as text is the code the record contained, unchanged. Nothing is parsed and nothing is escaped:
+  // markup inside a fence is text here, exactly as it is everywhere else in this file.
+
+  var codeSeq = 0;                     // ids only have to be unique inside the tree being built
+
+  /** The first word of a fence's info string, which is the language a reader sees named. */
+  function codeLang(raw) {
+    var word = str(raw).replace(/^\s+/, '').split(/\s+/)[0] || '';
+    return word.replace(/^[{(]+|[)}.,;]+$/g, '');
+  }
+
+  // Which scanner rules a language word gets. A word that is not listed here is not a failure: its
+  // code is drawn as one plain text node, which is what every fence got before the colours existed.
+  var CODE_ALIAS = {
+    json: 'json',
+    js: 'js', javascript: 'js', jsx: 'js', mjs: 'js', cjs: 'js',
+    ts: 'js', typescript: 'js', tsx: 'js',
+    python: 'python', py: 'python', python3: 'python',
+    bash: 'bash', sh: 'bash', shell: 'bash', zsh: 'bash', console: 'bash'
+  };
+  function wordSet(s) {
+    var out = {}, parts = str(s).split(' ');
+    for (var i = 0; i < parts.length; i++) if (parts[i] !== '') out[parts[i]] = true;
+    return out;
+  }
+  var CODE_KW = {
+    js: wordSet('as async await break case catch class const continue debugger declare default ' +
+      'delete do else enum export extends finally for from function get if implements import in ' +
+      'instanceof interface let namespace new of private protected public readonly return set ' +
+      'static super switch this throw try type typeof var void while with yield abstract any ' +
+      'boolean never number object string symbol unknown'),
+    python: wordSet('and as assert async await break class continue def del elif else except ' +
+      'finally for from global if import in is lambda nonlocal not or pass raise return try ' +
+      'while with yield match case'),
+    bash: wordSet('alias case coproc declare do done elif else esac export fi for function if in ' +
+      'local readarray readonly return select shift source then time until unset while')
+  };
+  var CODE_LIT = {
+    json: wordSet('true false null'),
+    js: wordSet('true false null undefined NaN Infinity'),
+    python: wordSet('True False None NotImplemented Ellipsis'),
+    bash: wordSet('true false')
+  };
+  var CODE_RULES = {
+    json: { line: null, block: null, quotes: '"', triple: false },
+    js: { line: '//', block: '/*', quotes: '\'"`', triple: false },
+    python: { line: '#', block: null, quotes: '\'"', triple: true, hashAfterSpace: false },
+    bash: { line: '#', block: null, quotes: '\'"', triple: false, hashAfterSpace: true }
+  };
+
+  function isDigitCh(c) { return c >= '0' && c <= '9'; }
+  function isSpaceCh(c) { return c === ' ' || c === '\t' || c === '\n' || c === '\r'; }
+  function isHexCh(c) {
+    return isDigitCh(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+  }
+  function isWordStart(c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c === '_' || c === '$';
+  }
+  function isWordCh(c) {
+    return isWordStart(c) || isDigitCh(c);
+  }
+  /** End of a `//`/`#` comment: the newline itself is not part of it. */
+  function lineCommentEnd(src, i) {
+    var j = src.indexOf('\n', i);
+    return j < 0 ? src.length : j;
+  }
+  /** End of a block comment, from its opening two characters to just past its closing ones; an
+   *  unterminated one runs to the end, which is how a reader sees it too. */
+  function blockCommentEnd(src, i, close) {
+    var j = src.indexOf(close, i + 2);
+    return j < 0 ? src.length : j + close.length;
+  }
+  /** End of a quoted string, escapes honoured. A one-line quote that never closes stops at the
+   *  newline so the rest of the block is still read as code; a triple quote may span lines. */
+  function stringEnd(src, i, quote, triple) {
+    var n = src.length, k = i + (triple ? 3 : 1), stop = quote + quote + quote;
+    while (k < n) {
+      var c = src.charAt(k);
+      if (c === '\\') { k += 2; continue; }
+      if (triple) {
+        if (src.substr(k, 3) === stop) return k + 3;
+        k++;
+        continue;
+      }
+      if (c === quote) return k + 1;
+      if (c === '\n') return k;
+      k++;
+    }
+    return n;
+  }
+  /** End of a numeric literal: decimal with an optional fraction/exponent, or a 0x/0b form. */
+  function numberEnd(src, i) {
+    var n = src.length, j = i, c = src.charAt(j), k = src.charAt(j + 1);
+    if (c === '0' && (k === 'x' || k === 'X')) {
+      j += 2;
+      while (j < n && (isHexCh(src.charAt(j)) || src.charAt(j) === '_')) j++;
+      return j;
+    }
+    if (c === '0' && (k === 'b' || k === 'B')) {
+      j += 2;
+      while (j < n && (src.charAt(j) === '0' || src.charAt(j) === '1' || src.charAt(j) === '_')) j++;
+      return j;
+    }
+    while (j < n && (isDigitCh(src.charAt(j)) || src.charAt(j) === '_')) j++;
+    if (src.charAt(j) === '.') {
+      j++;
+      while (j < n && isDigitCh(src.charAt(j))) j++;
+    }
+    c = src.charAt(j);
+    if (c === 'e' || c === 'E') {
+      k = j + 1;
+      if (src.charAt(k) === '+' || src.charAt(k) === '-') k++;
+      if (isDigitCh(src.charAt(k))) {
+        j = k;
+        while (j < n && isDigitCh(src.charAt(j))) j++;
+      }
+    }
+    return j;
+  }
+
+  /**
+   * Cut one block of code into `{text, cls}` slices. The slices' texts concatenate back to `src`
+   * exactly — that property is the whole point of this function, and every branch below either
+   * consumes characters into a slice or into plain text, so none can drop or duplicate one.
+   *   cls is one of hd-tok-str, hd-tok-com, hd-tok-num, hd-tok-kw, hd-tok-lit, or null for plain.
+   * `family` is a key of CODE_RULES; anything else (including '') means "no colouring at all".
+   */
+  function scanCode(src, family) {
+    var text = str(src), rules = CODE_RULES[family];
+    if (!rules) return [{ text: text, cls: null }];
+    var out = [], plain = '', i = 0, n = text.length, lineMark = rules.line;
+    var kw = CODE_KW[family] || {}, lit = CODE_LIT[family] || {};
+    function flush() { if (plain !== '') { out.push({ text: plain, cls: null }); plain = ''; } }
+    function push(from, to, cls) { flush(); out.push({ text: text.slice(from, to), cls: cls }); }
+    function has(map, word) { return Object.prototype.hasOwnProperty.call(map, word); }
+    while (i < n) {
+      var c = text.charAt(i), two = text.substr(i, 2), j;
+      // `#` opens a comment anywhere in python, but in a shell only at a word boundary (`$#` is a
+      // parameter, not a comment).
+      if (lineMark !== null && (lineMark.length === 2 ? two === lineMark : c === lineMark) &&
+          !(rules.hashAfterSpace && i > 0 && !isSpaceCh(text.charAt(i - 1)))) {
+        j = lineCommentEnd(text, i);
+        push(i, j, 'hd-tok-com');
+        i = j;
+        continue;
+      }
+      if (rules.block !== null && two === rules.block) {
+        j = blockCommentEnd(text, i, '*/');
+        push(i, j, 'hd-tok-com');
+        i = j;
+        continue;
+      }
+      if (rules.quotes.indexOf(c) >= 0) {
+        var triple = !!rules.triple && text.substr(i, 3) === c + c + c;
+        j = stringEnd(text, i, c, triple);
+        push(i, j, 'hd-tok-str');
+        i = j;
+        continue;
+      }
+      if (isDigitCh(c)) {
+        j = numberEnd(text, i);
+        push(i, j, 'hd-tok-num');
+        i = j;
+        continue;
+      }
+      if (isWordStart(c)) {
+        j = i + 1;
+        while (j < n && isWordCh(text.charAt(j))) j++;
+        var word = text.slice(i, j);
+        if (has(kw, word)) push(i, j, 'hd-tok-kw');
+        else if (has(lit, word)) push(i, j, 'hd-tok-lit');
+        else plain += word;
+        i = j;
+        continue;
+      }
+      plain += c;
+      i++;
+    }
+    flush();
+    return out;
+  }
+
+  /** The public name for the scanner: the same slices, with the language word resolved. */
+  function highlightCode(text, lang) {
+    return scanCode(text, CODE_ALIAS[str(lang).toLowerCase()] || '');
+  }
+
+  /** The code itself. A language this build knows is cut into coloured slices; anything else — or a
+   *  block in which nothing is colourable — stays the one text node it always was, so an unknown
+   *  fence is rendered exactly as before. Either way the node's text is the fence's text. */
+  function codeNode(text, lang) {
+    var src = str(text);
+    var node = el('pre', 'hd-cv-code');
+    var toks = highlightCode(src, lang), styled = false, i;
+    for (i = 0; i < toks.length; i++) if (toks[i].cls) { styled = true; break; }
+    if (!styled) {
+      node.textContent = src;
+      return node;
+    }
+    for (i = 0; i < toks.length; i++) {
+      node.appendChild(toks[i].cls
+        ? el('span', toks[i].cls, toks[i].text)
+        : document.createTextNode(toks[i].text));
+    }
+    return node;
+  }
+
+  /** One fence: head (language, copy) and the code. The block marked for copying is the wrapper, so
+   *  the clipboard gets this block's code and the message's own words, never the whole bubble. */
+  function codeBlock(b) {
+    var lang = codeLang(b.lang);
+    var id = 'code#' + (++codeSeq);
+    var wrap = el('div', 'hd-cv-codewrap');
+    var head = el('div', 'hd-cv-codehead');
+    head.appendChild(el('span', 'hd-cv-lang', lang === '' ? 'text' : lang));
+    var btn = copyButton(id, 'copy this code block');
+    btn.className += ' hd-cv-codecopy';
+    head.appendChild(btn);
+    wrap.appendChild(head);
+    wrap.appendChild(codeNode(b.text, lang));
+    markBlock(wrap, id, b.text);
+    return wrap;
+  }
+
   /** The body of a bubble: prose blocks keep their own line breaks (verbatim), fences are <pre>. */
   function bodyInto(parent, raw) {
     var blocks = splitFences(raw);
     for (var i = 0; i < blocks.length; i++) {
       var b = blocks[i];
       if (b.code) {
-        var wrap = el('div', 'hd-cv-codewrap');
-        if (b.lang) wrap.appendChild(el('span', 'hd-cv-lang', b.lang));
-        wrap.appendChild(pre(b.text, 'hd-cv-code'));
-        parent.appendChild(wrap);
+        parent.appendChild(codeBlock(b));
       } else {
         var p = el('div', 'hd-cv-p');
         appendInline(p, b.text);
@@ -669,11 +898,11 @@
   // tool card) and is always the LAST child of its head row, so whatever control was already there
   // keeps its own hit area.
 
-  function copyButton(blockId) {
+  function copyButton(blockId, label) {
     var b = el('button', 'hd-cv-copy');
     b.setAttribute('type', 'button');
     b.setAttribute('data-hd-copy', str(blockId));
-    b.setAttribute('aria-label', 'copy this block');
+    b.setAttribute('aria-label', label == null ? 'copy this block' : str(label));
     b.textContent = '⧉';
     return b;
   }
@@ -1240,6 +1469,107 @@
     return wrap;
   }
 
+  // ── runs of tool records drawn in the open ───────────────────────────────────
+  // A running turn, and the records a finished turn keeps after its answer, have no fold to live
+  // in — so a dozen consecutive tool calls used to be a dozen identical frames. Two or more in a
+  // row are drawn as one group with a count and a state; the cards themselves are unchanged inside
+  // the body, each keeping its own expand control, copy button, clamps and pending wording. One
+  // tool record on its own is not a group: a run of one is drawn exactly as before.
+
+  var TOOL_GROUP_NAMES = 3;          // names in the head's one line, before the ellipsis
+
+  /** The group's id, named after the record that starts it — so appending a record to the turn
+   *  cannot rename a group the reader already closed. A record with no key falls back to its index
+   *  in the turn, which is the only stable name such a record has. */
+  function toolGroupId(items) {
+    var base = items.length ? idBase(items[0].msg) : '';
+    return base !== '' ? base + '#tgrp' : '#tgrp' + items[0].at;
+  }
+
+  /** What the head says: the count, the first few names, and the facts a reader must not have to open
+   *  the group to learn — a failed call, a call still waiting, and a result outside this window. */
+  function toolGroupFacts(items) {
+    var names = [], more = false, errors = 0, waiting = 0, stale = 0, i;
+    for (i = 0; i < items.length; i++) {
+      var m = items[i].msg;
+      var tool = (m && m.tool && typeof m.tool === 'object') ? m.tool : {};
+      var isResult = normKind(m.kind) === 'tool_result';
+      if (tool.is_error) errors++;
+      // The same "is this still coming" test the card itself uses, so the count and the card can
+      // never disagree: no result on the record, and the server has not retracted the claim. A call
+      // whose result is simply outside the loaded window is not still running — the card says that
+      // in its own words, and the group must not call it waiting.
+      if (!isResult && tool.pending && resultText(m, tool, false) === null) {
+        if (tool.pending_reason === 'not_in_window') stale++;
+        else waiting++;
+      }
+      if (names.length >= TOOL_GROUP_NAMES) { more = true; continue; }
+      var name = toolName(tool);
+      if (name) names.push(name);
+    }
+    var summary = plural(items.length, 'tool call', 'tool calls');
+    if (names.length) summary += ' · ' + names.join(', ') + (more ? ', …' : '');
+    var facts = [];
+    if (errors) facts.push(plural(errors, 'error', 'errors'));
+    if (waiting) facts.push(waiting + ' waiting');
+    if (stale) facts.push(plural(stale, 'call', 'calls') + ' with no result in this window');
+    return { summary: summary, facts: facts.join(' · '), attention: errors > 0 || waiting > 0 || stale > 0 };
+  }
+
+  /** One run of two or more tool records. Collapsed by default unless something in it needs the
+   *  reader's eyes; `opts.openKeys[id]` is the reader's own choice and always wins. No listener is
+   *  attached here: the head carries the id and the state, and the panel delegates the click. */
+  function toolGroup(items, fold, opts) {
+    var o = normOpts(opts);
+    var id = toolGroupId(items);
+    var facts = toolGroupFacts(items);
+    var open = isOpen(o, id, facts.attention);
+    var wrap = el('div', 'hd-cv-toolgroup');
+
+    var head = el('button', 'hd-cv-toolgroup-head');
+    head.setAttribute('type', 'button');
+    head.setAttribute('data-hd-open', id);
+    head.setAttribute('aria-expanded', open ? 'true' : 'false');
+    head.title = open ? 'hide these tool calls' : 'show these tool calls';
+    var caret = el('span', 'hd-cv-toolgroup-caret', open ? '▾' : '▸');
+    caret.setAttribute('aria-hidden', 'true');
+    head.appendChild(caret);
+    head.appendChild(el('span', 'hd-cv-toolgroup-sum', facts.summary));
+    if (facts.facts) head.appendChild(el('span', 'hd-cv-toolgroup-err', facts.facts));
+    wrap.appendChild(head);
+
+    var body = el('div', 'hd-cv-toolgroup-body' + (open ? ' hd-cv-open' : ''));
+    body.hidden = !open;
+    for (var i = 0; i < items.length; i++) {
+      body.appendChild(renderMessage(items[i].msg, neighbourOpts(items[i].msg, fold, items[i].at, opts)));
+    }
+    wrap.appendChild(body);
+    return wrap;
+  }
+
+  /** Draw records in log order, one node each except for the runs a toolGroup takes over. `interim`
+   *  marks a text record as an interim note rather than the answer (a turn with no reply has no
+   *  answer to mark). */
+  function drawRecords(parent, items, fold, opts, interim) {
+    var i = 0;
+    while (i < items.length) {
+      var m = items[i].msg;
+      if (isToolKind(m)) {
+        var j = i;
+        while (j < items.length && isToolKind(items[j].msg)) j++;
+        if (j - i > 1) {
+          parent.appendChild(toolGroup(items.slice(i, j), fold, opts));
+          i = j;
+          continue;
+        }
+      }
+      var node = renderMessage(m, neighbourOpts(m, fold, items[i].at, opts));
+      if (interim && normKind(m.kind) === 'text') node.className += ' hd-cv-interim';  // not the answer
+      parent.appendChild(node);
+      i++;
+    }
+  }
+
   /** The same counts the control shows, for a caller that appends to an already-drawn turn and must
    *  refresh its summary without redrawing the group. `turn` has the renderTurn shape ({user,
    *  segments, working}); returns {text, notes, count, toolCalls, durationMs}. */
@@ -1336,19 +1666,19 @@
         answerNode.className += ' hd-cv-reply';
         body.appendChild(el('div', 'hd-cv-replytag', 'reply'));
         body.appendChild(answerNode);
-        for (i = 0; i < after.length; i++) {
-          body.appendChild(renderMessage(after[i].msg, neighbourOpts(after[i].msg, fold, after[i].at, opts)));
-        }
+        // records the log kept after the answer are drawn in the open, so they group the way a
+        // running turn's do; the records before the answer stay inside the process fold, which has
+        // its own summary and is not grouped
+        drawRecords(body, after, fold, opts, false);
         drawn = before.length + 1 + after.length;
       } else {
+        var openRecords = [];
         for (i = 0; i < kept.length; i++) {
           if (fold.skip[i]) continue;
-          var seg = kept[i];
-          var node = renderMessage(seg, neighbourOpts(seg, fold, i, opts));
-          if (normKind(seg.kind) === 'text') node.className += ' hd-cv-interim';   // not the answer
-          body.appendChild(node);
-          drawn++;
+          openRecords.push({ msg: kept[i], at: i });
         }
+        drawRecords(body, openRecords, fold, opts, true);
+        drawn = openRecords.length;
       }
       if (t.working) body.appendChild(renderWorkingTail(t.elapsedMs));
       else if (!drawn) {
@@ -1390,7 +1720,7 @@
     fmtTime: fmtTime, fmtFull: fmtFull, tsMs: tsMs, charCount: charCount, countLines: countLines,
     firstLines: firstLines, splitFences: splitFences, splitInlineCode: splitInlineCode,
     prettyInput: prettyInput, textOf: textOf, resultText: resultText, summaryArg: summaryArg,
-    cardText: cardText, msgBlockId: msgBlockId,
+    cardText: cardText, msgBlockId: msgBlockId, highlightCode: highlightCode,
     toolName: toolName, callKeys: callKeys, isPairedResult: isPairedResult, normKind: normKind,
     normRole: normRole, normOpts: normOpts, roleLabel: roleLabel, clip: clip, linkNode: linkNode,
     dupeNote: dupeNote, dupeIdentity: dupeIdentity, foldMap: foldMap, isEmptySegment: isEmptySegment,

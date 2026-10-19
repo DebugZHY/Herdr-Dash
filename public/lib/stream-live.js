@@ -490,7 +490,7 @@
       node.appendChild(think);
       node.appendChild(tools);
       return { node: node, textEl: textEl, think: think, summary: summary, thinkBody: thinkBody,
-               toolsEl: tools, textShown: '', reasonShown: '', tools: {} };
+               toolsEl: tools, textShown: '', textDone: false, reasonShown: '', tools: {} };
     }
 
     function toolNode(vn, tool) {
@@ -539,14 +539,24 @@
           view.msgs[m.id] = vn;
           view.root.insertBefore(vn.node, view.note);
         }
-        // text: append the delta only (no rebuild) while it is a pure suffix
-        if (m.text !== vn.textShown) {
-          if (m.text.indexOf(vn.textShown) === 0) {
+        // text: progressive markdown when its renderer is loaded — the block still
+        // being written is the only one rebuilt; earlier blocks keep their nodes.
+        var doneNow = !!m.done;
+        if (m.text !== vn.textShown || doneNow !== vn.textDone) {
+          var markdown = root.HD && root.HD.streamMd;
+          if (markdown && typeof markdown.render === 'function') {
+            if (!vn.mdClass) {
+              vn.textEl.className = (vn.textEl.className ? vn.textEl.className + ' ' : '') + 'hd-md';
+              vn.mdClass = true;
+            }
+            markdown.render(vn.textEl, m.text, { done: doneNow });
+          } else if (m.text.indexOf(vn.textShown) === 0) {
             vn.textEl.appendChild(document.createTextNode(m.text.slice(vn.textShown.length)));
           } else {
             vn.textEl.textContent = m.text;
           }
           vn.textShown = m.text;
+          vn.textDone = doneNow;
         }
         vn.textEl.hidden = !m.text;
         // reasoning: collapsed <details>, summary carries the size
