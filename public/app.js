@@ -877,18 +877,20 @@ function connectEvents() {
 function flashResult(ok, text) {
   const el = $('promptResult');
   if (!el) return;
-  el.textContent = text;
+  const line = el.querySelector ? el.querySelector('[data-result-text]') : null;
+  if (line) line.textContent = text; else el.textContent = text;
   el.className = 'result ' + (ok ? 'ok' : 'err');
   /* a copy-status timer belongs to the sentence it wrote, never to the next message */
   el.removeAttribute('data-hd-copystatus');
 }
 
-/* Dismiss the composer's last message without waiting for a reload. The close button is a
-   sibling of #promptResult, so copy.js can keep writing that line with textContent. */
+/* Dismiss the composer's last message without waiting for a reload. The message
+   and its dismiss control live inside one box, so hiding the box hides both. */
 function clearResult() {
   const el = $('promptResult');
   if (!el) return;
-  el.textContent = '';
+  const line = el.querySelector ? el.querySelector('[data-result-text]') : null;
+  if (line) line.textContent = ''; else el.textContent = '';
   el.className = 'result hidden';
   el.removeAttribute('data-hd-copystatus');
 }

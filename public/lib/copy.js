@@ -113,6 +113,23 @@
     try { return document.getElementById(id); } catch (e) { return null; }
   }
 
+  /* The line may hold a dismiss control beside its sentence. Write and compare the
+     sentence's own node so a status update cannot detach that control. */
+  function lineTextEl(el) {
+    if (!el || !el.querySelector) return null;
+    return el.querySelector('[data-result-text]');
+  }
+
+  function lineValue(el) {
+    var t = lineTextEl(el);
+    return str(t ? t.textContent : (el ? el.textContent : ''));
+  }
+
+  function writeLine(el, text) {
+    var t = lineTextEl(el);
+    if (t) t.textContent = text; else if (el) el.textContent = text;
+  }
+
   /** Clear the sentence again after its TTL — but only if the line still holds OUR sentence (an
    *  exact text match AND the marker we set), so a send's result, or a newer copy, is never wiped by
    *  an older timer. A caller-provided sink owns its own line and is never cleared from here. */
@@ -121,9 +138,9 @@
     if (opts && typeof opts.status === 'function') return;
     var el = lineOf(opts);
     if (!el) return;
-    if (str(el.textContent) !== text) return;
+    if (lineValue(el) !== text) return;
     if (!attr(el, MARK)) return;
-    el.textContent = '';
+    writeLine(el, '');
     el.className = CLS.row + ' ' + CLS.hidden;
     if (el.removeAttribute) el.removeAttribute(MARK);
   }
@@ -137,7 +154,7 @@
     } else {
       var el = lineOf(opts);
       if (el) {
-        el.textContent = text;
+        writeLine(el, text);
         el.className = CLS.row + ' ' + (ok ? CLS.ok : CLS.err);
         if (el.setAttribute) el.setAttribute(MARK, '1');
       }

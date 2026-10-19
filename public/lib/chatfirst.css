@@ -517,11 +517,19 @@
 
 #promptResult { margin-top: 8px; }
 
-/* The result line and its dismiss button share one row. The button sits outside
-   #promptResult because copy.js writes that line's textContent directly; keeping it a
-   sibling lets both writers work without rebuilding a second status sink. */
-.result-row { display: flex; align-items: flex-start; gap: 6px; min-width: 0; }
-.result-row #promptResult { flex: 1 1 auto; min-width: 0; margin-top: 8px; overflow-wrap: anywhere; }
+/* The result box owns its dismiss control: the sentence wraps inside the box and
+   the × sits on the box's right edge instead of hanging outside it. */
+.result-row { display: flex; align-items: flex-start; gap: 0; min-width: 0; }
+.result-row #promptResult {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+}
+.result-text { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
 .result-close {
   flex: 0 0 auto;
   display: inline-flex;
@@ -529,18 +537,17 @@
   justify-content: center;
   width: 20px;
   height: 20px;
-  margin-top: 9px;
+  margin: 0;
   padding: 0;
-  border: 1px solid transparent;
-  border-radius: 6px;
+  border: 0;
   background: transparent;
   color: var(--fg-dim);
-  font: 13px/1 var(--mono);
+  font: 14px/1 var(--mono);
   cursor: pointer;
+  opacity: .65;
 }
-.result-close:hover { background: var(--bg-panel2); border-color: var(--line); color: var(--fg); }
+.result-close:hover { background: transparent; color: var(--fg); opacity: 1; }
 .result-close:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-#promptResult.hidden + #promptResultClose { display: none; }
 
 /* rounded result line inside the card */
 .result { border-radius: 8px; }
