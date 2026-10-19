@@ -161,7 +161,11 @@ if (typeof window.HD.register !== 'function') {
         <button id="stopBtn" class="tool-btn" type="button"
                 title="stop the current pi run without killing pi">stop</button>
       </div>
-      <div id="promptResult" class="result hidden"></div>
+      <div id="promptResultRow" class="result-row">
+        <div id="promptResult" class="result hidden" role="status" aria-live="polite"></div>
+        <button id="promptResultClose" class="result-close" type="button"
+                aria-label="Dismiss this message" title="Dismiss">&times;</button>
+      </div>
     </section>
 
   </main>

@@ -873,6 +873,18 @@ function flashResult(ok, text) {
   if (!el) return;
   el.textContent = text;
   el.className = 'result ' + (ok ? 'ok' : 'err');
+  /* a copy-status timer belongs to the sentence it wrote, never to the next message */
+  el.removeAttribute('data-hd-copystatus');
+}
+
+/* Dismiss the composer's last message without waiting for a reload. The close button is a
+   sibling of #promptResult, so copy.js can keep writing that line with textContent. */
+function clearResult() {
+  const el = $('promptResult');
+  if (!el) return;
+  el.textContent = '';
+  el.className = 'result hidden';
+  el.removeAttribute('data-hd-copystatus');
 }
 function needPane() {
   if (state.selected) return true;
@@ -3668,6 +3680,8 @@ function init() {
   if (pFollow) pFollow.addEventListener('click', function () { sendQueued('followup'); });
   updateQueueControls();
   wireApprovals();                               // the Claude approval banner above the queue tray
+  const resultClose = $('promptResultClose');
+  if (resultClose) resultClose.addEventListener('click', clearResult);
   wireAttachComposer();                          // CONTRACT-v2 §10: picker, drop and paste
   const kr = $('keysRow');
   if (kr) kr.addEventListener('click', function (e) {

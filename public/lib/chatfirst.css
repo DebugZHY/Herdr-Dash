@@ -480,6 +480,31 @@
 
 #promptResult { margin-top: 8px; }
 
+/* The result line and its dismiss button share one row. The button sits outside
+   #promptResult because copy.js writes that line's textContent directly; keeping it a
+   sibling lets both writers work without rebuilding a second status sink. */
+.result-row { display: flex; align-items: flex-start; gap: 6px; min-width: 0; }
+.result-row #promptResult { flex: 1 1 auto; min-width: 0; margin-top: 8px; overflow-wrap: anywhere; }
+.result-close {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-top: 9px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg-dim);
+  font: 13px/1 var(--mono);
+  cursor: pointer;
+}
+.result-close:hover { background: var(--bg-panel2); border-color: var(--line); color: var(--fg); }
+.result-close:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+#promptResult.hidden + #promptResultClose { display: none; }
+
 /* rounded result line inside the card */
 .result { border-radius: 8px; }
 
