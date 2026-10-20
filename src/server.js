@@ -939,57 +939,93 @@ async function refreshHermesModelCatalogue(cfg, now, providerNames) {
   // silently drop every provider but the first.
   const byPair = new Map();
   const lists = await Promise.all(cfg.providers.map((p) => fetchProviderModels(p)));
+  const fellBack = [];
   for (let i = 0; i < cfg.providers.length; i++) {
-    for (const id of lists[i]) {
-      const key = cfg.providers[i].name + '\u0000' + id;
-      if (!byPair.has(key)) byPair.set(key, { model: id, provider: cfg.providers[i].name, providers: [cfg.providers[i].name] });
+    const prov = cfg.providers[i];
+    let ids = Array.isArray(lists[i]) ? lists[i] : [];
+    /* A provider whose live list cannot be read still knows the model names it was
+       configured with. Show those instead of dropping the provider entirely. */
+    if (!ids.length && Array.isArray(prov.declaredModels) && prov.declaredModels.length) {
+      ids = prov.declaredModels;
+      fellBack.push(prov.name);
+    }
+    for (const id of ids) {
+      const key = prov.name + '\u0000' + id;
+      if (!byPair.has(key)) byPair.set(key, { model: id, provider: prov.name, providers: [prov.name] });
     }
   }
   const models = Array.from(byPair.values())
     .sort((a, b) => (a.model < b.model ? -1 : a.model > b.model ? 1 : a.provider < b.provider ? -1 : a.provider > b.provider ? 1 : 0))
     .map((m, i) => ({ n: i + 1, model: m.model, provider: m.provider, providers: m.providers }));
+  const notes = [];
+  if (fellBack.length) notes.push('live /v1/models was unavailable for: ' + fellBack.join(', ') + '; those providers list their configured models');
+  if (!models.length) notes.push('none of the configured providers listed a model');
   const value = {
     models,
     providers: providerNames,
     providerNames,
     source: cfg.source,
-    note: models.length ? '' : 'none of the configured providers listed a model',
+    note: notes.length ? notes.join('; ') : '',
   };
-  if (models.length || providerNames.length) {
+  /* Never replace a usable catalogue with an empty one: a provider outage would
+     otherwise blank the switch list until the next successful refresh. */
+  if (models.length) {
     hermesModelCache = { at: now, models, value };
     saveHermesModelStore(now, value);
+  } else if (!hermesModelCache.value) {
+    hermesModelCache = { at: now, models, value };
   }
   return value;
 }
 
-/* the flat, de-duplicated model list every hermes pane can switch to, each entry
-   remembering which providers offer it. The three polyu gateways share one host,
-   so a shared model name resolves to the same endpoint regardless of which of
-   them hermes picks — the model NAME is all `/model` needs. */
+/* A cached catalogue may name providers the current config no longer lists
+   (Hermes rewrites custom_providers); drop those rows rather than offering a
+   switch target that no longer exists. */
+function catalogueForProviders(value, providerNames) {
+  if (!value || !Array.isArray(value.models)) return value;
+  const models = value.models.filter((m) => !m.provider || providerNames.indexOf(m.provider) >= 0);
+  return Object.assign({}, value, { models, providers: providerNames, providerNames });
+}
+
 async function hermesModelCatalogue() {
   const cfg = await chatHermes.configProviders({ home: HERMES_HOME });
   const now = Date.now();
   const providerNames = cfg.providers.map((p) => p.name);
   if (!cfg.providers.length) {
+    /* An unreadable or empty config must not hide a catalogue already on disk;
+       report why the config looked empty and still return what we have. */
+    if (hermesModelCache.value) {
+      return Object.assign({}, catalogueForProviders(hermesModelCache.value, providerNames), {
+        providers: [], providerNames: [], source: cfg.source, note: cfg.note,
+      });
+    }
     return {
       models: [], providers: [], providerNames: [],
       source: cfg.source, note: cfg.note,
     };
   }
   if (hermesModelCache.value && (now - hermesModelCache.at) < HERMES_MODEL_CACHE_MS) {
-    return Object.assign({}, hermesModelCache.value, { providers: providerNames, providerNames, source: cfg.source });
+    const filtered = catalogueForProviders(hermesModelCache.value, providerNames);
+    if (filtered.models.length || !hermesModelCache.value.models.length) {
+      return Object.assign({}, filtered, { source: cfg.source });
+    }
+    /* Every cached row belongs to a provider this config no longer lists: fall
+       through and rebuild from the current config. */
   }
   /* A stale catalogue is still useful: answer from it immediately and refresh in
      the background. Only a cold process waits for the provider round-trip. */
   if (hermesModelCache.value) {
-    if (!hermesModelRefresh) {
-      hermesModelRefresh = refreshHermesModelCatalogue(cfg, now, providerNames)
-        .catch(() => null)
-        .finally(() => { hermesModelRefresh = null; });
+    const filtered = catalogueForProviders(hermesModelCache.value, providerNames);
+    if (filtered.models.length) {
+      if (!hermesModelRefresh) {
+        hermesModelRefresh = refreshHermesModelCatalogue(cfg, now, providerNames)
+          .catch(() => null)
+          .finally(() => { hermesModelRefresh = null; });
+      }
+      return Object.assign({}, filtered, {
+        source: cfg.source, stale: true, refreshing: true,
+      });
     }
-    return Object.assign({}, hermesModelCache.value, {
-      providers: providerNames, providerNames, source: cfg.source, stale: true, refreshing: true,
-    });
   }
   if (!hermesModelRefresh) {
     hermesModelRefresh = refreshHermesModelCatalogue(cfg, now, providerNames)

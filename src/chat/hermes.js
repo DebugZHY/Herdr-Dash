@@ -654,18 +654,49 @@ async function configProviders(opts) {
   const out = [];
   let inBlock = false;
   let cur = null;
+  let modelsIndent = -1;
+
+  // One `key: value` scalar at any indentation, with the quotes YAML allows.
+  function scalar(line, key) {
+    const m = new RegExp('^\\s+' + key + ':\\s*(.*?)\\s*$').exec(line);
+    if (!m) return null;
+    let v = m[1];
+    if (v === '' || v === '~' || v === 'null') return '';
+    if ((v[0] === '"' && v[v.length - 1] === '"') || (v[0] === "'" && v[v.length - 1] === "'")) v = v.slice(1, -1);
+    return v;
+  }
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (!inBlock) {
-      if (/^custom_providers:\s*$/.test(line)) inBlock = true;
+      if (/^custom_providers:\s*(?:#.*)?$/.test(line)) inBlock = true;
       continue;
     }
-    if (/^\S/.test(line)) break;                       // back at column 0: the block ended
-    let m = /^\s*-\s+name:\s*(\S+)\s*$/.exec(line);
-    if (m) { cur = { name: m[1], baseUrl: null, apiKey: null }; out.push(cur); continue; }
+    /* A new provider entry. Hermes writes the list at column 0 (`- name:`); an
+       indented form (`  - name:`) is accepted too, so both YAML styles parse. */
+    let m = /^\s*-\s+name:\s*(.+?)\s*$/.exec(line);
+    if (m) {
+      cur = { name: m[1].replace(/^["']|["']$/g, ''), baseUrl: null, apiKey: null, keyEnv: null, declaredModels: [] };
+      out.push(cur);
+      modelsIndent = -1;
+      continue;
+    }
+    /* Back at column 0 and not a list item: the custom_providers block ended. */
+    if (/^\S/.test(line)) break;
     if (!cur) continue;
-    if ((m = /^\s+base_url:\s*(\S+)/.exec(line))) cur.baseUrl = m[1];
-    else if ((m = /^\s+api_key:\s*(\S+)/.exec(line))) cur.apiKey = m[1];
+    if (scalar(line, 'base_url') !== null) { cur.baseUrl = scalar(line, 'base_url'); modelsIndent = -1; continue; }
+    if (scalar(line, 'api_key') !== null) { cur.apiKey = scalar(line, 'api_key'); modelsIndent = -1; continue; }
+    if (scalar(line, 'key_env') !== null) { cur.keyEnv = scalar(line, 'key_env'); modelsIndent = -1; continue; }
+    const mm = /^(\s*)models:\s*(?:#.*)?$/.exec(line);
+    if (mm) { modelsIndent = mm[1].length; continue; }
+    /* Model ids are the keys one level under `models:`; their own attributes sit
+       one level deeper and must not be read as model names. */
+    if (modelsIndent >= 0) {
+      const indent = /^(\s*)/.exec(line)[1].length;
+      const key = /^\s*([A-Za-z0-9._:\/-]+):\s*(?:#.*)?$/.exec(line);
+      if (indent === modelsIndent + 2 && key) { cur.declaredModels.push(key[1]); continue; }
+      if (indent <= modelsIndent && /^\s/.test(line)) { modelsIndent = -1; }
+    }
   }
   const providers = out.filter((p) => p.name && p.baseUrl);
   return {
