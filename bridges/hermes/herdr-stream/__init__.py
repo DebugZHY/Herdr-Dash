@@ -11,6 +11,10 @@ Safety:
   streaming path on a non-Herdr run.
 - Reasoning deltas need ``plugins.stream_reasoning_deltas: true`` in Hermes
   config; without it Hermes never emits ``kind="reasoning"``.
+- The pending-input observer (``queue_state.py``) is one extra daemon thread. It
+  is started only when the host context exposes ``_manager`` -- that is how the
+  real Hermes CLI context looks, and it keeps a test host that never has a CLI
+  from growing a polling thread.
 """
 
 from __future__ import annotations
@@ -23,6 +27,28 @@ import sys
 logger = logging.getLogger(__name__)
 
 _bridge = None
+_observer = None
+
+
+def _load_sibling(module_name, filename):
+    """Load a ``.py`` next to this one, relative first and file-based second."""
+    try:
+        module = importlib.import_module("." + module_name, __package__)
+        if module is not None:
+            return module
+    except Exception:
+        pass
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    existing = sys.modules.get(module_name + "_impl")
+    if existing is not None and getattr(existing, "__file__", None) == path:
+        return existing
+    spec = importlib.util.spec_from_file_location(module_name + "_impl", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {module_name} from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name + "_impl"] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _load_impl():
@@ -53,6 +79,11 @@ def _load_impl():
 
 
 _impl = _load_impl()
+try:
+    _queue_state = _load_sibling("queue_state", "queue_state.py")
+except Exception:  # a partial install must not stop the token stream
+    logger.debug("herdr-stream: queue_state.py unavailable", exc_info=True)
+    _queue_state = None
 
 
 # ---------------------------------------------------------------------------
@@ -136,13 +167,57 @@ _HOOKS = (
 )
 
 
+def _cli_ref_of(ctx):
+    """The live CLI reference, or None.
+
+    ``_cli_ref`` is filled in after the CLI starts, which is normally *after*
+    ``register`` runs, so it is read through the manager on every poll instead of
+    being captured once.
+    """
+    manager = getattr(ctx, "_manager", None)
+    if manager is None:
+        return None
+    return getattr(manager, "_cli_ref", None)
+
+
+def _start_observer(ctx, bridge):
+    """Start the pending-input observer, or None when this host has no CLI manager."""
+    if _queue_state is None or getattr(ctx, "_manager", None) is None:
+        return None
+
+    def emit(snapshot, reason):
+        bridge.handle_queue_snapshot(snapshot, reason=reason)
+
+    try:
+        return _queue_state.QueueObserver(lambda: _cli_ref_of(ctx), emit).start()
+    except Exception:
+        logger.debug("herdr-stream: queue observer did not start", exc_info=True)
+        return None
+
+
+def _stop_observer():
+    """Stop the observer this module started, if any (idempotent)."""
+    global _observer
+    observer = _observer
+    _observer = None
+    if observer is not None:
+        try:
+            observer.stop()
+        except Exception:
+            pass
+
+
 def register(ctx):
     """Hermes plugin entrypoint: observe this pane's stream when under Herdr."""
-    global _bridge
+    global _bridge, _observer
     bridge = _impl.HermesStreamBridge.from_env()
     if bridge is None:
         # Strict no-op outside Herdr (or without a pane): register nothing.
         return
+    # A re-registration replaces both halves: the old observer must stop before
+    # the bridge it writes through is shut down, or its last poll could submit
+    # into a closed writer.
+    _stop_observer()
     previous = _bridge
     if previous is not None:
         try:
@@ -155,3 +230,4 @@ def register(ctx):
             ctx.register_hook(hook_name, callback)
         except Exception:
             logger.debug("herdr-stream: failed to register %s", hook_name, exc_info=True)
+    _observer = _start_observer(ctx, bridge)

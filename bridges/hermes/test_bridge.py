@@ -13,8 +13,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import queue as queue_module
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -22,6 +24,7 @@ from unittest import mock
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN_DIR = os.path.join(HERE, "herdr-stream")
 IMPL_PATH = os.path.join(PLUGIN_DIR, "herdr_stream.py")
+QUEUE_STATE_PATH = os.path.join(PLUGIN_DIR, "queue_state.py")
 INIT_PATH = os.path.join(PLUGIN_DIR, "__init__.py")
 PLUGIN_YAML = os.path.join(PLUGIN_DIR, "plugin.yaml")
 
@@ -39,6 +42,7 @@ def _load_module(name, path, *, package_dir=None):
 
 
 impl = _load_module("herdr_stream_under_test", IMPL_PATH)
+queue_state = _load_module("queue_state_under_test", QUEUE_STATE_PATH)
 plugin = _load_module("herdr_stream_plugin_under_test", INIT_PATH, package_dir=PLUGIN_DIR)
 
 PANE = "wD:p2"
@@ -52,6 +56,47 @@ class FakeCtx:
 
     def register_hook(self, name, callback):
         self.hooks.append((name, callback))
+
+
+class FakeManager:
+    """What ``ctx._manager`` looks like to the plugin: a late-bound CLI reference."""
+
+    def __init__(self, cli=None):
+        self._cli_ref = cli
+
+
+class ManagedCtx(FakeCtx):
+    def __init__(self, cli=None):
+        super().__init__()
+        self._manager = FakeManager(cli)
+
+
+class FakeAgent:
+    """``cli.agent``: one newline-joined steer string behind its own lock."""
+
+    def __init__(self, steer=""):
+        self._pending_steer = steer
+        self._pending_steer_lock = threading.Lock()
+
+
+class FakeCli:
+    """The three pending queues and nothing else: no Hermes runtime is loaded."""
+
+    def __init__(self, session_id="sess-1", steer=""):
+        self.session_id = session_id
+        self._pending_input = queue_module.Queue()
+        self._interrupt_queue = queue_module.Queue()
+        self.agent = FakeAgent(steer)
+
+
+def wait_for(predicate, timeout=3.0, interval=0.01):
+    """Poll ``predicate`` until it is true (the observer owns its own thread)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
 
 
 class BridgeTest(unittest.TestCase):
@@ -430,6 +475,111 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(events[0]["turn_id"], "control")
         self.assertEqual(events[0]["model"], "gpt-x")
 
+    # -- pending-input queue envelopes -------------------------------------
+
+    def test_queue_snapshot_goes_to_control_file_with_the_exact_shape(self):
+        self.bridge.handle_queue_snapshot(
+            {
+                "session_id": SESSION,
+                "steering": [{"id": "hq-a", "kind": "steer", "text": "go left", "at": None}],
+                "followUp": [
+                    {"id": "hq-b", "kind": "followup", "text": "then down", "at": None, "source": "queue"},
+                    {"id": "hq-c", "kind": "followup", "text": "and stop", "at": 1700000000000, "source": "interrupt"},
+                ],
+                "updated_at": 1700000000123,
+                "reason": "change",
+            }
+        )
+        events = self.read_events(turn="control")
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assert_envelope(event, "queue")
+        self.assertEqual(event["turn_id"], "control")
+        self.assertEqual(event["session_id"], SESSION)
+        self.assertEqual(event["updated_at"], 1700000000123)
+        self.assertEqual(event["reason"], "change")
+        # The tray's own shape, no extra fields beyond the documented ones.
+        self.assertEqual(event["steering"], [{"id": "hq-a", "kind": "steer", "text": "go left", "at": None}])
+        self.assertEqual([row["id"] for row in event["followUp"]], ["hq-b", "hq-c"])
+        self.assertEqual([row["kind"] for row in event["followUp"]], ["followup", "followup"])
+        self.assertEqual([row["source"] for row in event["followUp"]], ["queue", "interrupt"])
+        self.assertEqual(event["followUp"][1]["at"], 1700000000000)
+        # A queue event never opens or joins a turn file, and never names the turn.
+        self.assertEqual(
+            sorted(os.listdir(self.pane_dir())),
+            [f"{impl.safe(SESSION)}__control.ndjson"],
+        )
+
+    def test_queue_snapshot_empty_still_emits_so_the_tray_clears(self):
+        self.bridge.handle_queue_snapshot(
+            {"session_id": SESSION, "steering": [], "followUp": [], "reason": "first", "updated_at": 1}
+        )
+        self.bridge.handle_queue_snapshot({"session_id": SESSION, "steering": [], "followUp": [], "reason": "change"})
+        events = self.read_events(turn="control")
+        self.assertEqual([event["type"] for event in events], ["queue", "queue"])
+        self.assertEqual([event["reason"] for event in events], ["first", "change"])
+        for event in events:
+            self.assertEqual(event["steering"], [])
+            self.assertEqual(event["followUp"], [])
+        self.assertIsInstance(events[1]["updated_at"], int)
+        self.assertGreater(events[1]["updated_at"], 1_600_000_000_000)
+
+    def test_queue_snapshot_bounds_rows_text_and_total_payload(self):
+        huge = "x" * 20_000
+        payload = {
+            "session_id": SESSION,
+            "steering": [{"text": huge}],
+            "followUp": [{"text": huge, "kind": "followup"} for _ in range(150)],
+        }
+        self.bridge.handle_queue_snapshot(payload)
+        events = self.read_events(turn="control")
+        self.assertEqual(len(events), 1, "an oversized queue must still be delivered, not dropped")
+        event = events[0]
+        self.assertLessEqual(len(event["followUp"]), impl.QUEUE_MAX_ROWS)
+        self.assertLessEqual(len(event["steering"]), impl.QUEUE_MAX_ROWS)
+        for row in event["steering"] + event["followUp"]:
+            self.assertLessEqual(len(row["text"]), impl.QUEUE_MAX_TEXT_CHARS)
+        # The writer drops any line over 64 KiB and cannot shrink a list, so the
+        # bridge has to keep the whole envelope well under that.
+        self.assertLess(len(json.dumps(event).encode("utf-8")), impl.MAX_LINE_BYTES)
+        # An id is invented for a row that arrived without one, and it is opaque.
+        self.assertTrue(event["steering"][0]["id"].startswith("hq-"))
+        self.assertEqual(len(event["steering"][0]["id"]), 19)
+
+    def test_queue_snapshot_tolerates_malformed_rows_and_payloads(self):
+        # No payload, no session, and lists of the wrong type: still one envelope
+        # each (under the "unknown" session), still no exception.
+        for payload in (
+            None,
+            {},
+            {"steering": "not-a-list", "followUp": {"nope": 1}},
+        ):
+            with self.subTest(payload=payload):
+                self.bridge.handle_queue_snapshot(payload)
+        unknown = self.read_events(session="unknown", turn="control")
+        self.assertEqual([event["type"] for event in unknown], ["queue"] * 3)
+        for event in unknown:
+            self.assertEqual(event["steering"], [])
+            self.assertEqual(event["followUp"], [])
+
+        # A known session: rows are validated, not trusted.
+        self.bridge.handle_queue_snapshot(
+            {"session_id": SESSION, "steering": [42, None, "text", {"text": 5}], "followUp": [["a", "b"]]}
+        )
+        self.bridge.handle_queue_snapshot(
+            {"session_id": SESSION, "steering": [{"kind": "unknown-kind", "text": "  two\n lines  "}],
+             "reason": 5}
+        )
+        events = self.read_events(turn="control")
+        self.assertEqual([event["type"] for event in events], ["queue", "queue"])
+        # Only the mapping survives; a non-mapping row is dropped rather than drawn blank.
+        self.assertEqual([row["text"] for row in events[0]["steering"]], ["5"])
+        self.assertEqual(events[0]["followUp"], [])
+        # An unknown kind falls back to the list's own kind; reason is text, never dropped.
+        self.assertEqual(events[1]["steering"][0]["kind"], "steer")
+        self.assertEqual(events[1]["steering"][0]["text"], "two lines")
+        self.assertEqual(events[1]["reason"], "5")
+
     # -- disabled / no-op --------------------------------------------------
 
     def test_no_pane_is_a_strict_noop(self):
@@ -659,6 +809,264 @@ class BridgeTest(unittest.TestCase):
             writer.flush(5.0)
         finally:
             writer.shutdown()
+
+
+class QueueStateTest(unittest.TestCase):
+    """The read-only snapshot: what is pending, and nothing is ever removed."""
+
+    def test_snapshot_extracts_pending_input_interrupt_queue_and_pending_steer(self):
+        cli = FakeCli(session_id="sess-9", steer="hold the elevator")
+        cli._pending_input.put("first follow-up")
+        cli._pending_input.put(("second, with an image", ["plan.png"]))
+        cli._interrupt_queue.put({"display_text": "third, interrupts"})
+
+        snap = queue_state.snapshot(cli)
+
+        self.assertEqual(snap["session_id"], "sess-9")
+        self.assertEqual([row["kind"] for row in snap["steering"]], ["steer"])
+        self.assertEqual(snap["steering"][0]["text"], "hold the elevator")
+        self.assertIsNone(snap["steering"][0]["at"])
+
+        self.assertEqual(
+            [row["text"] for row in snap["followUp"]],
+            ["first follow-up", "second, with an image", "third, interrupts"],
+        )
+        self.assertEqual([row["kind"] for row in snap["followUp"]], ["followup"] * 3)
+        self.assertEqual([row["source"] for row in snap["followUp"]], ["queue", "queue", "interrupt"])
+        self.assertEqual([row["at"] for row in snap["followUp"]], [None, None, None])
+
+        ids = [row["id"] for row in snap["followUp"]]
+        self.assertEqual(len(set(ids)), 3)
+        for row_id in ids + [snap["steering"][0]["id"]]:
+            self.assertTrue(row_id.startswith("hq-"), row_id)
+            self.assertEqual(len(row_id), 19)
+
+        # An observer must not consume what the agent is about to run.
+        self.assertEqual(cli._pending_input.qsize(), 2)
+        self.assertEqual(cli._interrupt_queue.qsize(), 1)
+        self.assertEqual(cli.agent._pending_steer, "hold the elevator")
+
+        # Deterministic: the same queue produces the same ids for the tray.
+        self.assertEqual(queue_state.snapshot(cli), snap)
+
+    def test_snapshot_reads_objects_with_text_and_a_latebound_lock(self):
+        class Item:
+            def __init__(self, text):
+                self.text = text
+
+        class Agent:
+            _pending_steer = "steer through the attribute"
+
+        cli = type("Cli", (), {"agent": Agent(), "_pending_input": [Item("from text"), "plain"],
+                               "_interrupt_queue": None, "session": {"id": "nested-session"}})()
+        snap = queue_state.snapshot(cli)
+        self.assertEqual([row["text"] for row in snap["followUp"]], ["from text", "plain"])
+        self.assertEqual([row["source"] for row in snap["followUp"]], ["queue", "queue"])
+        self.assertEqual(snap["steering"][0]["text"], "steer through the attribute")
+        self.assertEqual(snap["session_id"], "nested-session")
+
+    def test_snapshot_never_raises_on_missing_fields_broken_locks_or_objects(self):
+        class Explodes:
+            def __getattr__(self, name):
+                raise RuntimeError("no attribute " + name)
+
+        class BrokenLock:
+            def __enter__(self):
+                raise RuntimeError("lock is unusable")
+
+            def __exit__(self, *exc_info):
+                return False
+
+        class Agent:
+            _pending_steer = "still readable"
+
+        agent = Agent()
+        agent._pending_steer_lock = BrokenLock()
+        cli = type("Cli", (), {"agent": agent, "_pending_input": Explodes()})()
+
+        self.assertEqual(
+            queue_state.snapshot(None),
+            {"steering": [], "followUp": [], "session_id": ""},
+        )
+        empty = queue_state.snapshot(object())
+        self.assertEqual(empty["followUp"], [])
+        self.assertEqual(empty["steering"], [])
+
+        broken = queue_state.snapshot(Explodes())
+        self.assertEqual(broken, {"steering": [], "followUp": [], "session_id": ""})
+
+        snap = queue_state.snapshot(cli)
+        # The queue explodes -> no rows; the steer value is still readable past its lock.
+        self.assertEqual(snap["followUp"], [])
+        self.assertEqual(snap["steering"][0]["text"], "still readable")
+
+    def test_snapshot_bounds_rows_and_text(self):
+        cli = FakeCli()
+        for index in range(150):
+            cli._pending_input.put("item-%d" % index)
+        cli._interrupt_queue.put("one too many")
+        cli.agent._pending_steer = "s" * 10_000
+
+        snap = queue_state.snapshot(cli)
+
+        self.assertEqual(len(snap["followUp"]), queue_state.MAX_ROWS)
+        self.assertEqual(snap["followUp"][0]["text"], "item-0")
+        self.assertEqual(snap["followUp"][-1]["text"], "item-99")
+        self.assertEqual(len(snap["steering"][0]["text"]), queue_state.MAX_TEXT_CHARS)
+        # Bounding the snapshot did not touch the CLI's own queues.
+        self.assertEqual(cli._pending_input.qsize(), 150)
+
+    def test_row_ids_are_opaque_stable_and_distinct(self):
+        first = queue_state.row_id("followup", "same words", 0)
+        self.assertEqual(first, queue_state.row_id("followup", "same words", 0))
+        self.assertNotEqual(first, queue_state.row_id("followup", "same words", 1))
+        self.assertNotEqual(first, queue_state.row_id("followup", "other words", 0))
+        self.assertNotEqual(first, queue_state.row_id("steer", "same words", 0))
+        self.assertNotIn("same", first)
+        self.assertTrue(first.startswith("hq-"))
+
+
+class QueueObserverTest(unittest.TestCase):
+    """The 750 ms poll: one thread, one emit per visible change, stoppable."""
+
+    def test_emits_once_when_the_cli_appears_then_only_on_change_and_stops(self):
+        cli = FakeCli(steer="")
+        holder = {"cli": None}
+        seen = []
+        observer = queue_state.QueueObserver(
+            lambda: holder["cli"], lambda snap, reason: seen.append((reason, snap)), interval=0.02
+        )
+        observer.start()
+        try:
+            self.assertTrue(observer.thread_alive)
+            time.sleep(0.1)
+            self.assertEqual(seen, [], "no CLI yet: nothing may be written")
+
+            holder["cli"] = cli
+            self.assertTrue(wait_for(lambda: len(seen) == 1), "the first snapshot must be emitted")
+            self.assertEqual(seen[0][0], "first")
+            self.assertEqual(seen[0][1]["followUp"], [])
+
+            time.sleep(0.15)
+            self.assertEqual(len(seen), 1, "an unchanged queue must not re-emit")
+
+            cli._pending_input.put("next step")
+            self.assertTrue(wait_for(lambda: len(seen) == 2))
+            self.assertEqual(seen[1][0], "change")
+            self.assertEqual([row["text"] for row in seen[1][1]["followUp"]], ["next step"])
+
+            cli._pending_input.get()  # the agent takes it (test-only drain)
+            self.assertTrue(wait_for(lambda: len(seen) == 3), "the cleared queue must be emitted")
+            self.assertEqual(seen[2][1]["followUp"], [])
+        finally:
+            observer.stop()
+
+        self.assertFalse(observer.thread_alive)
+        self.assertEqual(observer.emitted, 3)
+        cli._pending_input.put("after stop")
+        time.sleep(0.1)
+        self.assertEqual(len(seen), 3, "a stopped observer must not keep polling")
+
+    def test_no_emit_without_a_cli_and_a_broken_emit_does_not_kill_the_thread(self):
+        holder = {"cli": None}
+        calls = []
+
+        def emit(snap, reason):
+            calls.append(reason)
+            if len(calls) == 1:
+                raise RuntimeError("sink is down")
+
+        observer = queue_state.QueueObserver(lambda: holder["cli"], emit, interval=0.02)
+        observer.start()
+        try:
+            time.sleep(0.1)
+            self.assertEqual(calls, [])
+            self.assertIsNone(observer.last_error)
+
+            holder["cli"] = FakeCli()
+            self.assertTrue(wait_for(lambda: len(calls) == 1))
+            self.assertTrue(observer.thread_alive, "a failing sink must not stop the poll")
+            self.assertIn("sink is down", observer.last_error or "")
+
+            holder["cli"] = FakeCli(steer="a real change")
+            self.assertTrue(wait_for(lambda: len(calls) == 2))
+            self.assertEqual(calls[1], "change")
+        finally:
+            observer.stop()
+
+    def test_a_raising_cli_reference_is_treated_as_no_cli(self):
+        def get_cli():
+            raise RuntimeError("manager went away")
+
+        observer = queue_state.QueueObserver(get_cli, lambda snap, reason: None, interval=0.02)
+        self.assertFalse(observer.poll_once())
+        self.assertIn("manager went away", observer.last_error or "")
+
+
+class PluginObserverWiringTest(unittest.TestCase):
+    """``register`` starts exactly one observer, and only where a CLI manager exists."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="herdr-stream-observer-test-")
+        self.env = mock.patch.dict(
+            os.environ,
+            {"HERDR_ENV": "1", "HERDR_PANE_ID": PANE, "HD_STREAM_DIR": self.tmp},
+            clear=False,
+        )
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        try:
+            plugin._stop_observer()
+        except Exception:
+            pass
+        if plugin._bridge is not None:
+            try:
+                plugin._bridge.shutdown()
+            finally:
+                plugin._bridge = None
+        for root, dirs, files in os.walk(self.tmp, topdown=False):
+            for name in files:
+                try:
+                    os.unlink(os.path.join(root, name))
+                except OSError:
+                    pass
+            for name in dirs:
+                try:
+                    os.rmdir(os.path.join(root, name))
+                except OSError:
+                    pass
+        try:
+            os.rmdir(self.tmp)
+        except OSError:
+            pass
+
+    def test_no_manager_means_no_thread(self):
+        ctx = FakeCtx()
+        plugin.register(ctx)
+        self.assertIsNone(plugin._observer)
+        self.assertEqual(len(ctx.hooks), 8)
+
+    def test_one_observer_per_register_and_the_previous_one_stops(self):
+        ctx = ManagedCtx()  # _cli_ref is None until the CLI starts
+        plugin.register(ctx)
+        first = plugin._observer
+        self.assertIsNotNone(first)
+        self.assertTrue(first.thread_alive)
+
+        plugin.register(ctx)
+        second = plugin._observer
+        self.assertIsNotNone(second)
+        self.assertIsNot(second, first)
+        self.assertFalse(first.thread_alive, "the replaced observer must be stopped")
+
+        # The observer reads _cli_ref live, so a CLI that appears later is seen.
+        ctx._manager._cli_ref = FakeCli(steer="started late")
+        self.assertTrue(wait_for(lambda: second.emitted >= 1), "a late CLI must be picked up")
+        plugin._stop_observer()
+        self.assertFalse(second.thread_alive)
 
 
 if __name__ == "__main__":

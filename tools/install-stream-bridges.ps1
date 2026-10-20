@@ -33,7 +33,17 @@ function Write-Step([string]$text) { Write-Host ''; Write-Host "== $text" }
 
 function Move-Aside([string]$path, [string]$label) {
   if (-not (Test-Path -LiteralPath $path)) { return }
-  $backup = "$path.bak-$stamp"
+  # Keep backups outside the discovery directory: a sibling named
+  # ``herdr-stream.bak-*`` is itself discovered as a plugin/extension and can
+  # shadow or collide with the live one.
+  $backupRoot = Join-Path (Split-Path -Parent (Split-Path -Parent $path)) 'backups'
+  New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
+  $backup = Join-Path $backupRoot ("$(Split-Path -Leaf $path).bak-$stamp")
+  $n = 1
+  while (Test-Path -LiteralPath $backup) {
+    $backup = Join-Path $backupRoot ("$(Split-Path -Leaf $path).bak-$stamp-$n")
+    $n++
+  }
   Move-Item -LiteralPath $path -Destination $backup
   Write-Host "backup $label -> $backup"
 }
@@ -43,7 +53,9 @@ function Get-TreeHash([string]$path) {
   if (-not (Test-Path -LiteralPath $path)) { return '' }
   $sha = [System.Security.Cryptography.SHA256]::Create()
   $sb = New-Object System.Text.StringBuilder
-  $files = Get-ChildItem -LiteralPath $path -Recurse -File | Sort-Object FullName
+  $files = Get-ChildItem -LiteralPath $path -Recurse -File |
+    Where-Object { $_.FullName -notmatch '\\__pycache__\\' -and $_.Extension -ne '.pyc' } |
+    Sort-Object FullName
   foreach ($f in $files) {
     $rel = $f.FullName.Substring($path.Length).TrimStart('\', '/')
     [void]$sb.Append($rel).Append(':')

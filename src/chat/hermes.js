@@ -63,6 +63,9 @@ const {
   LIMITS, clampText, isBlankValue, toMs, message, planUnits, applyPlan, planBucket, absorbPairedResults,
   mergeCounts, mergeDelta, addUnits, emittedUnits, markPendingReasons,
 } = require('./common');
+/* The control-file locator lives with the pi bridge reader: one implementation of
+   "the newest `<session>__control.ndjson` for this pane", used by both agents. */
+const chatPi = require('./pi');
 
 const SOURCE_KIND = 'hermes_sqlite';
 const ROW_BATCH = 200;                 // rows fetched per query, never per unit
@@ -828,6 +831,106 @@ function clearEcho(paneId) {
   paneEcho.delete(String(paneId == null ? '' : paneId));
 }
 
+/* ------------------------------------------------------------------ */
+/* queue state from the bridge control file                            */
+/* ------------------------------------------------------------------ */
+
+const QUEUE_TAIL_BYTES = 1024 * 1024;          // at most the last 1 MiB of a control file
+const QUEUE_NOTE_MISSING = 'no queue record for this pane yet';
+const QUEUE_NOTE_MALFORMED = 'the queue record for this pane is malformed';
+const QUEUE_NOTE_UNREADABLE = 'the queue record for this pane is unreadable';
+const QUEUE_NOTE_UNREADABLE_NOTE = 'the queue record for this pane could not be read';
+
+/**
+ * hermes' own queue, as the bridge last published it.
+ *
+ * The bridge appends one `type:"queue"` envelope to the pane's newest control file
+ * whenever the snapshot changes (and an empty one to clear the tray), next to the
+ * settings lines that file already carries. The LAST valid envelope for this pane
+ * wins; everything else in the file — settings lines, pi lines, other panes, a
+ * half-written tail — is skipped. Only the tail of the file is read.
+ *
+ * `found:false` means "no bridge record to show", which is the caller's cue to fall
+ * back; an empty queue that the bridge did publish is `found:true` with empty arrays,
+ * because those are different facts.
+ *
+ * @param {string} paneId
+ * @param {{streamRoot?: string}} [opts]
+ * @returns {Promise<{steering: Array<object>, followUp: Array<object>,
+ *                    updated_at: number|null, found: boolean, note: string, file: string}>}
+ */
+async function readQueueState(paneId, opts) {
+  const empty = (note, file) => ({
+    steering: [], followUp: [], updated_at: null, found: false,
+    note: note || '', file: file || '',
+  });
+  try {
+    const rawPane = String(paneId === undefined || paneId === null ? '' : paneId);
+    if (!rawPane) return empty(QUEUE_NOTE_MISSING);
+    const best = await chatPi.newestControlFile(rawPane, opts);
+    if (!best) return empty(QUEUE_NOTE_MISSING);
+
+    let text = '';
+    let fh;
+    try {
+      fh = await fsp.open(best.file, 'r');
+    } catch (e) {
+      return empty(QUEUE_NOTE_UNREADABLE, best.file);
+    }
+    try {
+      const size = (await fh.stat()).size || 0;
+      if (!size) return empty(QUEUE_NOTE_MISSING, best.file);
+      const start = Math.max(0, size - QUEUE_TAIL_BYTES);
+      const want = size - start;
+      const buf = Buffer.alloc(want);
+      const { bytesRead } = await fh.read(buf, 0, want, start);
+      text = buf.subarray(0, bytesRead).toString('utf8');
+      if (start > 0) {
+        // The first line of a tail read is probably cut; it is not a record.
+        const nl = text.indexOf('\n');
+        text = nl < 0 ? '' : text.slice(nl + 1);
+      }
+    } finally {
+      await fh.close().catch(() => {});
+    }
+
+    const lines = String(text).split(/\r?\n/);
+    let sawMalformed = false;
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      const line = lines[i];
+      if (!line || !line.trim()) continue;
+      let env;
+      try {
+        env = JSON.parse(line);
+      } catch (e) {
+        if (line.includes('"queue"')) sawMalformed = true;
+        continue;
+      }
+      if (!env || typeof env !== 'object' || Array.isArray(env)) continue;
+      if (env.type !== 'queue') continue;
+      // A control file is per session and the root is shared: the envelope must name
+      // this pane and this agent before its rows are believed.
+      if (env.agent !== 'hermes') continue;
+      if (env.pane_id !== rawPane) continue;
+      const steering = chatPi.normalizeQueueItems(env.steering);
+      const followUp = chatPi.normalizeQueueItems(env.followUp);
+      if (!steering || !followUp) return empty(QUEUE_NOTE_MALFORMED, best.file);
+      return {
+        steering,
+        followUp,
+        updated_at: Number.isFinite(env.updated_at) ? env.updated_at : null,
+        found: true,
+        note: '',
+        file: best.file,
+      };
+    }
+    if (sawMalformed) return empty(QUEUE_NOTE_MALFORMED, best.file);
+    return empty(QUEUE_NOTE_MISSING, best.file);
+  } catch (e) {
+    return empty(QUEUE_NOTE_UNREADABLE_NOTE);
+  }
+}
+
 module.exports = {
   SOURCE_KIND, dbPath, readOnlyUri, openReadOnly, parseToolCalls, parseRow, readWindow, readTail,
   recentSessions, listSessions, sessionKnown, sessionSettings,
@@ -836,4 +939,7 @@ module.exports = {
   HERMES_STEER_COMMAND, HERMES_FOLLOWUP_COMMAND, HERMES_ECHO_NOTE, ECHO_ITEMS_MAX,
   steerCommand, followupCommand, echoItemId, planHermesQueuePrompt,
   rememberEcho, echoRows, clearEcho,
+  /* the bridge's queue record (found:false means "fall back to the echo rows") */
+  QUEUE_TAIL_BYTES, QUEUE_NOTE_MISSING, QUEUE_NOTE_MALFORMED, QUEUE_NOTE_UNREADABLE,
+  readQueueState,
 };

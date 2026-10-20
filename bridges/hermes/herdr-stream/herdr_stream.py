@@ -14,6 +14,7 @@ Design:
 from __future__ import annotations
 
 import collections
+import hashlib
 import json
 import logging
 import os
@@ -39,6 +40,15 @@ MAX_AGE_SECONDS = 2 * 60 * 60
 
 # Bounded turn bookkeeping so a long-lived process cannot grow without bound.
 MAX_TRACKED_TURNS = 512
+
+# A queue envelope is a glance at the tray, so it is bounded harder than a turn
+# event: 100 rows a list, 4096 characters a row, and a total payload budget well
+# under the 64 KiB line cap (a line that big would be dropped by the encoder).
+QUEUE_MAX_ROWS = 100
+QUEUE_MAX_TEXT_CHARS = 4096
+QUEUE_BUDGET_BYTES = 48 * 1024
+QUEUE_KINDS = ("steer", "followup")
+QUEUE_SOURCES = ("queue", "interrupt")
 
 _SAFE_RE = re.compile(r"[^A-Za-z0-9_.-]")
 
@@ -124,6 +134,94 @@ def _int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _epoch_ms(value: Any) -> int:
+    """A payload timestamp in epoch milliseconds, never a crash."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return int(time.time() * 1000)
+    return int(value)
+
+
+def _queue_row_id(kind: str, text: str, index: int) -> str:
+    """The observer's row id for a row that arrived without one.
+
+    Same recipe as ``queue_state.row_id`` (hash of kind+text+position) so an id
+    this bridge invents is the id the observer would have given the same row.
+    """
+    digest = hashlib.sha1(f"{kind}\x00{text}\x00{index}".encode("utf-8", "replace")).hexdigest()
+    return "hq-" + digest[:16]
+
+
+def _queue_rows(value: Any, default_kind: str) -> list:
+    """Validate, normalise and bound one list of queue rows.
+
+    Anything that is not a mapping is dropped rather than rendered as a blank
+    card; a row without a usable id gets the deterministic one for its content,
+    a kind outside the two the tray knows falls back to the list's own kind, and
+    the text is collapsed to one line and capped. Never raises.
+    """
+    rows = []
+    if not isinstance(value, (list, tuple)):
+        return rows
+    for index, raw in enumerate(value):
+        if len(rows) >= QUEUE_MAX_ROWS:
+            break
+        if not isinstance(raw, Mapping):
+            continue
+        kind = raw.get("kind")
+        kind = kind if isinstance(kind, str) and kind in QUEUE_KINDS else default_kind
+        text = raw.get("text")
+        if text is None:
+            text = ""
+        elif not isinstance(text, str):
+            text = str(text)
+        try:
+            text = " ".join(text.split())[:QUEUE_MAX_TEXT_CHARS]
+        except Exception:
+            text = ""
+        row_id = raw.get("id")
+        if not isinstance(row_id, str) or not row_id:
+            row_id = _queue_row_id(kind, text, index)
+        row: Dict[str, Any] = {"id": row_id[:80], "kind": kind, "text": text, "at": None}
+        at = raw.get("at")
+        if isinstance(at, (int, float)) and not isinstance(at, bool):
+            row["at"] = int(at)
+        source = raw.get("source")
+        if isinstance(source, str) and source in QUEUE_SOURCES:
+            row["source"] = source
+        rows.append(row)
+    return rows
+
+
+def _queue_payload_size(steering: list, follow_up: list) -> int:
+    try:
+        blob = json.dumps([steering, follow_up], ensure_ascii=False, default=str)
+    except Exception:
+        return QUEUE_BUDGET_BYTES + 1
+    return len(blob.encode("utf-8"))
+
+
+def _fit_queue_budget(steering: list, follow_up: list) -> tuple:
+    """Keep the whole queue payload inside QUEUE_BUDGET_BYTES.
+
+    The writer caps a line at 64 KiB and only knows how to shrink top-level
+    strings, so an oversized queue would be dropped silently. Here the row texts
+    are halved first (readable truncation beats a lost tray), then the tails of
+    the lists are dropped, oldest first.
+    """
+    cap = QUEUE_MAX_TEXT_CHARS
+    while _queue_payload_size(steering, follow_up) > QUEUE_BUDGET_BYTES and cap > 256:
+        cap = max(256, cap // 2)
+        for rows in (steering, follow_up):
+            for row in rows:
+                row["text"] = row["text"][:cap]
+    while _queue_payload_size(steering, follow_up) > QUEUE_BUDGET_BYTES:
+        longer = steering if len(steering) >= len(follow_up) else follow_up
+        if not longer:
+            break
+        longer.pop()
+    return steering, follow_up
 
 
 def _ordered(env: Mapping[str, Any]) -> Dict[str, Any]:
@@ -619,6 +717,34 @@ class HermesStreamBridge:
                 self._turn_id = ""
         except Exception:
             logger.debug("herdr-stream on_session_reset failed", exc_info=True)
+
+    def handle_queue_snapshot(self, payload: Optional[Mapping[str, Any]] = None, *, reason: Optional[str] = None) -> None:
+        """Emit one ``type="queue"`` envelope to this session's control file.
+
+        The tray is a control-plane view, not part of a turn: the envelope always
+        goes to ``<session>__control.ndjson`` with ``turn_id="control"`` so it
+        keeps working between turns (and while one is open). An empty snapshot is
+        emitted like any other -- that is the message that clears the tray -- so
+        there is no early return here. Never raises.
+        """
+        try:
+            p = dict(payload or {})
+            self._remember(p)
+            session_id = self._session_id_of(p)
+            steering, follow_up = _fit_queue_budget(
+                _queue_rows(p.get("steering"), "steer"),
+                _queue_rows(p.get("followUp"), "followup"),
+            )
+            reason_text = reason if reason is not None else p.get("reason")
+            fields: Dict[str, Any] = {
+                "steering": steering,
+                "followUp": follow_up,
+                "updated_at": _epoch_ms(p.get("updated_at")),
+                "reason": bound_text("" if reason_text is None else str(reason_text), 200),
+            }
+            self._emit_raw(session_id, "control", "queue", fields, file_key="control")
+        except Exception:
+            logger.debug("herdr-stream queue snapshot failed", exc_info=True)
 
     # -- test / lifecycle helpers -----------------------------------------
 

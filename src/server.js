@@ -590,16 +590,34 @@ async function handlePrompt(req, res, body) {
 
 /* GET /api/queue?pane_id=<id>.
  *
- * pi: the bridge-visible queue — the last `type:"queue"` envelope of the newest control
- * file. hermes: `source:"pane-echo"` — the commands THIS server sent while the pane worked,
- * which is an acknowledgement of our own writes, not a listing of hermes' queue (the `note`
- * says exactly that; nothing here polls hermes or reads its internals). A pane that is no
- * longer `working` has its echo rows dropped, so an idle pane never shows stale rows. */
+ * Both agents read the bridge's queue record — the last `type:"queue"` envelope of the
+ * pane's newest control file (`source:"bridge"`). hermes publishes its own queue that way,
+ * so the tray shows hermes' rows rather than an acknowledgement of ours.
+ *
+ * Until a hermes pane's bridge has written one (old plugin, missing file), the response
+ * falls back to `source:"pane-echo"`: the commands THIS server sent while the pane worked,
+ * with `bridge_ready:false` and the reader's note so the missing plugin is visible. A pane
+ * that is no longer `working` has its echo rows dropped, so an idle pane never shows stale
+ * rows. Neither path polls hermes or writes to the pane. */
 async function handleQueueGet(req, res, url) {
   const paneId = url.searchParams.get('pane_id');
   if (!paneId) throw { code: 'bad_request', message: '"pane_id" query parameter is required' };
   const agent = await agentFamilyOf(paneId);
   if (agent === 'hermes') {
+    const state = await chatHermes.readQueueState(paneId);
+    if (state.found) {
+      return ok(res, {
+        pane_id: paneId,
+        agent: 'hermes',
+        source: 'bridge',
+        bridge_ready: true,
+        steering: state.steering,
+        followUp: state.followUp,
+        updated_at: state.updated_at,
+        note: state.note || '',
+        file: state.file,
+      });
+    }
     const working = (await paneAgentStatus(paneId)) === 'working';
     const rows = chatHermes.echoRows(paneId, working);
     return ok(res, {
@@ -611,6 +629,7 @@ async function handleQueueGet(req, res, url) {
       followUp: rows.followUp,
       updated_at: rows.updated_at,
       note: chatHermes.HERMES_ECHO_NOTE,
+      bridge_note: state.note,
     });
   }
   if (agent !== 'pi') {
