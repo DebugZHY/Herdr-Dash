@@ -844,12 +844,56 @@ async function handleText(req, res, body) {
 
 // ── agent question (round: prompt answering) ─────────────────────────────
 
+/* Read a pane's visible terminal and detect a pending question on it. Used by both
+ * the GET below and every answer path, so a reply is always decided from the pane's
+ * OWN current pixels rather than from a client's memory of an earlier poll. */
+async function readPanePrompt(paneId) {
+  const read = await hdr.request(
+    'pane.read',
+    { pane_id: paneId, source: 'visible', lines: 60, format: 'text', strip_ansi: true },
+    { timeoutMs: DEFAULT_TIMEOUT_MS },
+  );
+  const text = (read && read.read && read.read.text) || (read && read.text) || '';
+  return { text, prompt: promptdetect.detect(text) || null };
+}
+
+/** The last few pane rows, for an error that shows WHAT was on screen instead of only a code. */
+function paneTail(text, count) {
+  return String(text || '').split('\n').slice(-(count || 12)).join('\n');
+}
+
+/** The echo line the pane printed for the answer, read from the UNWRAPPED scrollback so a
+ *  long answer is one logical row instead of several wrapped ones. `clarifyEchoInfo`
+ *  reports the pane's own preview cut; a read failure is null, never an error (the panel
+ *  move has already proved acceptance — the echo is the corroboration). */
+async function readPaneEcho(paneId) {
+  try {
+    const read = await hdr.request(
+      'pane.read',
+      { pane_id: paneId, source: 'recent_unwrapped', lines: 80, format: 'text', strip_ansi: true },
+      { timeoutMs: DEFAULT_TIMEOUT_MS },
+    );
+    const text = (read && read.read && read.read.text) || (read && read.text) || '';
+    return clarifyEchoInfo(text);
+  } catch (e) {
+    return null;
+  }
+}
+
 /* Read the visible terminal of a blocked pane and detect a pending question.
  * GET /api/prompt?pane_id=.. -> { ok, pane_id, agent_status, prompt|null }
  * prompt = { kind, question, options:[{n,label}], free_text, answer_hint } or null. */
 async function handlePromptDetect(req, res, url) {
   const paneId = url.searchParams.get('pane_id');
   if (!paneId) throw { code: 'bad_request', message: '"pane_id" query parameter is required' };
+
+  /* A pane herdr no longer knows cannot hold a question. Saying so with its own code
+     is what lets the page drop a card whose pane died (the reader must not be shown a
+     question they cannot answer), instead of painting a generic read failure. */
+  const where = await paneInSnapshot(paneId);
+  if (!where.exists) {
+    throw { code: 'pane_not_found', message: `pane "${paneId}" is not in herdr's current snapshot — its question is gone` };
+  }
 
   let status = null;
   try {
@@ -860,34 +904,367 @@ async function handlePromptDetect(req, res, url) {
     }
   } catch (e) { /* a missing status never blocks detection */ }
 
-  const read = await hdr.request(
-    'pane.read',
-    { pane_id: paneId, source: 'visible', lines: 60, format: 'text', strip_ansi: true },
-    { timeoutMs: DEFAULT_TIMEOUT_MS },
-  );
-  const text = (read && read.read && read.read.text) || (read && read.text) || '';
-  const prompt = promptdetect.detect(text);
-  ok(res, { pane_id: paneId, agent_status: status, prompt: prompt || null });
+  const seen = await readPanePrompt(paneId);
+  ok(res, { pane_id: paneId, agent_status: status, prompt: seen.prompt });
+}
+
+/* ── answering a hermes clarify panel ────────────────────────────────────────
+ * The clarify panel is a LIST WITH A CURSOR, not a text field, so a blind
+ * pane.send_text() is wrong twice over. Measured on the live fixture pane wD:p1B
+ * (2026-10-26, footer "↑/↓ to select, Enter to lock"):
+ *   · a typed digit is an absolute hot-key. send-text "2" on a fresh panel landed
+ *     on beta and the panel returned in 1.20 s; send-keys down enter did the same
+ *     in 1.23 s. The digit assumes nothing about where the cursor is, so it is
+ *     what this code sends.
+ *   · the "Other (type your answer)" row opens a REAL text box when its number is
+ *     typed: send-text "3" turned the footer into "type your answer and press
+ *     Enter" and the box row "✎ ❯ type your answer here and press Enter" appeared
+ *     within ~0.06 s. 400 ms is the constant used before typing (≈6× the measured
+ *     switch).
+ *   · the text must never be sent at the panel or after the box closed: digits in
+ *     it are read as hot-keys (the reported "BLUE-42" picked option 2 and leaked
+ *     "BLUE-" into the main input). Every step below is verified by re-reading the
+ *     pane; the text is typed ONLY once the box row is on screen, Enter is pressed
+ *     ONLY once the text is in that row, and a step that does not verify stops with
+ *     an error instead of guessing.
+ */
+const CLARIFY_FREETEXT_OPEN_MS = 400;   // measured box-open ≈0.06 s; this is the margin used
+const CLARIFY_SETTLE_MS = 150;          // between two reads of a keystroke's effect
+const CLARIFY_TYPE_MS = 2500;           // the echoed text needs a few frames to be drawn; poll this long
+const CLARIFY_VERIFY_MS = 3000;         // the panel may take ~1.2 s to return; poll this long
+/* The box row is ONE terminal row: "✎ ❯ " plus ~68 characters (measured: the row is 72
+   columns in the fixture pane). A longer answer is not wrapped there — the pane shows its
+   PREFIX and the pane's own scrollback echo cuts the rest with "…". Everything below is
+   written around that: the window decides what to TYPE, the echo decides whether the
+   submitted text was the answer, and Enter is never withheld because the window is short. */
+const CLARIFY_BOX_WINDOW_CHARS = 68;    // what the box row can show of the content
+const CLARIFY_BOX_FULL_MIN = CLARIFY_BOX_WINDOW_CHARS - 8; // a window this full can hide a longer answer
+const CLARIFY_CLEAR_MAX_KEYS = 240;     // total backspaces a dirty box may be cleared with
+const CLARIFY_ANSWER_MAX = 4000;        // hard limit: longer is refused explicitly, never half-sent
+const CLARIFY_TYPE_SETTLE_MS = 500;     // answers longer than the window need a settle before Enter
+
+const clarifyWait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** The box row ("✎ ❯ …") and only the rows it wrapped onto, or null when no box is open.
+ *  The rows AFTER the box are read strictly: the input rule under it (───), a panel border,
+ *  the footer and the status/model row all END the box. The first version appended the rule
+ *  to the content, so "BLUE-42" was read as "BLUE-42 ────…", the equality check failed and
+ *  Enter was never pressed — the exact failure the reader saw as "Send does nothing". */
+function clarifyBox(text) {
+  const lines = String(text == null ? '' : text).split('\n');
+  let at = -1;
+  for (let i = lines.length - 1; i >= 0; i--) { if (lines[i].includes('✎')) { at = i; break; } }
+  if (at < 0) return null;
+  const block = [lines[at]];
+  for (let i = at + 1; i < lines.length && i <= at + 6; i++) {
+    const t = lines[i].trim();
+    if (!t) break;                                          // a blank row ends the box
+    if (/^[─═━·⋅•]{2,}\s*$/.test(t)) break;                 // the input rule under the box
+    if (/^[╭┌╰└│┃|]/.test(t)) break;                        // a panel border ends it
+    if (/to select|to lock|press Enter/i.test(t)) break;    // the footer under the box
+    if (/[☤❓⚡●◐]/.test(t)) break;                           // a status row ends it
+    block.push(lines[i]);                                   // a wrapped continuation of the box
+  }
+  const first = block[0];
+  const arrow = first.indexOf('❯');
+  const head = arrow >= 0 ? first.slice(arrow + 1) : first.replace(/^.*✎/, '');
+  const content = (head + ' ' + block.slice(1).join(' ')).replace(/\s+/g, ' ').trim();
+  const empty = /^type your answer here/i.test(content);    // hermes' empty-box placeholder
+  return { block: block.join('\n'), content: empty ? '' : content };
+}
+
+/** Does the open box hold exactly this answer? Whitespace is dropped from both sides so a
+ *  wrap can split a word across rows without turning a correct answer into a failure. */
+function clarifyBoxHolds(box, answer) {
+  if (!box) return false;
+  const squeeze = (s) => String(s == null ? '' : s).replace(/\s+/g, '');
+  return !!squeeze(answer) && squeeze(box.content) === squeeze(answer);
+}
+
+const clarifySqueeze = (s) => String(s == null ? '' : s).replace(/\s+/g, '');
+
+/** What the box's VISIBLE WINDOW proves about its content, and therefore about what to type:
+ *    no-box / empty        nothing in the box → type the answer
+ *    same                  the whole answer is on screen → just submit
+ *    long-prefix           a FULL window that is a prefix of the answer → the rest cannot be
+ *                          shown by this control, so the answer is already there; submit
+ *    short-prefix          a partial window shorter than the control can show → it cannot be
+ *                          the full answer; clear and retype
+ *    foreign               text that is not the answer at all → clear and retype
+ *  Only the typing decision comes from here. A window that proves nothing never blocks the
+ *  submit — the post-hoc echo check is what decides whether the answer actually arrived. */
+function clarifyWindowState(box, answer) {
+  if (!box) return 'no-box';
+  const v = clarifySqueeze(box.content);
+  const a = clarifySqueeze(answer);
+  if (!v) return 'empty';
+  if (v === a) return 'same';
+  if (a.startsWith(v)) return v.length >= CLARIFY_BOX_FULL_MIN ? 'long-prefix' : 'short-prefix';
+  return 'foreign';
+}
+
+/** The pane's echo line from the UNWRAPPED scrollback — one logical row, so the answer is
+ *  not chopped into wrapped pane rows — with the pane's own preview cut reported. The pane
+ *  truncates the echo it prints (measured: ~164 characters then "…"), so a long answer can
+ *  only ever be checked as a prefix; `truncated` says so instead of pretending otherwise. */
+function clarifyEchoInfo(text) {
+  const lines = String(text == null ? '' : text).split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = /Clarify:\s*(.*?)\s*→\s*(.+?)\s*$/.exec(lines[i].trim());
+    if (!m) continue;
+    let body = m[2];
+    let truncated = false;
+    if (/[…]\s*$/.test(body) || /\.\.\.\s*$/.test(body)) {
+      truncated = true;
+      body = body.replace(/([…]|\.\.\.)\s*$/, '').trim();
+    }
+    return { text: body, truncated };
+  }
+  return null;
+}
+
+/** The `? Clarify: <question> → <answer>` line the pane prints after an accepted answer,
+ *  when it is still on screen. Used as corroborating evidence, and to fail an answer the
+ *  pane echoed as something else. */
+function clarifyEcho(text) {
+  const info = clarifyEchoInfo(text);
+  return info ? info.text : null;
+}
+
+/** Post-hoc verdict on what the pane says the answer WAS. `verbatim` means the whole answer
+ *  was echoed; a non-verbatim echo is accepted ONLY when the pane marked its own cut with an
+ *  ellipsis AND what it printed is a prefix of the answer. Nothing longer than the answer can
+ *  ever pass, so a doubled submission ("XX" for "X") fails loudly instead of looking like a
+ *  prefix. */
+function clarifyEchoVerdict(info, answer) {
+  if (!info || !clarifySqueeze(info.text)) return { checked: false, verbatim: false, matches: true };
+  const e = clarifySqueeze(info.text);
+  const a = clarifySqueeze(answer);
+  const verbatim = !info.truncated && e === a;
+  const matches = verbatim || (info.truncated && e.length > 0 && a.startsWith(e));
+  return { checked: true, verbatim, matches };
+}
+
+/** The pane's echo, when it names neither the label nor (the start of) the answer: the
+ *  answer went somewhere other than this option/text. `undefined` when there is no echo. */
+function clarifyEchoMismatch(echo, wanted) {
+  if (echo == null || !wanted) return false;
+  const e = String(echo).toLowerCase();
+  const w = String(wanted).toLowerCase();
+  return !e.includes(w) && !w.startsWith(e) && !e.startsWith(w);
+}
+
+/** Re-read the pane until `want(box, text)` holds, or the budget runs out. A terminal draws
+ *  the effect of keystrokes a few frames after they land, so one settle-then-read races its
+ *  own keystrokes and reports a failure for an edit that did in fact happen. */
+async function waitForBox(paneId, want, ms) {
+  const deadline = Date.now() + (ms || CLARIFY_TYPE_MS);
+  let text = '';
+  let box = null;
+  for (;;) {
+    const seen = await readPanePrompt(paneId);
+    text = seen.text;
+    box = clarifyBox(text);
+    if (want(box, text)) return { ok: true, text, box };
+    if (Date.now() >= deadline) return { ok: false, text, box };
+    await clarifyWait(CLARIFY_SETTLE_MS);
+  }
+}
+
+/** Poll until the panel that showed `question` is gone or has advanced to another
+ *  question. Two reads ≥120 ms apart must agree, so a redraw gap is not mistaken
+ *  for an accepted answer. */
+async function waitForClarifyMove(paneId, question) {
+  const deadline = Date.now() + CLARIFY_VERIFY_MS;
+  let confirmedAt = 0;
+  let last = '';
+  while (Date.now() < deadline) {
+    const seen = await readPanePrompt(paneId);
+    last = seen.text;
+    const p = seen.prompt;
+    const moved = !p || p.kind !== 'hermes_clarify' || p.question !== question;
+    if (!moved) confirmedAt = 0;                       // the same question is still on screen
+    else if (!confirmedAt) confirmedAt = Date.now();
+    else if (Date.now() - confirmedAt >= 120) return { ok: true, text: seen.text };
+    await clarifyWait(150);
+  }
+  return { ok: false, text: last };
+}
+
+/** Answer a hermes clarify panel from the server's own fresh parse of it. */
+async function answerClarifyPanel(res, paneId, panel, body, beforeText) {
+  const answer = String(body.answer);
+  const options = Array.isArray(panel.options) ? panel.options : [];
+  const fail = (code, message, text) => ({
+    code,
+    message,
+    extra: { pane_id: paneId, session_kind: 'hermes_clarify', pane_excerpt: paneTail(text == null ? beforeText : text) },
+  });
+
+  /* The card was drawn from an earlier poll. If the panel has advanced to another
+     question since, the same option number would answer the WRONG one — the card's
+     own question is used as a staleness check, never as the mechanism. */
+  if (body.question != null && String(body.question) !== panel.question) {
+    throw fail('clarify_stale', `the panel now shows "${panel.question}", not "${String(body.question)}" — nothing was sent`, beforeText);
+  }
+
+  const asOption = options.find((o) => String(o.n) === answer.trim());
+  const freeTextWanted = body.free_text === true || (!asOption && !/^\d{1,2}$/.test(answer.trim()));
+
+  if (!freeTextWanted) {
+    if (!asOption) {
+      const labels = options.map((o) => `${o.n}. ${o.label}`).join('  ') || 'none';
+      const other = String(panel.free_text_n) === answer.trim()
+        ? ' — that is the "Other" row, which needs the text itself (free_text:true), not its number'
+        : '';
+      throw fail('clarify_option_not_found', `"${answer.trim()}" is not one of this panel's choices (${labels})${other} — nothing was sent`, beforeText);
+    }
+    await hdr.request('pane.send_text', { pane_id: paneId, text: String(asOption.n) }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    const moved = await waitForClarifyMove(paneId, panel.question);
+    if (!moved.ok) throw fail('clarify_verify_failed', `the panel did not take option ${asOption.n} ("${asOption.label}") — it still shows the same question`, moved.text);
+    const echo = clarifyEcho(moved.text);
+    if (clarifyEchoMismatch(echo, asOption.label)) {
+      throw fail('clarify_verify_failed', `the panel answered "${echo}" instead of "${asOption.label}" — option ${asOption.n} may have been taken by another row`, moved.text);
+    }
+    return ok(res, { pane_id: paneId, sent: 'clarify-option', option: asOption.n, label: asOption.label, question: panel.question, pane_echo: echo, panel_gone: !/Hermes needs your input/.test(moved.text) });
+  }
+
+  /* Free text: select the Other row, make sure the box is safe to type into, type, SUBMIT,
+     then verify what the pane says the answer was.
+
+     The box row shows a ~72-column window of its content (CLARIFY_BOX_WINDOW_CHARS), so for
+     an answer longer than that the window can only ever prove a prefix. It is therefore used
+     ONLY to decide what to type — never as a licence to withhold Enter: the previous version
+     waited for the whole answer to appear in the window, which is impossible past ~68
+     characters, so a correct long answer was refused with clarify_text_not_shown and the
+     panel never advanced. Enter is now sent whenever the text has had time to land, and the
+     verdict comes afterwards from the pane's echo line and the panel moving on. */
+  if (!panel.free_text || !Number.isFinite(Number(panel.free_text_n))) {
+    throw fail('clarify_no_free_text', 'this clarify panel offers no "Other" free-text row — nothing was sent', beforeText);
+  }
+  if (answer.length > CLARIFY_ANSWER_MAX) {
+    throw fail('clarify_answer_too_long', `the answer is ${answer.length} characters; this panel takes at most ${CLARIFY_ANSWER_MAX} — nothing was sent`, beforeText);
+  }
+  if (/[\r\n]/.test(answer)) {
+    throw fail('clarify_answer_multiline', 'the answer contains a line break, which the single-line box would submit early — nothing was sent', beforeText);
+  }
+  let seen = beforeText;
+  let box = clarifyBox(seen);
+  if (!box) {
+    await hdr.request('pane.send_text', { pane_id: paneId, text: String(Number(panel.free_text_n)) }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    const opened = await waitForBox(paneId, (b) => !!b, CLARIFY_FREETEXT_OPEN_MS);
+    seen = opened.text;
+    box = opened.box;
+    if (!box) throw fail('clarify_box_missing', 'the "Other" row did not open its text box — the text was NOT typed', seen);
+  }
+
+  /* A box that already holds something else is CLEARED before typing: typing over it would
+     submit a concatenation (the "XX" for "X" duplication the reader reported). The clear is
+     bounded and re-checked; a box that will not come back empty is refused explicitly. */
+  let state = clarifyWindowState(box, answer);
+  let cleared = 0;
+  while (state === 'foreign' || state === 'short-prefix') {
+    const budget = CLARIFY_CLEAR_MAX_KEYS - cleared;
+    const keys = Math.min(Array.from(box.content).length + 8, budget);
+    if (keys <= 0) break;
+    await hdr.request('pane.send_keys', { pane_id: paneId, keys: new Array(keys).fill('backspace') }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    cleared += keys;
+    const after = await waitForBox(paneId, (b) => !b || !b.content, CLARIFY_TYPE_MS);
+    seen = after.text;
+    box = after.box;
+    if (!box) throw fail('clarify_box_missing', 'the text box disappeared while it was being cleared — nothing was submitted', seen);
+    state = clarifyWindowState(box, answer);
+  }
+  if (state === 'foreign' || state === 'short-prefix') {
+    throw fail('clarify_box_dirty', `the panel's text box still holds text that is not this answer (it reads "${box.content}") — clear it manually, then send again`, seen);
+  }
+
+  if (state === 'empty') {
+    await hdr.request('pane.send_text', { pane_id: paneId, text: answer }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    /* Wait only for evidence that the text LANDED, not for the whole answer to be visible:
+       'same' for a short answer, 'long-prefix' once a full window of a long one is on screen.
+       A window that stays empty means the keystrokes never arrived — that is a real failure. */
+    const typed = await waitForBox(paneId, (b) => {
+      const s = clarifyWindowState(b, answer);
+      return s === 'same' || s === 'long-prefix';
+    }, CLARIFY_TYPE_MS);
+    seen = typed.text;
+    box = typed.box;
+    if (!typed.ok) {
+      throw fail('clarify_text_not_shown', `the text never reached the panel's box (the box reads "${box ? box.content : '(no box)'}") — nothing was submitted`, seen);
+    }
+    state = clarifyWindowState(box, answer);
+  }
+  if (state === 'long-prefix') {
+    /* The window is full and the rest of the answer is invisible to this control; give the
+       app a moment to drain the keystrokes that are still in flight before Enter follows. */
+    await clarifyWait(CLARIFY_TYPE_SETTLE_MS);
+  }
+
+  await hdr.request('pane.send_keys', { pane_id: paneId, keys: ['enter'] }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+  const moved = await waitForClarifyMove(paneId, panel.question);
+  if (!moved.ok) throw fail('clarify_verify_failed', 'the panel did not accept the text (it still shows the same question)', moved.text);
+
+  /* Post-hoc: the echo says what the panel actually received — read from the UNWRAPPED
+     scrollback, so a long answer is one logical row and the pane's own "…" cut is visible as
+     such. `verbatim` can only be true when the pane printed the whole answer; a cut echo must
+     still be a prefix of it (nothing duplicated), and anything else fails loudly. When the
+     echo cannot be read at all the panel move stands as the proof and `echo_checked` says so. */
+  const echo = await readPaneEcho(paneId);
+  const verdict = clarifyEchoVerdict(echo, answer);
+  if (verdict.checked && !verdict.matches) {
+    throw fail('clarify_verify_failed', `the pane echoed "${echo.text}" — the panel did not receive this answer verbatim`, moved.text);
+  }
+  return ok(res, {
+    pane_id: paneId, sent: 'clarify-free-text', answer: answer, free_text_n: Number(panel.free_text_n),
+    question: panel.question,
+    pane_echo: echo ? echo.text : null,
+    echo_verbatim: verdict.verbatim,
+    echo_truncated: !!(echo && echo.truncated),
+    echo_checked: verdict.checked,
+    box_window: box ? box.content : null,
+    panel_gone: !/Hermes needs your input/.test(moved.text),
+  });
 }
 
 /* Answer a pending question. POST /api/prompt/answer
- * { pane_id, answer } — answer is a string: a digit for a numbered option,
- * free text for a free-text field, or "y"/"n" for a y/n prompt.
+ * { pane_id, answer } — a digit for a numbered option, free text otherwise. On a
+ *   hermes clarify panel the server re-reads the panel and runs the panel's own
+ *   keystrokes (option digit / Other-row + text + Enter); `free_text:true` states
+ *   the intent outright, and `question` lets a stale card be refused.
  * { pane_id, keys:["up","enter"] } — raw keystrokes for a pi picker.
  * { pane_id, cancel:true } — send esc. */
 async function handlePromptAnswer(req, res, body) {
   const paneId = requireString(body, 'pane_id');
+
+  /* Nothing is sent to a pane herdr no longer has: the answer would vanish (or, if
+     the id were reused, land in a different pane). The page drops the card on this code. */
+  const where = await paneInSnapshot(paneId);
+  if (!where.exists) {
+    throw { code: 'pane_not_found', message: `pane "${paneId}" is not in herdr's current snapshot — nothing was sent` };
+  }
+
   if (body.cancel === true) {
     const r = await hdr.request('pane.send_keys', { pane_id: paneId, keys: ['esc'] }, { timeoutMs: DEFAULT_TIMEOUT_MS });
-    return ok(res, { result: r, sent: 'esc' });
+    return ok(res, { pane_id: paneId, result: r, sent: 'esc' });
   }
   if (Array.isArray(body.keys) && body.keys.length) {
     const r = await hdr.request('pane.send_keys', { pane_id: paneId, keys: normalizeKeys(body.keys) }, { timeoutMs: DEFAULT_TIMEOUT_MS });
-    return ok(res, { result: r, sent: 'keys' });
+    return ok(res, { pane_id: paneId, result: r, sent: 'keys' });
   }
   if (typeof body.answer === 'string' && body.answer.length > 0) {
+    /* The panel is re-read and re-detected here, never taken from the request: the
+       card is a memory of an earlier poll, and a keystroke sent into a panel that is
+       no longer there lands in the agent's main input instead. */
+    const seen = await readPanePrompt(paneId);
+    if (!seen.prompt) {
+      throw { code: 'no_panel', message: 'no question is on this pane right now — nothing was sent', extra: { pane_id: paneId, pane_excerpt: paneTail(seen.text) } };
+    }
+    if (seen.prompt.kind === 'hermes_clarify') {
+      return answerClarifyPanel(res, paneId, seen.prompt, body, seen.text);
+    }
     const r = await hdr.request('pane.send_text', { pane_id: paneId, text: body.answer }, { timeoutMs: DEFAULT_TIMEOUT_MS });
-    return ok(res, { result: r, sent: 'text' });
+    return ok(res, { pane_id: paneId, result: r, sent: 'text', detected_by: 'server' });
   }
   throw { code: 'bad_request', message: 'provide one of: answer (string), keys (array), or cancel:true' };
 }

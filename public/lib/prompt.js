@@ -10,10 +10,19 @@
  *   claude AskUserQuestion  POST /api/prompt/answer {answer:"<n>"}  (send_text a digit)
  *                           free text is two steps: first the option number that opens the box,
  *                           then the typed text — both awaited, in that order
+ *   hermes clarify          POST /api/prompt/answer {answer:"<n>", question}  for an option, or
+ *                           {answer:"<text>", free_text:true, question} for custom text. The
+ *                           panel is digit/arrow driven, so the SERVER owns the keystrokes: it
+ *                           re-reads the panel, selects the Other row, waits for its text box,
+ *                           types, verifies and sends Enter. `question` is the card's own
+ *                           question, which lets the server refuse a card the panel moved past.
  *   generic y/n             POST /api/prompt/answer {answer:"y"|"n"}
  *   pi inline picker        POST /api/prompt/answer {keys:["down",…,"enter"]}  (k downs then enter,
  *                           the picker starts on item 1)
  *   any card's esc          POST /api/prompt/answer {cancel:true}
+ *
+ * A card whose pane is no longer in the snapshot is REMOVED: the pane holds no
+ * question any more, so the server answers `pane_not_found` and nothing is sent.
  *
  * After a successful answer the pane leaves the detection map at once (optimistic: the next tick
  * re-reads it), and its card lingers for 1.5 s as a 'sent' ghost before it is removed; a failure
@@ -233,6 +242,9 @@
         at: same ? prev.at : clock(),
         seq: same ? prev.seq : (++seq),
         status: 'ready',
+        /* A failed send stays on the card while the same panel is up: the reader must see why
+           nothing was answered instead of a card that silently looks untouched. */
+        _error: same ? (prev._error || null) : null,
         kind: kind,
         agent: agentOf(kind),
         question: txt(prompt.question),
@@ -306,6 +318,9 @@
       }
       /* expire stale watches */
       for (var w in watched) { if (Object.prototype.hasOwnProperty.call(watched, w) && watched[w] <= now) delete watched[w]; }
+      /* a detection whose pane is not in the snapshot has nothing left to answer: the
+         pane died, so the card goes with it (runs before the reads, so a dead pane is
+         never read and never painted as an error) */
       detections.forEach(function (d, id) { if (!targetIds[id]) detections.delete(id); });
       var jobs = [];
       for (var j = 0; j < target.length; j++) {
@@ -325,6 +340,14 @@
       if (!d) { d = { pane_id: paneId, at: clock(), seq: (++seq), status: 'ready' }; detections.set(paneId, d); }
       d._sending = false;
       d._error = errText(err);
+    }
+    /* the pane is gone from herdr's snapshot: there is no question left to answer, so
+       the card is removed instead of kept as an error the reader would keep clicking */
+    function dropCard(paneId) {
+      detections.delete(paneId);
+      delete watched[paneId];
+      if (unmounted) return;
+      render();
     }
     function postRaw(paneId, payload) {
       var body = { pane_id: paneId };
@@ -357,7 +380,10 @@
     function post(paneId, payload) {
       return postRaw(paneId, payload).then(function (res) {
         if (unmounted) return res;
-        if (!res || !res.ok) { setCardError(paneId, res && res.error); render(); return res; }
+        if (!res || !res.ok) {
+          if (res && res.error && res.error.code === 'pane_not_found') { dropCard(paneId); return res; }
+          setCardError(paneId, res && res.error); render(); return res;
+        }
         markSent(paneId, payload && payload.cancel ? 'cancel' : 'answer');
         render();
         return res;
@@ -367,9 +393,13 @@
     function answerOption(d, opt) {
       if (!opt) return;
       if (d.kind === 'yn') { post(d.pane_id, { answer: /^(y|yes)/i.test(txt(opt.label)) ? 'y' : 'n' }); return; }
-      /* claude maps a typed digit to the numbered item; hermes' clarify and pi's picker are
-         arrow-driven and ignore typed digits, so they take a keystroke plan instead */
+      /* claude AskUserQuestion maps a typed digit to the numbered item */
       if (d.kind === 'claude_ask') { post(d.pane_id, { answer: String(opt.n) }); return; }
+      /* hermes' clarify panel is digit-driven and the SERVER owns the keystrokes: it
+         re-reads the panel itself and picks the option there, so a card the panel has
+         already moved past is refused instead of answering the next question by mistake.
+         `question` is the card's own question — the staleness check, not the mechanism. */
+      if (d.kind === 'hermes_clarify') { post(d.pane_id, { answer: String(opt.n), question: d.question }); return; }
       /* claude's /model picker ignores typed digits and opens with the highlight on the CURRENT
          model, so the answer is a relative arrow walk from that highlight to the target row,
          then enter (one enter both picks and confirms — verified live) */
@@ -383,6 +413,8 @@
         post(d.pane_id, { keys: keys });
         return;
       }
+      /* the pi inline picker is the panel with no numbered hot-keys: an absolute option
+         number becomes k downs + enter from its first row */
       answerByKeys(d.pane_id, (opt.n || 1) - 1);
     }
     function answerByKeys(paneId, downs) {
@@ -395,8 +427,10 @@
       answerByKeys(paneId, index);
     }
     /* free text takes the path the agent actually supports, per family:
-       - hermes clarify: navigating onto the "Other (type below)" item opens a real text box
-         (verified live) — so: arrow down to the meta item, enter, send_text the text, enter.
+       - hermes clarify: ONE server call. The panel needs the Other row selected, its text
+         box waited for, the text typed, verified and Enter pressed; doing that here split the
+         sequence across requests and left a failure half-applied. The server does the whole
+         sequence and answers with an error when a step does not verify.
        - claude AskUserQuestion: "Type something" commits the moment it is selected and never
          opens a box (verified live) — so: esc to release the pane, then a normal agent.prompt.
        A blocked pane refuses agent.prompt, hence the esc first for claude. */
@@ -408,18 +442,7 @@
       render();
       var chain;
       if (d.kind === 'hermes_clarify') {
-        /* free_text_n is the meta item's number; it sits (free_text_n - 1) downs from the top */
-        var keys = [];
-        var downs = Math.max(0, (d.free_text_n || 1) - 1);
-        for (var i = 0; i < downs; i++) keys.push('down');
-        keys.push('enter');
-        chain = postRaw(d.pane_id, { keys: keys }).then(function (res) {
-          if (!res || !res.ok) return res;
-          return postRaw(d.pane_id, { answer: v });        // type into the box the item opened
-        }).then(function (res) {
-          if (!res || !res.ok) return res;
-          return postRaw(d.pane_id, { keys: ['enter'] });  // submit the box
-        });
+        chain = postRaw(d.pane_id, { answer: v, free_text: true, question: d.question });
       } else {
         /* claude (and the safest default): esc, wait for the pane to unblock, then prompt */
         chain = postRaw(d.pane_id, { cancel: true }).then(function (res) {
@@ -433,7 +456,10 @@
       chain.then(function (res) {
         if (unmounted) return;
         d._sending = false;
-        if (!res || !res.ok) { setCardError(d.pane_id, res && res.error); render(); return; }
+        if (!res || !res.ok) {
+          if (res && res.error && res.error.code === 'pane_not_found') { dropCard(d.pane_id); return; }
+          setCardError(d.pane_id, res && res.error); render(); return;
+        }
         markSent(d.pane_id, 'answer');
         render();
       });
@@ -534,8 +560,17 @@
         });
         input.addEventListener('keyup', function (ev) { if (ev.stopPropagation) ev.stopPropagation(); }, true);
         input.addEventListener('keypress', function (ev) { if (ev.stopPropagation) ev.stopPropagation(); }, true);
-        /* a render skipped while this input was focused is made good the moment it blurs */
-        input.addEventListener('blur', function () { render(); });
+        /* a render skipped while this input was focused is made good the moment it blurs —
+           EXCEPT when the blur is the mousedown of this card's own Send button: rendering
+           then tears the button out of the DOM before its click event fires, and the click
+           is the only way an answer is sent (Enter is deliberately inert). That made Send
+           look dead (live report, 2026-10-26). The next poll renders anyway, so skipping
+           one render here costs nothing. */
+        input.addEventListener('blur', function () {
+          var next = document.activeElement;
+          if (next && next.classList && next.classList.contains('hd-prompt-send')) return;
+          render();
+        });
         var send = el('button', 'hd-prompt-send', 'send');
         send.type = 'button';
         send.disabled = !!sending;
