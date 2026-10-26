@@ -93,6 +93,7 @@
     var lastAction = null;
     var pend = null;                  // {excerpt} while the server reports pending
     var busy = false;                 // one request at a time (read or write)
+    var dirty = { interval: false, prompt: false };   // the user edited this field; a poll must not re-seed it
     var again = false;                // a refresh arrived while one was in flight
     var seq = 0;                      // keeps a stale response from overwriting a newer pane
     var pollTimer = null;
@@ -126,6 +127,9 @@
       catch (e) { return null; }
     }
     function supported() { return !(view && view.supported === false); }
+    /* a user edit survives every re-render until the panel genuinely resets: opening it, a pane
+       switch, or a successful set/clear write (those re-seed from the write/stored state) */
+    function clearDirty() { dirty.interval = false; dirty.prompt = false; }
 
     /* ── one request, with an AbortController and a deadline (never a hung panel) ── */
     function request(method, url, payload) {
@@ -245,6 +249,9 @@
         if (!res.ok) { err = errText(res.error); lastAction = null; render(); return; }
         var rb = res.body || {};
         applyPost(rb);
+        /* the write is in: a set carries the fields back, a clear empties them, so the panel may
+           re-seed again — this is the one write that legitimately ends a draft */
+        if (action === 'set' || action === 'clear') clearDirty();
         lastAction = action + ' · ' + (has(rb.applied_via) ? txt(rb.applied_via) : 'ok');
         if (rb.pending === true) {
           pend = { excerpt: has(rb.pane_excerpt) ? txt(rb.pane_excerpt) : '' };
@@ -324,6 +331,7 @@
       intervalEl.spellcheck = false;
       intervalEl.setAttribute('aria-label', 'heartbeat interval (30m, 2h, 90s, 1d)');
       shield(intervalEl);
+      intervalEl.addEventListener('input', function () { dirty.interval = true; });
       addField(panel, 'interval', intervalEl);
 
       promptEl = document.createElement('textarea');
@@ -333,6 +341,7 @@
       promptEl.spellcheck = false;
       promptEl.setAttribute('aria-label', 'heartbeat prompt');
       shield(promptEl);
+      promptEl.addEventListener('input', function () { dirty.prompt = true; });
       addField(panel, 'prompt', promptEl);
 
       var ops = el('div', 'hd-heartbeat-ops');
@@ -399,11 +408,11 @@
       if (stateEl) stateEl.textContent = hb ? pure.formatStateLine(hb) : 'no heartbeat set';
       if (intervalEl) {
         intervalEl.disabled = !pane || !sup;   // never on `busy`: a 5 s poll must not blur a focused input
-        if (document.activeElement !== intervalEl) intervalEl.value = hb ? pure.formatInterval(hb.interval_seconds) : '';
+        if (!dirty.interval && document.activeElement !== intervalEl) intervalEl.value = hb ? pure.formatInterval(hb.interval_seconds) : '';
       }
       if (promptEl) {
         promptEl.disabled = !pane || !sup;     // same rule — a poll in flight is not a reason to drop the caret
-        if (document.activeElement !== promptEl) promptEl.value = (hb && has(hb.prompt)) ? txt(hb.prompt) : '';
+        if (!dirty.prompt && document.activeElement !== promptEl) promptEl.value = (hb && has(hb.prompt)) ? txt(hb.prompt) : '';
       }
       var canWrite = !!pane && sup && !busy;
       if (actions.set) actions.set.disabled = !canWrite;
@@ -474,6 +483,7 @@
     function openPanel() {
       if (unmounted || !pane || open) return false;
       open = true;
+      clearDirty();                       // opening the panel always re-seeds from the stored state
       ensurePanel();
       overlayHost = safeOverlay();
       if (panel.parentNode !== overlayHost) overlayHost.appendChild(panel);
@@ -506,6 +516,7 @@
       var id = next || null;
       if (id === pane) return false;
       pane = id;
+      clearDirty();                       // never leak one pane's draft into another
       view = null;
       err = null;
       lastAction = null;
