@@ -31,9 +31,13 @@
  *
  * Signal order (documented; `detected_by` names the winner):
  *   0 reader        an explicit `?session_id=` pick, from the candidates listed
- *   0.5 sink_session pi: the pane's OWN token-sink file names a session that is
- *                   also one of the cwd's verified log candidates (pane-specific
- *                   evidence; beats the rank/mtime guesses below)
+ *   0.5 sink_session pi: the pane's OWN bridge evidence names a session — the newest
+ *                   of its token sink and its control file (`bridgeSessionForPane`).
+ *                   A TURN sink is trusted only when the id is also one of the cwd's
+ *                   verified log candidates; a CONTROL identity (the pane's settings
+ *                   file) resolves even with no log yet, because that is exactly what
+ *                   a pane that has not taken a turn looks like. Beats the rank/mtime
+ *                   guesses below (pane-specific evidence).
  *   1 pane_banner   the pane's own text (on screen first, scrollback second)
  *   2 store_session hermes `sessions` table: this cwd, newest activity
  *   3 cwd_newest    claude: the newest jsonl under the pane's cwd that PROVES
@@ -67,6 +71,7 @@ const LIMITS = {
 const SIGNALS = {
   READER: 'reader',
   SINK_SESSION: 'sink_session',
+  CONTROL_SESSION: 'control_session',
   PANE_BANNER: 'pane_banner',
   STORE_SESSION: 'store_session',
   CWD_NEWEST: 'cwd_newest',
@@ -202,10 +207,12 @@ function digestPaneText(text) {
  *   store_sessions       hermes, newest first: [{id, cwd, started_at, last_activity_at}]
  *   store_known_ids      hermes: {[id]: true} — ids this store knows for this pane
  *   candidates           claude/pi, newest first: [{id, path, mtimeMs}] verified against the cwd
- *   sink_session         pi: {id, path, mtimeMs} from the pane's own token-sink file
- *                        (pi.sinkSessionForPane), or null
+ *   sink_session         pi: {id, path, mtimeMs, kind:'turn'|'control'} from the
+ *                        pane's own bridge evidence (pi.bridgeSessionForPane — the
+ *                        newest of its token-sink file and its control file), or null
  *   bound_mtime_ms       claude: mtime of herdr's bound file (null when it has none)
- *   claimed              {[sessionId]: paneId} — ids herdr binds to OTHER panes
+ *   claimed              {[sessionId]: paneId} — ids herdr binds to OTHER panes, and
+ *                        (pi) ids those panes' own bridge evidence names
  *   reader_pick          `?session_id=` — the reader's explicit choice
  *   now                  ms epoch
  * @returns {resolved, session_id, detected_by, reason, note, corroborated,
@@ -303,26 +310,50 @@ function resolvePaneSession(input) {
     return out;
   }
 
-  // ── 0.5 the pane's own token sink (pi) ────────────────────────────────────
+  // ── 0.5 the pane's own bridge evidence (pi) ───────────────────────────────
   // The pi bridge writes <streams>/<safe(pane)>/<safe(session)>__<safe(turn)>.ndjson
-  // and the first envelope names the pane's session. That is the ONLY piece of
-  // evidence that is pane-specific when several pi panes share one cwd, so it
-  // outranks the rank/mtime guesses below. It is trusted only when the id is also
-  // one of the log candidates this resolver already verified for the cwd: a stale
-  // or mis-copied sink file must not bind a session the pane's logs do not
-  // corroborate. A rejected sink id is disclosed and then ignored — never guessed.
+  // (one file per turn) and <safe(session)>__control.ndjson (settings, from session
+  // start), and the first envelope of either names the pane's session. That is the
+  // ONLY pane-specific evidence when several pi panes share one cwd, so it outranks
+  // the rank/mtime guesses below.
+  //
+  // A TURN sink is trusted only when its id is also one of the log candidates this
+  // resolver verified for the cwd: a stale or mis-copied turn file must not bind a
+  // session the pane's logs do not corroborate. A rejected one is disclosed and
+  // ignored — never guessed.
+  //
+  // A CONTROL identity is different by design: it was written by THIS pane's bridge
+  // (the envelope carries the pane id) and names a session that has not run a turn
+  // yet, which is exactly why no log can corroborate it. Refusing it is what let the
+  // cwd guess hand an idle pane a sibling's live conversation (live, 2026-10-20:
+  // wF:p2/wF:p3 showed wF:p4's session). It resolves uncorroborated; the chat route
+  // then answers `session_file_missing` ("nothing written yet") — the truth for a
+  // pane that has not taken a turn.
   if (agent === 'pi' && inp.sink_session && typeof inp.sink_session === 'object') {
     const sinkId = inp.sink_session.id == null ? '' : String(inp.sink_session.id);
+    const fromControl = inp.sink_session.kind === 'control';
     if (sinkId) {
       const corroborating = filerows.find((c) => String(c.id) === sinkId) || null;
       if (corroborating) {
         return Object.assign(out, {
           resolved: true,
           session_id: sinkId,
-          detected_by: SIGNALS.SINK_SESSION,
+          detected_by: fromControl ? SIGNALS.CONTROL_SESSION : SIGNALS.SINK_SESSION,
           reason: null,
           corroborated: true,
-          note: `the pane's own sink file named ${sinkId}`,
+          note: fromControl
+            ? `the pane's own settings file named ${sinkId}`
+            : `the pane's own sink file named ${sinkId}`,
+        });
+      }
+      if (fromControl) {
+        return Object.assign(out, {
+          resolved: true,
+          session_id: sinkId,
+          detected_by: SIGNALS.CONTROL_SESSION,
+          reason: null,
+          corroborated: false,
+          note: `the pane's own settings file names ${sinkId}; that session has no log yet (no turn written)`,
         });
       }
       note(`the pane's sink file names ${sinkId}, which is not one of this cwd's verified log candidates — ignored`);
@@ -380,17 +411,34 @@ function resolvePaneSession(input) {
   // ── 3. claude/pi: the newest jsonl under this pane's cwd ──────────────────
   // A pi pane that shares its cwd with siblings takes its server-assigned log
   // instead: rank beats mtime, or three panes would all bind the newest one.
+  let rankRefused = false;
   if (agent === 'pi' && Array.isArray(inp.pi_assign) && inp.pi_assign.length) {
     const me = inp.pi_assign.find((a) => a && a.pane_id === inp.pane_id) || null;
-    if (me && me.id) {
+    const owner = me && me.id ? claimOf(me.id) : null;
+    if (me && me.id && !owner) {
       return Object.assign(out, {
         resolved: true, session_id: me.id, detected_by: SIGNALS.CWD_ASSIGN,
         corroborated: false,
         note: `assigned by the server: this cwd has ${inp.pi_assign.length} pi pane(s) sharing ${inp.pi_assign.filter((a) => a && a.id).length} log(s); this pane takes rank ${me.rank + 1}`,
       });
     }
+    if (me) {
+      /* The rank carries no log this pane may take: either the cwd has more panes
+         than logs (this rank has none), or the log at it is one a SIBLING pane's
+         own bridge evidence names (§9.5, through `claimed`). Both used to fall
+         through to the mtime guess below — which is how an idle pane ended up
+         showing a sibling's live conversation (live, 2026-10-20, wF:p2/wF:p3).
+         The rank IS the server's answer here; no session is the honest one. */
+      rankRefused = true;
+      if (owner) {
+        note(`the log at this pane's rank (${me.id}) is one pane ${owner} owns by its own bridge evidence — not adopting it`);
+        push(me.id, SIGNALS.CWD_ASSIGN, `bound to ${owner}`);
+      } else {
+        note(`this cwd has ${inp.pi_assign.length} pi pane(s) sharing ${inp.pi_assign.filter((a) => a && a.id).length} verified log(s); this pane's rank (${me.rank + 1}) has none — not adopting a sibling's log`);
+      }
+    }
   }
-  if (agent !== 'hermes' && filerows.length) {
+  if (agent !== 'hermes' && filerows.length && !rankRefused) {
     const newest = filerows[0];
     const freshMs = agent === 'pi' ? LIMITS.FILE_FRESH_PI_MS : LIMITS.FILE_FRESH_MS;
     const runnerUp = filerows.slice(1).find((c) => newest.mtimeMs - c.mtimeMs <= LIMITS.AMBIG_MARGIN_MS) || null;

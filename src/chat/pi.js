@@ -242,6 +242,70 @@ async function newestControlFile(paneId, opts) {
 }
 
 /**
+ * The session a pane's own CONTROL file names, or null.
+ *
+ * A turn sink only exists once the pane has RUN a turn. An idle pane sitting at the
+ * pi welcome screen has no turn file at all, and the resolver's cwd scan would then
+ * hand it a SIBLING pane's conversation (live, 2026-10-20: wF:p2 and wF:p3 showed
+ * wF:p4's live chat). The control file is written at session start and again after
+ * every session change, and every control envelope carries the pane's `session_id`,
+ * so for a session with no turns yet it is the only pane-specific evidence there is.
+ *
+ * The file is accepted on the same rules as `sinkSessionForPane` — `v === 1`, an
+ * envelope that names THIS pane, a non-empty session id — which is why the two are
+ * separate readers: "the newest turn file" and "the newest settings file" are
+ * different questions, and a control file is never a turn. Never throws.
+ *
+ * @param {string} paneId
+ * @param {{streamRoot?: string}} [opts]
+ * @returns {Promise<{id: string, path: string, mtimeMs: number}|null>}
+ */
+async function controlSessionForPane(paneId, opts) {
+  try {
+    const rawPane = String(paneId === undefined || paneId === null ? '' : paneId);
+    if (!rawPane) return null;
+    const best = await newestControlFile(rawPane, opts);
+    if (!best) return null;
+    const line = await firstSinkLine(best.file);
+    if (!line) return null;
+    let env;
+    try { env = JSON.parse(line); } catch (e) { return null; }
+    if (!env || typeof env !== 'object' || Array.isArray(env)) return null;
+    if (env.v !== 1) return null;
+    if (typeof env.pane_id !== 'string' || env.pane_id !== rawPane) return null;
+    if (typeof env.session_id !== 'string' || !env.session_id.trim()) return null;
+    return { id: env.session_id, path: best.file, mtimeMs: best.mtimeMs };
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * The pane's own bridge evidence as ONE answer: the newest of its turn sink and its
+ * control file, tagged with the `kind` that named the session.
+ *
+ * Newest wins because both writers leave the file of the session the pane LEFT
+ * behind: after a `/resume` the new control file is newer than the old session's
+ * turn file, and the first turn in the resumed session writes a turn file newer
+ * than that control file. A tie goes to the control file — it exists from session
+ * start, the turn file only after the first turn.
+ *
+ * @param {string} paneId
+ * @param {{streamRoot?: string}} [opts]
+ * @returns {Promise<{id: string, path: string, mtimeMs: number, kind: 'turn'|'control'}|null>}
+ */
+async function bridgeSessionForPane(paneId, opts) {
+  const turn = await sinkSessionForPane(paneId, opts).catch(() => null);
+  const control = await controlSessionForPane(paneId, opts).catch(() => null);
+  if (!turn && !control) return null;
+  if (!turn) return Object.assign({}, control, { kind: 'control' });
+  if (!control) return Object.assign({}, turn, { kind: 'turn' });
+  return control.mtimeMs >= turn.mtimeMs
+    ? Object.assign({}, control, { kind: 'control' })
+    : Object.assign({}, turn, { kind: 'turn' });
+}
+
+/**
  * The last bridge settings envelope for a pane: the model and thinking level the
  * extension last reported. A model switch and a thinking-level switch each write a
  * settings line; reading both from the same source keeps the dashboard from pairing
@@ -1394,7 +1458,8 @@ function fits(messages, plan, limit, bytes) {
 module.exports = {
   SOURCE_KIND, EXCLUDED_TYPES, KNOWN_TYPES, MESSAGE_TYPES, sessionsRoot, findSessionFile,
   verifyCwd, sameCwd, parseRecord, readWindow, readTail, candidatesForCwd,
-  sinkSessionForPane, sinkSettingsForPane, sinkSafeSegment, sinkStreamRoot, bridgeStateForPane,
+  sinkSessionForPane, controlSessionForPane, bridgeSessionForPane,
+  sinkSettingsForPane, sinkSafeSegment, sinkStreamRoot, bridgeStateForPane,
   /* control plane (pure helpers; the routes only send these strings) */
   PI_RESUME_COMMAND, PI_MODEL_COMMAND, PI_ABORT_COMMAND, PI_NEW_COMMAND,
   resumeCommand, modelCommand, safeCommandToken,

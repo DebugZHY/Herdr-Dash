@@ -1,0 +1,181 @@
+/* herdr-dash — lib/heartbeat.css
+ *
+ * The ♥ heartbeat control (lib/heartbeat.js): the trigger in the composer's tools row and its
+ * popover panel. The trigger deliberately reuses the .tool-btn / .tool-select metrics of
+ * lib/chatfirst.css so the row keeps one rhythm; the panel reuses the ask card's language —
+ * dark panel, 3 px accent edge, mono text (lib/prompt.js).
+ */
+
+/* ---------------------------------------------------------------- trigger */
+
+.hd-heartbeat-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--fg-dim);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.hd-heartbeat-btn:hover { color: var(--fg); border-color: #35425a; }
+.hd-heartbeat-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.hd-heartbeat-btn:disabled { opacity: .55; cursor: default; }
+.hd-heartbeat-btn[data-open="1"] { color: var(--fg); border-color: var(--accent); }
+.hd-heartbeat-heart { color: var(--st-blocked); font-size: 12px; line-height: 1; }
+.hd-heartbeat-btn[data-state="off"] .hd-heartbeat-heart,
+.hd-heartbeat-btn[data-state="none"] .hd-heartbeat-heart { color: var(--fg-dim); }
+.hd-heartbeat-btn[data-state="paused"] .hd-heartbeat-heart { color: var(--st-working); }
+.hd-heartbeat-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--fg-dim);
+}
+.hd-heartbeat-btn[data-state="on"] .hd-heartbeat-dot { background: var(--st-done); }
+.hd-heartbeat-btn[data-state="paused"] .hd-heartbeat-dot { background: var(--st-working); }
+.hd-heartbeat-btn[data-state="pending"] .hd-heartbeat-dot,
+.hd-heartbeat-btn[data-state="loading"] .hd-heartbeat-dot {
+  background: var(--accent);
+  animation: hd-heartbeat-pulse 1s ease-in-out infinite;
+}
+@keyframes hd-heartbeat-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .35; }
+}
+
+/* ---------------------------------------------------------------- panel */
+
+.hd-heartbeat-panel {
+  position: fixed;
+  z-index: 9400;
+  width: min(420px, 92vw);
+  max-height: min(480px, 70vh);
+  overflow-y: auto;
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--st-blocked);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .55);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.45;
+  padding: 10px 12px;
+}
+.hd-heartbeat-panel[data-pending="1"] { border-left-color: var(--accent); }
+.hd-heartbeat-panel[data-supported="false"] { border-left-color: var(--fg-dim); }
+
+.hd-heartbeat-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.hd-heartbeat-title { font-weight: bold; color: var(--fg); }
+.hd-heartbeat-badge {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 1px 7px;
+  color: var(--fg-dim);
+  background: var(--bg-panel2);
+}
+.hd-heartbeat-badge[data-agent="hermes"] { color: var(--st-working); border-color: var(--st-working); }
+.hd-heartbeat-badge[data-agent="pi"] { color: var(--st-unknown); border-color: var(--st-unknown); }
+.hd-heartbeat-pane { color: var(--fg-dim); overflow-wrap: anywhere; }
+.hd-heartbeat-spacer { flex: 1; }
+.hd-heartbeat-icon {
+  background: var(--bg-panel2);
+  border: 1px solid var(--line);
+  color: var(--fg-dim);
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: 11px;
+  padding: 2px 7px;
+  cursor: pointer;
+}
+.hd-heartbeat-icon:hover { color: var(--fg); border-color: var(--accent); }
+.hd-heartbeat-note {
+  color: var(--fg-dim);
+  font-size: 11px;
+  margin: 2px 0 6px;
+  overflow-wrap: anywhere;
+}
+.hd-heartbeat-note[data-kind="warn"] { color: var(--st-working); }
+.hd-heartbeat-state { color: var(--fg); margin: 2px 0 8px; overflow-wrap: anywhere; }
+
+.hd-heartbeat-field {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.hd-heartbeat-field-label {
+  flex: 0 0 58px;
+  color: var(--fg-dim);
+  padding-top: 5px;
+}
+.hd-heartbeat-input,
+.hd-heartbeat-prompt {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--bg-input);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: 12px;
+  padding: 5px 8px;
+}
+.hd-heartbeat-prompt { resize: vertical; min-height: 54px; }
+.hd-heartbeat-input:focus,
+.hd-heartbeat-prompt:focus { outline: none; border-color: var(--accent); }
+.hd-heartbeat-input:disabled,
+.hd-heartbeat-prompt:disabled { opacity: .55; cursor: default; }
+
+.hd-heartbeat-ops {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 4px;
+}
+.hd-heartbeat-action {
+  background: var(--bg-panel2);
+  border: 1px solid var(--line);
+  color: var(--fg);
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: 11.5px;
+  padding: 4px 9px;
+  cursor: pointer;
+}
+.hd-heartbeat-action:hover { border-color: var(--accent); }
+.hd-heartbeat-action:disabled { opacity: .45; cursor: default; }
+.hd-heartbeat-action:disabled:hover { border-color: var(--line); }
+.hd-heartbeat-action.hd-heartbeat-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #06101c;
+  font-weight: bold;
+}
+.hd-heartbeat-action.hd-heartbeat-primary:disabled { opacity: .45; }
+.hd-heartbeat-action:focus-visible,
+.hd-heartbeat-icon:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.hd-heartbeat-status {
+  font-size: 11px;
+  margin-top: 4px;
+  color: var(--fg-dim);
+  overflow-wrap: anywhere;
+}
+.hd-heartbeat-status[data-kind="error"] { color: var(--st-blocked); }
+.hd-heartbeat-status[data-kind="pending"] { color: var(--accent); }
+.hd-heartbeat-status[data-kind="ok"] { color: var(--st-done); }

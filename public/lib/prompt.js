@@ -59,10 +59,14 @@
     '.hd-prompt-icon{background:var(--bg-panel2);border:1px solid var(--line);color:var(--fg-dim);',
     'border-radius:6px;font-family:inherit;font-size:11px;padding:2px 7px;cursor:pointer;}',
     '.hd-prompt-icon:hover{color:var(--fg);border-color:var(--accent);}',
-    '.hd-prompt-q{color:var(--fg);margin:2px 0 8px;white-space:pre-wrap;word-break:break-word;}',
+    '.hd-prompt-q{color:var(--fg);margin:2px 0 8px;white-space:pre-wrap;overflow-wrap:anywhere;}',
     '.hd-prompt-ops{display:flex;flex-direction:column;gap:4px;margin-bottom:8px;}',
+    /* An option is as tall as its own text. Commands, paths and URLs carry runs with no space to
+       break at, and an unwrapped run keeps the row one line high and spills out of the card, so
+       the row wraps anywhere and grows downward instead of sideways. */
     '.hd-prompt-op{text-align:left;background:var(--bg-input);border:1px solid var(--line);color:var(--fg);',
-    'border-radius:6px;font-family:inherit;font-size:12px;padding:5px 8px;cursor:pointer;}',
+    'border-radius:6px;font-family:inherit;font-size:12px;padding:5px 8px;cursor:pointer;',
+    'white-space:normal;overflow-wrap:anywhere;min-width:0;}',
     '.hd-prompt-op:hover{border-color:var(--accent);background:var(--bg-panel2);}',
     '.hd-prompt-n{color:var(--fg-dim);margin-right:6px;}',
     '.hd-prompt-free{display:flex;gap:6px;align-items:center;margin-bottom:6px;}',
@@ -72,8 +76,8 @@
     '.hd-prompt-send{background:var(--accent);border:1px solid var(--accent);color:#06101c;font-weight:bold;',
     'border-radius:6px;font-family:inherit;font-size:12px;padding:5px 10px;cursor:pointer;}',
     '.hd-prompt-send:disabled{opacity:.5;cursor:default;}',
-    '.hd-prompt-hint{color:var(--fg-dim);font-size:11px;margin-top:4px;}',
-    '.hd-prompt-status{font-size:11px;margin-top:6px;color:var(--fg-dim);}',
+    '.hd-prompt-hint{color:var(--fg-dim);font-size:11px;margin-top:4px;overflow-wrap:anywhere;}',
+    '.hd-prompt-status{font-size:11px;margin-top:6px;color:var(--fg-dim);overflow-wrap:anywhere;}',
     '.hd-prompt-status[data-kind="error"]{color:var(--st-blocked);}',
     '.hd-prompt-status[data-kind="sent"]{color:var(--st-done);}'
   ].join('');
@@ -286,7 +290,19 @@
         if (!p || !p.pane_id) continue;
         var isBlocked = p.agent_status === 'blocked';
         var isWatched = watched[p.pane_id] !== undefined && watched[p.pane_id] > now;
-        if (isBlocked || isWatched) { target.push(p.pane_id); targetIds[p.pane_id] = true; }
+        /* a pane that already shows a question stays in the poll set even when its status leaves
+           'blocked': herdr's state rules for an agent can flip to working while a panel still
+           waits (one clarify call can carry several questions), and the detector — not the
+           status — decides when the question is gone */
+        var isAsked = detections.has(p.pane_id);
+        /* hermes draws its clarify panel and keeps waiting while herdr still reports 'working':
+           for that family the row-level interrupt rule wins over the clarification rule, so the
+           status cannot be used to decide whether a question is on screen. Poll hermes panes in
+           'working' as well — the detector decides, and a pane whose read finds no prompt drops
+           out on the next pass. pi/claude working panes stay out: they never hold a panel in that
+           state, and reading them mid-run would only cost a pane.read. */
+        var isHermesWorking = p.agent === 'hermes' && p.agent_status === 'working';
+        if (isBlocked || isWatched || isAsked || isHermesWorking) { target.push(p.pane_id); targetIds[p.pane_id] = true; }
       }
       /* expire stale watches */
       for (var w in watched) { if (Object.prototype.hasOwnProperty.call(watched, w) && watched[w] <= now) delete watched[w]; }
@@ -324,6 +340,9 @@
     function markSent(paneId, action) {
       var d = detections.get(paneId);
       detections.delete(paneId);
+      /* keep reading the pane for a while: a batch clarify shows its next question the moment one
+         is answered, and the pane may not be reported blocked again for it */
+      watch(paneId);
       sent.set(paneId, {
         pane_id: paneId, at: d ? d.at : clock(), sentAt: clock(), seq: d ? d.seq : (++seq),
         status: 'sent', action: action || 'answer', agent: d ? d.agent : null, kind: d ? d.kind : null

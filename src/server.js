@@ -32,6 +32,7 @@ const chatSession = require('./chat/session');   // §9 pane→session binding (
 const attach = require('./attach');              // §10 POST /api/attach (round 7.7)
 const pathsApi = require('./paths');             // §13.2 POST /api/pathinfo, /api/open (round 9)
 const statusView = require('./status');          // §12.3 GET /api/status (round 8)
+const heartbeatApi = require('./heartbeat');     // session heartbeats, hermes + pi (U1)
 const approvals = require('./approvals');        // Claude Code PreToolUse approval bridge
 const promptdetect = require('./promptdetect');   // agent question detection from terminal text
 const paneCacheModule = require('./pane-cache'); // §8 pane/session read caches (W1)
@@ -655,6 +656,69 @@ async function handleQueueGet(req, res, url) {
   });
 }
 
+/* The pane → session mapping for the heartbeat routes. /api/chat (and the views that
+ * build on it) resolve through `liveSessionFor`, because herdr's `agent_session.value`
+ * is a HINT, not the source of truth (DEFECT-17): the pane's own banner/store, the pi
+ * bridge and the dash's switch store are reconciled into the session the UI shows. Use
+ * that same path here, with heartbeat.js's own herdr + pi-bridge resolver as the
+ * fallback for a pane the live scan cannot decide. Returns {agent, sessionId}; an empty
+ * sessionId is a real "cannot locate", never an error. */
+async function heartbeatSessionFor(paneId) {
+  const list = await agentList();
+  const agents = list.agents || [];
+  const entry = agents.find((a) => a && a.pane_id === paneId) || null;
+  const session = entry && entry.agent_session;
+  const agent = String((session && session.agent) || (entry && entry.agent) || '') || null;
+  const herdrSessionId = session && session.value != null ? String(session.value) : '';
+  if (entry) {
+    try {
+      const live = await liveSessionFor(paneId, entry, agent, herdrSessionId, agents, null, null);
+      if (live && live.res && live.res.resolved && live.res.session_id) {
+        return { agent, sessionId: String(live.res.session_id) };
+      }
+    } catch (e) { /* fall through to the module's own resolver */ }
+  }
+  const resolved = await heartbeatApi.resolvePaneSession(paneId);
+  return { agent: resolved.agent || agent, sessionId: resolved.session_id || '' };
+}
+
+/* GET /api/heartbeat?pane_id=<id> — the selected pane's session heartbeat (U1).
+ *
+ * Read-only, both agents: hermes from its own sqlite store (`state_meta` key
+ * `heartbeat:<session_id>`, opened mode=ro), pi from `<pi home>/heartbeat/<id>.json`.
+ * The pane → session mapping is the chat view's own resolution (heartbeatSessionFor),
+ * so the answer matches what the UI shows. A pane whose agent has no heartbeat answers
+ * {supported:false, heartbeat:null, note} rather than an error. */
+async function handleHeartbeatGet(req, res, url) {
+  const paneId = url.searchParams.get('pane_id');
+  if (!paneId) throw { code: 'bad_request', message: '"pane_id" query parameter is required' };
+  const resolved = await heartbeatSessionFor(paneId);
+  return sendJson(res, await heartbeatApi.readHeartbeat({ agent: resolved.agent, sessionId: resolved.sessionId }), 200);
+}
+
+/* POST /api/heartbeat {pane_id, action:"set"|"pause"|"resume"|"clear", interval?, prompt?} (U1).
+ *
+ * hermes is written ONLY by sending its official slash command through the same
+ * `agent.prompt` path /api/pane/prompt uses; pi is written ONLY by an atomic
+ * read-modify-write of its state file. HD_HEARTBEAT_DRY=1 makes both a dry-run that
+ * returns the command/payload without touching a pane or a file. The four actions and
+ * their validation live in src/heartbeat.js; this handler only resolves the pane's
+ * agent+session and forwards the contract body. */
+async function handleHeartbeatPost(req, res, body) {
+  const paneId = requireString(body, 'pane_id');
+  const action = requireString(body, 'action');
+  const resolved = await heartbeatSessionFor(paneId);
+  const result = await heartbeatApi.apply({
+    paneId,
+    agent: resolved.agent,
+    sessionId: resolved.sessionId,
+    action,
+    interval: optionalString(body, 'interval'),
+    prompt: optionalString(body, 'prompt'),
+  });
+  return sendJson(res, result, 200);
+}
+
 /* GET /api/approvals?pane_id=<id> — the selected Claude pane's pending tool calls.
    The first call establishes the SameSite=Strict UI cookie and returns no rows; the page's
    next poll sees them. A cross-origin page cannot read either response. */
@@ -1160,16 +1224,18 @@ async function loadSessionsPayload(paneId) {
      /resume is typed, no selector is opened, and a busy pane can still be listed. Each row is
      one file `candidatesForCwd` proved for this cwd (`/api/chat` uses the same proof), and its
      title is the first user text in a bounded read (basename when there is none).
-     `current` is the sink session (the pane's own bridge) when it has written one, else the
-     binding `/api/chat` resolved. */
+     `current` is the pane's own bridge session — the newest of its turn sink and its control
+     file, the control file being what a pane with no turns yet has — else the binding
+     `/api/chat` resolved. */
   if (info.family === 'pi') {
     const cwd = info.cwd || '';
     if (!cwd) throw { code: 'no_cwd', message: 'herdr reports no cwd for this pi pane, so its sessions cannot be listed' };
     const rows = await chatPi.listSessionsForCwd(cwd);
-    const sink = await chatPi.sinkSessionForPane(paneId);
+    const sink = await chatPi.bridgeSessionForPane(paneId);
     const switched = switchedPanes.get(paneId);
-    /* A newer sink turn means the pane moved on (a manual pi switch or a new session);
-       the recorded dashboard switch is then stale and must not shadow the pane. */
+    /* Newer bridge evidence — a turn in another session, or the control file of one pi
+       just started — means the pane moved on (a manual pi switch or a new session); the
+       recorded dashboard switch is then stale and must not shadow the pane. */
     if (switched && sink && sink.id !== switched.id && sink.mtimeMs > switched.at) {
       switchedPanes.delete(paneId);
       saveSwitchStore();
@@ -1514,6 +1580,9 @@ async function handleModelGet(req, res, url) {
 async function handleModelPost(req, res, body) {
   const paneId = requireString(body, 'pane_id');
   const family = await agentFamilyOf(paneId);
+  /* a switch changes which levels the pane offers, so nothing cached for the old model may
+     answer the next effort read (see the effort section for the cache). */
+  invalidateEffortCache(paneId);
 
   if (family === 'hermes') {
     if (typeof body.model !== 'string' || !body.model.trim()) {
@@ -1632,6 +1701,14 @@ const EFFORT_READ_CACHE_MS = 5 * 60 * 1000;
 const effortReadCache = new Map();       // paneId -> { at, body }
 const effortReadInflight = new Map();    // paneId -> Promise<body>
 const effortReadEpoch = new Map();       // paneId -> generation, bumped by a switch
+
+/* The levels a pane offers belong to its model, so the answer cached for the old model stops
+   describing the pane the moment a model switch is sent. Invalidate rather than rewrite: the
+   next read describes the new model. An aborted switch only costs one extra read. */
+function invalidateEffortCache(paneId) {
+  effortReadCache.delete(paneId);
+  effortReadEpoch.set(paneId, (effortReadEpoch.get(paneId) || 0) + 1);
+}
 
 /* what the pane's own agent is doing. A read that writes a command into a busy pane — or that
    cancels one with esc — can interrupt the turn it is in the middle of, so every write below is
@@ -3064,6 +3141,32 @@ function claimedByOtherPanes(agents, paneId) {
   return claimed;
 }
 
+/** The sessions pi sibling panes own by their OWN bridge evidence.
+ *
+ *  herdr publishes no pi session (§9.3), so `claimedByOtherPanes` alone cannot keep one
+ *  pane's log from being handed to a sibling — and that is how an idle pane at the pi
+ *  welcome screen ended up showing another pane's live conversation (live, 2026-10-20:
+ *  wF:p2/wF:p3 showed wF:p4's session). Both bridge files name their pane, so both are
+ *  claimed here: the turn sink proves the sessions it has RUN a turn in, and the
+ *  control file proves the session it is on right now — including one with no turns
+ *  yet. An id herdr already claims keeps herdr's claim. Never throws. */
+async function piBridgeClaims(agents, paneId, reader) {
+  const claims = {};
+  if (!reader) return claims;
+  for (const a of agents || []) {
+    if (!a || a.pane_id === paneId) continue;
+    if (String((a.agent_session && a.agent_session.agent) || a.agent || '') !== 'pi') continue;
+    for (const read of ['sinkSessionForPane', 'controlSessionForPane']) {
+      if (typeof reader[read] !== 'function') continue;
+      let ev = null;
+      try { ev = await reader[read](a.pane_id); } catch (e) { ev = null; }
+      const id = ev && ev.id ? String(ev.id) : '';
+      if (id && !claims[id]) claims[id] = a.pane_id;
+    }
+  }
+  return claims;
+}
+
 /** §9's resolution, and the fields every reply carries about it. */
 async function liveSessionFor(paneId, entry, agent, herdrSessionId, agents, readerPick, mark) {
   // §11.3: one cold resolution per pane+session, never one per request. The key
@@ -3107,22 +3210,32 @@ async function liveSessionFor(paneId, entry, agent, herdrSessionId, agents, read
 async function resolveLiveSession(paneId, entry, agent, herdrSessionId, agents, readerPick, mark) {
   if (SCAN_DELAY_MS) await new Promise((r) => setTimeout(r, SCAN_DELAY_MS));
   const cwd = typeof entry.cwd === 'string' ? entry.cwd.trim() : '';
+  const reader = fileLogReader(agent);
+  /* A pi pane's own bridge evidence names the session outright — the newest of its turn
+     sink and its control file (the control file is what an idle pane, one that has never
+     run a turn, has instead of a sink). Reading 60 + 200 lines of its TUI on every
+     background refresh is not evidence we need, and a full-viewport read makes pi redraw
+     and scroll; so when the bridge answers, no pane text is read. */
+  let piSink = null;
+  if (agent === 'pi' && reader && typeof reader.bridgeSessionForPane === 'function') {
+    try { piSink = await reader.bridgeSessionForPane(paneId); } catch (e) { piSink = null; }
+  }
+  /* §9.5's "another pane owns it" check, extended to pi: herdr publishes no pi session,
+     so without the sibling panes' own bridge evidence the rank/mtime guesses can hand one
+     pane's log — or the session an idle pane is sitting on — to another pane. */
+  const claimed = claimedByOtherPanes(agents, paneId);
+  if (agent === 'pi' && reader && typeof reader.bridgeSessionForPane === 'function') {
+    const bridgeClaims = await piBridgeClaims(agents, paneId, reader);
+    for (const id of Object.keys(bridgeClaims)) if (!claimed[id]) claimed[id] = bridgeClaims[id];
+  }
   const inp = {
     agent,
     pane_id: paneId,
     herdr_session_id: herdrSessionId || null,
     now: Date.now(),
-    claimed: claimedByOtherPanes(agents, paneId),
+    claimed,
     reader_pick: readerPick,
   };
-  const reader = fileLogReader(agent);
-  /* A pi pane's bridge sink names the session outright. Reading 60 + 200 lines of its
-     TUI on every background refresh is not evidence we need, and a full-viewport read
-     makes pi redraw and scroll; so when the sink answers, no pane text is read. */
-  let piSink = null;
-  if (agent === 'pi' && reader && typeof reader.sinkSessionForPane === 'function') {
-    try { piSink = await reader.sinkSessionForPane(paneId); } catch (e) { piSink = null; }
-  }
   let texts = { visible: null, recent: null, error: null };
   if (!piSink) {
     texts = await paneTexts(paneId);
@@ -3556,10 +3669,12 @@ async function switchedSessionFor(paneId, agent, entry, agents) {
   if (!sw) return null;
   if (sw.agent !== agent) { switchedPanes.delete(paneId); return null; }
   if (Date.now() - sw.at > SWITCHED_TTL_MS) { switchedPanes.delete(paneId); return null; }
-  /* A pi pane that has written a newer turn for a different session has moved on inside
-     pi (a manual /resume or a new session); the dashboard's recorded switch is stale. */
+  /* A pi pane whose own bridge evidence now names a different session has moved on
+     inside pi (a manual /resume or a new session); the dashboard's recorded switch is
+     stale. The control file counts as much as a turn sink here: /new writes one at
+     session start, before the new session has any turn to write. */
   if (agent === 'pi') {
-    const sink = await chatPi.sinkSessionForPane(paneId);
+    const sink = await chatPi.bridgeSessionForPane(paneId);
     if (sink && sink.id !== sw.id && sink.mtimeMs > sw.at) {
       switchedPanes.delete(paneId);
       saveSwitchStore();
@@ -4249,6 +4364,7 @@ async function handle(req, res) {
     if (pathname === '/api/status') return handleStatus(req, res, url); // §12.3
     if (pathname === '/api/prompt') return handlePromptDetect(req, res, url);
     if (pathname === '/api/queue') return handleQueueGet(req, res, url);   // native queue endpoint
+    if (pathname === '/api/heartbeat') return handleHeartbeatGet(req, res, url);   // session heartbeat (U1)
     if (pathname === '/api/approvals') return handleApprovalsGet(req, res, url);
     if (pathname === '/api/model') return handleModelGet(req, res, url);
     if (pathname === '/api/sessions') return handleSessionsGet(req, res, url);
@@ -4294,6 +4410,7 @@ async function handle(req, res) {
       '/api/cli': handleCli,
       '/api/fanout': handleFanout,
       '/api/keys-broadcast': handleKeysBroadcast,
+      '/api/heartbeat': handleHeartbeatPost,
     };
     const handler = handlers[pathname];
     if (!handler) return notFound(res, `no route for ${method} ${pathname}`);

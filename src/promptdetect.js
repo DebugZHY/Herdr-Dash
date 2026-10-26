@@ -133,6 +133,82 @@ function detectClaude(lines) {
   };
 }
 
+/* ── hermes' clarify panel ──────────────────────────────────────────────────
+   A bordered box titled "Hermes needs your input": one status row per question (✓ answered,
+   ▸ active, · pending) and, under the active one, its numbered choices plus "Other (type your
+   answer)" — a multi-question clarify keeps every question in this one box, answering one
+   advances the ▸ mark to the next. The box is drawn at the top of the pane while the input hint
+   stays at the bottom, so the blank rows between them can run to dozens and the tail walk used
+   for claude never reaches across them. The panel is therefore parsed from its own title, and
+   the wrapped continuation rows are folded back into the option they belong to so the label is
+   complete rather than cut at the panel's width. */
+const HERMES_PANEL_TITLE = /^[╭┌][─━\s]*Hermes needs your input/i;
+const HERMES_PANEL_STATUS = /^([✓▸·>])\s+(\S.*)$/;
+/* A panel choice: an optional cursor, the number, and a label that may be empty — hermes wraps a
+   choice whose first token carries no space (a path) onto the rows below, which leaves the first
+   row as "1." alone. The dot must be followed by a space or the end of the row, so a wrapped
+   continuation that starts with "1.5" or "20261021/" is not mistaken for a choice. */
+function panelChoice(line) {
+  const m = /^\s*[❯›>]?\s*(\d{1,2})[.)](?:\s+(.*?))?\s*$/.exec(line);
+  if (!m) return null;
+  return { n: Number(m[1]), label: (m[2] || '').trim() };
+}
+
+function detectHermesPanel(lines) {
+  let headIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (HERMES_PANEL_TITLE.test(inner(lines[i]).trim())) { headIdx = i; break; }
+  }
+  if (headIdx < 0) return null;
+
+  const options = [];
+  let question = '';
+  let meta = null;
+  let last = null;                       // the option/meta item a continuation row belongs to
+  let inActive = true;                   // rows before any status row: a single-question panel
+  const stop = Math.min(lines.length, headIdx + 40);
+  for (let i = headIdx + 1; i < stop; i++) {
+    /* a panel inside a nested layout can be indented: strip the offset so the box border and the
+       cursor column still read at the start of the row */
+    const raw = String(lines[i]).replace(/^\s+(?=[│┃|])/, '');
+    const t = inner(raw).trim();
+    if (/^[╰└]/.test(t)) break;                          // the panel's bottom border ends the box
+    if (!t) continue;                                    // blank rows inside the box
+    const st = HERMES_PANEL_STATUS.exec(t);
+    if (st) {
+      inActive = st[1] === '▸' || st[1] === '>';
+      if (inActive) question = st[2].trim();
+      last = null;
+      continue;
+    }
+    if (!inActive) continue;                             // a choice or answer of another question
+    const it = panelChoice(t);
+    if (it) {
+      /* the meta check reads the raw label: cleanLabel's "…(type your answer)" strip would hide it */
+      const entry = { n: it.n, label: cleanLabel(it.label) };
+      if (isMetaOption(it.label)) { if (!meta) { meta = entry; last = meta; } }
+      else { options.push(entry); last = options[options.length - 1]; }
+      continue;
+    }
+    /* an unmarked row: the question of a single-question panel, the wrapped rest of it, or the
+       wrapped rest of the item above — re-cleaned, since a "(Recommended)" marker can land on the
+       wrapped part of a label */
+    if (!question) { question = t; continue; }
+    if (last) last.label = cleanLabel((last.label + ' ' + t).trim());
+    else if (!options.length) question += ' ' + t;
+  }
+  if (!options.length && !meta) return null;             // nothing answerable inside the box
+  return {
+    kind: 'hermes_clarify',
+    question: question || 'the agent asked a question',
+    options: options,
+    free_text: !!meta,
+    free_text_n: meta ? meta.n : null,
+    answer_hint: 'send-keys down to the choice then enter (the panel is arrow-driven); the "Other" item opens a text box',
+    raw: lines.slice(headIdx, stop),
+  };
+}
+
 function detectPiPicker(lines) {
   const tailStart = Math.max(0, lines.length - 14);
   const items = [];
@@ -328,7 +404,7 @@ function detectYn(lines) {
 function detect(text) {
   if (!text || typeof text !== 'string') return null;
   const lines = text.replace(/\r/g, '').split('\n');
-  return detectClaude(lines) || detectPiModel(lines) || detectPiPicker(lines) || detectYn(lines);
+  return detectHermesPanel(lines) || detectClaude(lines) || detectPiModel(lines) || detectPiPicker(lines) || detectYn(lines);
 }
 
 module.exports = { detect, detectClaudeResume, detectPiResume, _inner: inner, _numbered: numbered };

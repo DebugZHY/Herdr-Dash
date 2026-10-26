@@ -571,6 +571,11 @@ function renderHeader() {
   if (typeof window.__hdUpdateModelSel === 'function') window.__hdUpdateModelSel();
   if (typeof window.__hdUpdateEffortSel === 'function') window.__hdUpdateEffortSel();
   if (typeof window.__hdSessionFollowSelection === 'function') window.__hdSessionFollowSelection();
+  /* HB-U2: the heartbeat control follows the selected pane the same way, but its read is a GET
+     that belongs to the module — a failed call is described inside the control, never thrown */
+  if (typeof window.__hdHeartbeatFollowSelection === 'function') {
+    try { window.__hdHeartbeatFollowSelection(); } catch (e) { /* the heartbeat control is additive */ }
+  }
   /* the queue controls follow the selected pane's agent and status; a broken queue read
      must never break the header */
   try { updateQueueControls(); } catch (e) { /* the queue UI is additive */ }
@@ -3408,6 +3413,9 @@ function init() {
       else { toast('model → ' + (body.label || ('option ' + n)), 'ok'); }
     }
     refreshModelList(paneId, agent, true);            // refetch so the current row is accurate
+    /* each model carries its own set of levels, so the effort droplist is re-read as well:
+       without this it keeps offering the levels of the model the pane just left. */
+    refreshEffortList(paneId, agent, true);
   }
 
   /* the think-effort droplist: the same shape as the model one — it shows the selected pane's
@@ -3660,6 +3668,11 @@ function init() {
   window.setInterval(refreshSnapshot, SNAPSHOT_MS);
   window.setInterval(pollPane, POLL_MS);
   mountModules();     // after the ctx exists and the shell is wired
+  /* HB-U2 — the heartbeat control registers like every lib module and mounts in the loop above;
+     this explicit call is the additive mount this unit owns (a no-op once mounted). */
+  try {
+    if (HD.modules.heartbeat && typeof HD.modules.heartbeat.mount === 'function') HD.modules.heartbeat.mount(ctx);
+  } catch (e) { /* the heartbeat control is additive */ }
 
   /* The terminal-first view. The engine is created after the
      modules mount (it reads chatview's handle); `t`, the chip and visibility share the
