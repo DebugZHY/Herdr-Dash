@@ -847,14 +847,59 @@ async function handleText(req, res, body) {
 /* Read a pane's visible terminal and detect a pending question on it. Used by both
  * the GET below and every answer path, so a reply is always decided from the pane's
  * OWN current pixels rather than from a client's memory of an earlier poll. */
-async function readPanePrompt(paneId) {
+async function readPanePrompt(paneId, depth) {
+  const deep = depth === 'deep';
   const read = await hdr.request(
     'pane.read',
-    { pane_id: paneId, source: 'visible', lines: 60, format: 'text', strip_ansi: true },
+    {
+      pane_id: paneId,
+      source: deep ? 'recent_unwrapped' : 'visible',
+      lines: deep ? 400 : 60,
+      format: 'text',
+      strip_ansi: true,
+    },
     { timeoutMs: DEFAULT_TIMEOUT_MS },
   );
   const text = (read && read.read && read.read.text) || (read && read.text) || '';
-  return { text, prompt: promptdetect.detect(text) || null };
+  const hit = promptdetect.detect(text) || null;
+  /* A scrollback read holds answered panels too. Only the box's own footer sitting in the
+     last rows proves the panel is the thing on screen right now; a non-clarify detection
+     from 400 rows back is an old picker, not a question. */
+  let prompt = hit;
+  if (deep) {
+    prompt = hit && hit.kind === 'hermes_clarify' && clarifyFooterInTail(text) ? hit : null;
+  }
+  return { text, prompt };
+}
+
+/** The clarify panel's footer, drawn directly under the box. `type your answer and press
+ *  Enter` is the footer while the "Other" text box is open, so both states count. */
+function clarifyFooterInTail(text) {
+  const tail = String(text || '').replace(/\r/g, '').split('\n').slice(-14).join('\n');
+  return /to select,?\s*Enter to lock|Enter to lock|type your answer and press Enter/i.test(tail);
+}
+
+/** herdr's own status for a pane ('blocked' while a question waits, null when unknown). */
+async function paneStatus(paneId) {
+  try {
+    const list = await hdr.request('agent.list', {}, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    const agents = (list && (list.agents || (list.result && list.result.agents))) || [];
+    for (let i = 0; i < agents.length; i++) {
+      if (agents[i] && agents[i].pane_id === paneId) return agents[i].agent_status || null;
+    }
+  } catch (e) { /* a missing status never blocks detection */ }
+  return null;
+}
+
+/* A clarify panel taller than the pane's viewport scrolls its title row out of the visible
+ * screen, so a visible-only read shows the box's lower half with nothing to anchor on and
+ * the card never appears. herdr reports such a pane as blocked: that, and only that, is the
+ * cue to re-read the scrollback (where the whole box still is) and parse it there. */
+async function readPaneQuestion(paneId) {
+  const seen = await readPanePrompt(paneId);
+  if (seen.prompt) return seen;
+  if ((await paneStatus(paneId)) !== 'blocked') return seen;
+  return readPanePrompt(paneId, 'deep');
 }
 
 /** The last few pane rows, for an error that shows WHAT was on screen instead of only a code. */
@@ -895,16 +940,8 @@ async function handlePromptDetect(req, res, url) {
     throw { code: 'pane_not_found', message: `pane "${paneId}" is not in herdr's current snapshot — its question is gone` };
   }
 
-  let status = null;
-  try {
-    const list = await hdr.request('agent.list', {}, { timeoutMs: DEFAULT_TIMEOUT_MS });
-    const agents = (list && (list.agents || (list.result && list.result.agents))) || [];
-    for (let i = 0; i < agents.length; i++) {
-      if (agents[i] && agents[i].pane_id === paneId) { status = agents[i].agent_status || null; break; }
-    }
-  } catch (e) { /* a missing status never blocks detection */ }
-
-  const seen = await readPanePrompt(paneId);
+  const status = await paneStatus(paneId);
+  const seen = await readPaneQuestion(paneId);
   ok(res, { pane_id: paneId, agent_status: status, prompt: seen.prompt });
 }
 
@@ -1062,7 +1099,7 @@ async function waitForBox(paneId, want, ms) {
   let text = '';
   let box = null;
   for (;;) {
-    const seen = await readPanePrompt(paneId);
+    const seen = await readPaneQuestion(paneId);
     text = seen.text;
     box = clarifyBox(text);
     if (want(box, text)) return { ok: true, text, box };
@@ -1079,7 +1116,7 @@ async function waitForClarifyMove(paneId, question) {
   let confirmedAt = 0;
   let last = '';
   while (Date.now() < deadline) {
-    const seen = await readPanePrompt(paneId);
+    const seen = await readPaneQuestion(paneId);
     last = seen.text;
     const p = seen.prompt;
     const moved = !p || p.kind !== 'hermes_clarify' || p.question !== question;
@@ -1256,7 +1293,7 @@ async function handlePromptAnswer(req, res, body) {
     /* The panel is re-read and re-detected here, never taken from the request: the
        card is a memory of an earlier poll, and a keystroke sent into a panel that is
        no longer there lands in the agent's main input instead. */
-    const seen = await readPanePrompt(paneId);
+    const seen = await readPaneQuestion(paneId);
     if (!seen.prompt) {
       throw { code: 'no_panel', message: 'no question is on this pane right now — nothing was sent', extra: { pane_id: paneId, pane_excerpt: paneTail(seen.text) } };
     }

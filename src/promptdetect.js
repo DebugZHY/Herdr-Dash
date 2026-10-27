@@ -143,7 +143,12 @@ function detectClaude(lines) {
    the wrapped continuation rows are folded back into the option they belong to so the label is
    complete rather than cut at the panel's width. */
 const HERMES_PANEL_TITLE = /^[╭┌][─━\s]*Hermes needs your input/i;
-const HERMES_PANEL_STATUS = /^([✓▸·>])\s+(\S.*)$/;
+/* A status row: the marker (answered / active / pending), then the question text — which the
+   multi-question panel puts on the rows BELOW the marker instead of beside it, leaving the
+   marker alone on its row. */
+const HERMES_PANEL_STATUS = /^([✓▸·>])\s*(.*)$/;
+/* The panel's own header row ("5 questions") names the count, not a question. */
+const HERMES_PANEL_COUNT = /^\d+\s+questions?$/i;
 /* A panel choice: an optional cursor, the number, and a label that may be empty — hermes wraps a
    choice whose first token carries no space (a path) onto the rows below, which leaves the first
    row as "1." alone. The dot must be followed by a space or the end of the row, so a wrapped
@@ -174,13 +179,14 @@ function detectHermesPanel(lines) {
     const t = inner(raw).trim();
     if (/^[╰└]/.test(t)) break;                          // the panel's bottom border ends the box
     if (!t) continue;                                    // blank rows inside the box
-    const st = HERMES_PANEL_STATUS.exec(t);
-    if (st) {
-      inActive = st[1] === '▸' || st[1] === '>';
-      if (inActive) question = st[2].trim();
-      last = null;
-      continue;
-    }
+    if (HERMES_PANEL_COUNT.test(t)) continue;            // "5 questions" — the count, not a question
+        const st = HERMES_PANEL_STATUS.exec(t);
+        if (st) {
+          inActive = st[1] === '▸' || st[1] === '>';
+          if (inActive) question = st[2].trim();             // '' when the marker stands on its own row
+          last = null;
+          continue;
+        }
     if (!inActive) continue;                             // a choice or answer of another question
     const it = panelChoice(t);
     if (it) {
