@@ -155,6 +155,8 @@
     var pollTimer = null;
     var busy = false;
     var seq = 0;
+    var rendering = false;             // a render pass is running
+    var renderQueued = false;          // a nested render waits for the running pass
     var detections = new Map();   // pane_id -> active detection (ready or read-error)
     var sent = new Map();         // pane_id -> the 1.5 s 'sent' ghost for an answered pane
     var sentTimers = {};
@@ -596,8 +598,31 @@
       return card;
     }
 
+    /* the pane id of the card that contains `node`, or null when the node is not inside a card */
+    function cardPaneOf(node) {
+      while (node && node !== root) {
+        if (node.getAttribute && node.getAttribute('data-pane') !== null) return node.getAttribute('data-pane');
+        node = node.parentNode;
+      }
+      return null;
+    }
+
     function render() {
       if (unmounted || !container) return;
+      if (rendering) {                   // a blur handler re-entering while a pass is running
+        renderQueued = true;             // let the running pass finish, then render once more
+        return;
+      }
+      rendering = true;
+      try {
+        renderPass();
+      } finally {
+        rendering = false;
+      }
+      if (renderQueued) { renderQueued = false; render(); }
+    }
+
+    function renderPass() {
       var cards = [];
       detections.forEach(function (d) { cards.push(d); });
       sent.forEach(function (s) { cards.push(s); });
@@ -612,20 +637,68 @@
         root.setAttribute('role', 'region');
         root.setAttribute('aria-label', 'pending agent questions');
       }
-      /* IME safety: while the reader is typing into any answer input — above all mid-
-         composition (a Chinese IME holds the text in a composition session that tearing the
-         input out of the DOM would silently drop) — do NOT rebuild the stack. The next render
-         after the input blurs catches the stack up. This replaces an earlier save/restore of
-         the draft text, which kept the value but still killed the composition. */
+      /* IME safety, per card: the card whose answer input is focused keeps its exact DOM node and
+         is left in place — removing it would fire blur and end the composition, and rebuilding it
+         would drop the typed text. Every other card is rebuilt around it, so a new question or a
+         sending/error line still shows up while the reader types; the kept card's data-first flag
+         follows its new place in the stack. */
       var active = document.activeElement;
-      if (root && active && active.classList && active.classList.contains('hd-prompt-input')) {
-        return;
+      var frozen = (active && active.classList && active.classList.contains('hd-prompt-input'))
+        ? cardPaneOf(active)
+        : null;
+      var keep = null;
+      if (frozen !== null && root.children) {
+        for (var k = 0; k < root.children.length; k++) {
+          var child = root.children[k];
+          if (child && child.classList && child.classList.contains('hd-prompt-card') &&
+              child.getAttribute('data-pane') === frozen) {
+            keep = child;
+            break;
+          }
+        }
       }
-      clear(root);
+      if (keep && keep.parentNode !== root) keep = null;   // stale reference: rebuild it
+      if (keep) {
+        var stillPending = false;
+        for (var f = 0; f < cards.length; f++) {
+          if (txt(cards[f].pane_id) === frozen) { stillPending = true; break; }
+        }
+        if (!stillPending) keep = null;                    // its question is gone: drop the card
+      }
+      if (keep) {
+        /* take out every other child; the kept card itself is never removed */
+        var kids = [];
+        for (var c = 0; c < root.children.length; c++) kids.push(root.children[c]);
+        for (var c2 = 0; c2 < kids.length; c2++) if (kids[c2] !== keep) root.removeChild(kids[c2]);
+      } else {
+        clear(root);
+      }
+      var reused = false;
+      var placed = {};
+      var frozenAt = -1;
+      var nodes = [];
       for (var i = 0; i < cards.length; i++) {
-        var card = buildCard(cards[i]);
-        if (i === 0) card.setAttribute('data-first', '1');
-        root.appendChild(card);
+        var d = cards[i];
+        var id = txt(d.pane_id);
+        if (Object.prototype.hasOwnProperty.call(placed, id)) continue;   // a pane never gets two cards
+        placed[id] = true;
+        var card;
+        if (!reused && keep && id === frozen) {
+          card = keep;                                  // the focused input keeps its DOM (and IME)
+          reused = true;
+          frozenAt = nodes.length;
+        } else {
+          card = buildCard(d);
+        }
+        nodes.push(card);
+      }
+      for (var j = 0; j < nodes.length; j++) {
+        var node = nodes[j];
+        if (j === 0) node.setAttribute('data-first', '1');
+        else node.removeAttribute('data-first');
+        if (node === keep) continue;                    // already in place, and never moved
+        if (keep && j < frozenAt) root.insertBefore(node, keep);
+        else root.appendChild(node);
       }
       if (!root.parentNode) container.appendChild(root);
     }
