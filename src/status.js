@@ -47,7 +47,9 @@ const fsp = require('node:fs/promises');
 const ELISION = '…';        // …  the only elision marker (U+2026)
 const STATUS_MARK = '☤';    // ☤  the hermes status line
 const CACHE_MARK = '◎';     // ◎  the cache-hit figure
-const CLOCK_MARK = '◷';     // ◷  the elapsed figure
+/* hermes has drawn the elapsed figure with more than one clock glyph (◷ in one footer layout,
+   ⏲ in another); testing a single glyph rejects the whole line on the other layout. */
+const CLOCK_MARKS = ['◷', '⏲', '⏱'];
 const TITLE_SEP = '─';      // ─  the `─ <title>` separator
 const PROC_MARK = '⚙';      // ⚙  one background process
 const BAR = '·';            // ·  the agent's own field separator
@@ -80,7 +82,8 @@ function parseCount(raw) {
 
 /** `~173K/1M` → {used, limit}; null when the segment is not a used/limit pair. */
 function parseCountPair(seg) {
-  const m = /^(~?\s*[0-9]+(?:\.[0-9]+)?\s*[KMG]?)\s*\/\s*(~?\s*[0-9]+(?:\.[0-9]+)?\s*[KMG]?)$/i
+  /* a trailing label word is hermes' own ("134K/1M pinned"); it names the figure, not a value */
+  const m = /^(~?\s*[0-9]+(?:\.[0-9]+)?\s*[KMG]?)\s*\/\s*(~?\s*[0-9]+(?:\.[0-9]+)?\s*[KMG]?)(?:\s+[A-Za-z][A-Za-z-]*)?$/i
     .exec(String(seg || '').trim());
   if (!m) return null;
   const used = parseCount(m[1]);
@@ -115,20 +118,45 @@ function pctOf(seg) {
  * all; if none does, the answer is `status:null`, never a field invented from a
  * line that prints no number.
  */
+/**
+ * Split a status line's fields. The two layouts hermes draws separate fields with │ and with ·,
+ * so both are separators here; a name or figure keeps its place under either layout.
+ */
+function statusFields(head) {
+  return String(head).split(new RegExp(`[${PIPE}${BAR}]`)).map((s) => s.trim()).filter(Boolean);
+}
+
+/** the glyph a segment uses for its elapsed figure, if any (the layouts differ, see CLOCK_MARKS) */
+function clockMarkIn(seg) {
+  return CLOCK_MARKS.find((g) => String(seg).includes(g)) || null;
+}
+
 function statusShape(line) {
   const head = String(line).split(new RegExp(`\\s*${TITLE_SEP}\\s*`))[0];
-  for (const seg of head.split(PIPE).map((s) => s.trim()).filter(Boolean)) {
+  for (const seg of statusFields(head)) {
     if (seg.includes(CACHE_MARK)) {
       const p = pctOf(seg.slice(seg.indexOf(CACHE_MARK) + CACHE_MARK.length));
       if (p) return 'cache';
     }
-    if (seg.includes(CLOCK_MARK)) {
-      if (/([0-9]+(?:\.[0-9]+)?)\s*s/i.test(seg.slice(seg.indexOf(CLOCK_MARK)))) return 'elapsed';
+    const clock = clockMarkIn(seg);
+    if (clock) {
+      if (/([0-9]+(?:\.[0-9]+)?)\s*s/i.test(seg.slice(seg.indexOf(clock) + clock.length))) return 'elapsed';
     }
     const pair = parseCountPair(seg);
     if (pair && pair.used) return 'pair';
+    /* a bar that prints its own percentage (`[███ 42%]`) is a figure too: providers that report
+       no token counts still draw that bar, and without this the whole line is rejected */
+    if (usedPctShape(seg)) return 'pct';
   }
   return null;
+}
+
+/** a standalone percentage in a segment — bare (`42%`) or drawn inside the bar (`[██░] ~13%`) */
+function usedPctShape(seg) {
+  const t = String(seg || '').trim();
+  if (!/[0-9]\s*%/.test(t)) return false;
+  /* everything else must be bar, bracket, percent or whitespace: a sentence or a hint never passes */
+  return t.replace(/[\[\]░▒▓█▉▊▋▌▍▎▏|~%0-9.\s]/g, '') === '';
 }
 
 /**
@@ -160,7 +188,7 @@ function parseHermesStatus(text, textError) {
     absent.status = text == null
       ? `the pane could not be read${textError ? ` (${textError})` : ''}, so there is no status line to interpret`
       : candidates > 0
-        ? `${candidates} ${STATUS_MARK} line(s) in the pane's visible text, but none carries usage figures ("<used>/<limit>", ${CACHE_MARK} or ${CLOCK_MARK}) — ${rejected} of them carry the mark alone (hermes' footer hint and its message-box title do), and the mark on its own is not a status line`
+        ? `${candidates} ${STATUS_MARK} line(s) in the pane's visible text, but none carries usage figures ("<used>/<limit>", ${CACHE_MARK} or a clock glyph) — ${rejected} of them carry the mark alone (hermes' footer hint and its message-box title do), and the mark on its own is not a status line`
         : `no ${STATUS_MARK} status line in the pane's visible text (${lines.length} line(s) read)`;
     return { status: null, absent };
   }
@@ -168,7 +196,7 @@ function parseHermesStatus(text, textError) {
   const sourceLine = line.trim();
   const head = sourceLine.split(new RegExp(`\\s*${TITLE_SEP}\\s*`))[0].trim();
   const elided = head.includes(ELISION);
-  const segs = head.split(PIPE).map((s) => s.trim()).filter(Boolean);
+  const segs = statusFields(head);
 
   let model = null;
   let pair = null;
@@ -187,11 +215,12 @@ function parseHermesStatus(text, textError) {
       if (p) cachePct = p.value;
       continue;
     }
-    if (seg.includes(CLOCK_MARK) && elapsed === null) {
-      const m = /([0-9]+(?:\.[0-9]+)?)\s*s/i.exec(seg.slice(seg.indexOf(CLOCK_MARK)));
-      if (m) elapsed = Number(m[1]);
-      continue;
-    }
+    const clock = clockMarkIn(seg);
+        if (clock && elapsed === null) {
+          const m = /([0-9]+(?:\.[0-9]+)?)\s*s/i.exec(seg.slice(seg.indexOf(clock) + clock.length));
+          if (m) elapsed = Number(m[1]);
+          continue;
+        }
     if (pair === null) {
       const p = parseCountPair(seg);
       if (p) { pair = p; continue; }
@@ -222,7 +251,7 @@ function parseHermesStatus(text, textError) {
   }
   if (pctValue === null) absent['status.used_pct'] = 'the status line carries no percentage';
   if (cachePct === null) absent['status.cache_pct'] = `the status line carries no "${CACHE_MARK} <n>%" cache figure`;
-  if (elapsed === null) absent['status.elapsed_s'] = `the status line carries no "${CLOCK_MARK} <n>s" elapsed figure`;
+  if (elapsed === null) absent['status.elapsed_s'] = `the status line carries no "${CLOCK_MARKS.join('/')} <n>s" elapsed figure`;
 
   const complete = model !== null && usedTokens !== null && limitTokens !== null
     && pctValue !== null && cachePct !== null && elapsed !== null;

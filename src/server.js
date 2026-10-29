@@ -1920,13 +1920,21 @@ async function handleModelGet(req, res, url) {
     const cat = await hermesModelCatalogue();
     const policy = chatHermes.sessionPolicy(chatHermes.dbPath(), info.sessionId);
     const footer = await hermesCurrentModel(paneId);
-    const cur = policy.model || footer || null;
-    const currentSource = policy.model ? 'state.db' : (footer ? 'footer' : null);
-    let curProvider = policy.provider ? policy.provider.replace(/^custom:/, '') : null;
-    let providerSource = curProvider ? 'state.db' : null;
-    if (!curProvider && cur) {
+    /* The pane's own status line is the model the session is running right now. The state.db row
+       is the durable policy, and it keeps the value of a switch made inside the pane that never
+       wrote back (measured: a pane on "k3.1-pro" whose row still said "kimi-k3"). So the live
+       line wins, and a disagreement is reported in the note rather than resolved silently. */
+    const cur = footer || policy.model || null;
+    const currentSource = footer ? 'footer' : (policy.model ? 'state.db' : null);
+    let curProvider = null;
+    let providerSource = null;
+    if (cur) {
       const row = cat.models.find((m) => m.model === cur);
       if (row) { curProvider = row.provider; providerSource = 'model list'; }
+      else if (policy.model === cur && policy.provider) {
+        curProvider = policy.provider.replace(/^custom:/, '');
+        providerSource = 'state.db';
+      }
     }
     const providerListed = !curProvider || cat.providers.indexOf(curProvider) >= 0;
     let marked = false;
@@ -1937,6 +1945,9 @@ async function handleModelGet(req, res, url) {
     });
     const notes = [];
     if (cat.note) notes.push(cat.note);
+    if (policy.model && footer && policy.model !== footer) {
+      notes.push('state.db records "' + policy.model + '" but the pane reports "' + footer + '" — showing the value from the pane status line');
+    }
     if (!cur) notes.push('no model is recorded for this session yet (state.db has no row and the footer names none)');
     if (cur && !marked) {
       notes.push(curProvider && !providerListed
@@ -1945,6 +1956,7 @@ async function handleModelGet(req, res, url) {
     }
     return ok(res, {
       pane_id: paneId, agent: 'hermes', current: cur, provider: curProvider,
+      policy_model: policy.model || null,
       source: cat.source, current_source: currentSource, provider_source: providerSource,
       providers: cat.providers, provider_listed: providerListed,
       models: rows,
