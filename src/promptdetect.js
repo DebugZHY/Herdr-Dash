@@ -407,10 +407,80 @@ function detectYn(lines) {
   return null;
 }
 
+/* ── hermes' own confirm modal ──────────────────────────────────────────────
+   The /model guard ("Large Context Switch Warning"), /reset and the billing confirms all render
+   through one modal: a box whose title row reads "!!! <title> !!!", the wrapped detail under it,
+   then bracketed choices "❯ [1] Switch anyway — …" / "  [2] Cancel — …". Its digits are SUBMIT
+   keys (one keystroke answers; arrows + Enter also work) and the modal abandons itself after
+   120 s, so a dashboard that never sees it leaves the pane sitting on an unanswered question. */
+const CONFIRM_TITLE = /^!!!\s*(.+?)\s*!!!$/;
+const CONFIRM_CHOICE = /^[❯›>]?\s*\[(\d{1,2})\]\s+(.+)$/;
+
+function detectHermesConfirm(lines) {
+  /* the choices are the anchor: walk up from the last one while rows still parse, then require a
+     "!!!" title above them — a box that merely numbers rows is not this modal */
+  const rows = [];
+  let firstIdx = -1;
+  for (let i = lines.length - 1; i >= Math.max(0, lines.length - 45); i--) {
+    const t = inner(lines[i]).trim();
+    if (!t) continue;
+    const m = CONFIRM_CHOICE.exec(t);
+    if (m) {
+      rows.unshift({ idx: i, n: Number(m[1]), label: m[2].trim(), hl: /^[❯›>]/.test(t) });
+      firstIdx = i;
+      continue;
+    }
+    if (rows.length && isRule(lines[i])) break;                  // the box's bottom edge
+  }
+  if (rows.length < 2 || firstIdx < 0) return null;
+
+  /* The title is the TOPMOST "!!!" row: the detail opens with its own "!!!" header, and the box
+     may draw the title inside its top border ("╭─ !!! … !!! ─╮") or on a body row — both are read
+     the same way, last match going up wins, and a border row ends the walk. */
+  let titleIdx = -1;
+  let title = '';
+  for (let i = firstIdx - 1; i >= Math.max(0, firstIdx - 45); i--) {
+    const t = inner(lines[i]).trim();
+    const m = /!!!\s*(.+?)\s*!!!/.exec(t);
+    if (m) { titleIdx = i; title = m[1]; }
+    if (isRule(lines[i]) || /^[╭┌╰└]/.test(t)) break;
+  }
+  if (titleIdx < 0) return null;
+
+  /* the wrapped detail between the title and the choices IS the question: it names the model, the
+     measured context, and what the switch costs — without it the two choices mean nothing */
+  const detail = [];
+  for (let i = titleIdx + 1; i < firstIdx; i++) {
+    const t = inner(lines[i]).trim().replace(CONFIRM_TITLE, '$1');
+    if (t) detail.push(t);
+  }
+    /* a choice label can wrap onto the rows under it (the modal wraps at its box width); a wrapped
+     row follows ITS OWN choice with no blank between, while the footer is preceded by one */
+  rows.forEach((row, k) => {
+    for (let j = row.idx + 1; j < lines.length; j++) {
+      if (k + 1 < rows.length && j >= rows[k + 1].idx) break;
+      const t = inner(lines[j]).trim();
+      if (!t || isRule(lines[j]) || CONFIRM_CHOICE.test(t) || CONFIRM_TITLE.test(t)) break;
+      if (/^[╭╰╮╯]/.test(t)) break;
+      row.label = (row.label + ' ' + t).trim();
+    }
+  });
+  const hl = rows.find((r) => r.hl);
+  return {
+    kind: 'hermes_confirm',
+    question: [title].concat(detail.length ? ['', detail.join(' ')] : []).join('\n'),
+    options: rows.map((r) => ({ n: r.n, label: r.label })),
+    free_text: false,
+    highlight_n: hl ? hl.n : null,
+    answer_hint: 'one keystroke answers: the option number is a submit key (esc cancels)',
+    raw: lines.slice(Math.max(0, titleIdx - 1), Math.min(lines.length, firstIdx + rows.length + 2)),
+  };
+}
+
 function detect(text) {
   if (!text || typeof text !== 'string') return null;
   const lines = text.replace(/\r/g, '').split('\n');
-  return detectHermesPanel(lines) || detectClaude(lines) || detectPiModel(lines) || detectPiPicker(lines) || detectYn(lines);
+  return detectHermesConfirm(lines) || detectHermesPanel(lines) || detectClaude(lines) || detectPiModel(lines) || detectPiPicker(lines) || detectYn(lines);
 }
 
 module.exports = { detect, detectClaudeResume, detectPiResume, _inner: inner, _numbered: numbered };

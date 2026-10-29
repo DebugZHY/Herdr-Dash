@@ -1264,6 +1264,32 @@ async function answerClarifyPanel(res, paneId, panel, body, beforeText) {
   });
 }
 
+/* hermes' confirm modal takes the option number as ONE submit keystroke — no arrow walk. The
+   modal is re-read afterwards so a modal that already timed out is reported instead of leaving a
+   keystroke in the agent's input box. */
+async function answerConfirmModal(res, paneId, panel, body, beforeText) {
+  const answer = String(body.answer || '').trim();
+  if (body.question != null && String(body.question) !== panel.question) {
+    throw fail('confirm_stale', 'the modal now shows "' + panel.question + '", not "' + String(body.question) + '" — nothing was sent', beforeText);
+  }
+  const option = panel.options.find((o) => String(o.n) === answer);
+  if (!option) {
+    const labels = panel.options.map((o) => o.n + '. ' + o.label).join('  ') || 'none';
+    throw fail('confirm_option_not_found', '"' + answer + '" is not one of this modal\'s choices (' + labels + ') — nothing was sent', beforeText);
+  }
+  await hdr.request('pane.send_text', { pane_id: paneId, text: String(option.n) }, { timeoutMs: DEFAULT_TIMEOUT_MS });
+  let after = { prompt: panel, text: beforeText };
+  for (let i = 0; i < 12; i++) {
+    await sleep(250);
+    after = await readPaneQuestion(paneId);
+    if (!after.prompt || after.prompt.kind !== 'hermes_confirm') break;
+  }
+  if (after.prompt && after.prompt.kind === 'hermes_confirm') {
+    throw fail('confirm_verify_failed', 'the modal did not take option ' + option.n + ' ("' + option.label + '") — it is still on screen', after.text);
+  }
+  return ok(res, { pane_id: paneId, sent: 'confirm-option', option: option.n, label: option.label, panel_gone: true });
+}
+
 /* Answer a pending question. POST /api/prompt/answer
  * { pane_id, answer } — a digit for a numbered option, free text otherwise. On a
  *   hermes clarify panel the server re-reads the panel and runs the panel's own
@@ -1299,6 +1325,9 @@ async function handlePromptAnswer(req, res, body) {
     }
     if (seen.prompt.kind === 'hermes_clarify') {
       return answerClarifyPanel(res, paneId, seen.prompt, body, seen.text);
+    }
+    if (seen.prompt.kind === 'hermes_confirm') {
+      return answerConfirmModal(res, paneId, seen.prompt, body, seen.text);
     }
     const r = await hdr.request('pane.send_text', { pane_id: paneId, text: body.answer }, { timeoutMs: DEFAULT_TIMEOUT_MS });
     return ok(res, { pane_id: paneId, result: r, sent: 'text', detected_by: 'server' });
@@ -2048,10 +2077,24 @@ async function handleModelPost(req, res, body) {
     const providerConfirmed = !provider
       || (stored.provider || '').replace(/^custom:/, '') === provider
       || new RegExp('Provider:\\s*' + provider.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).test(text);
+    const confirmed = modelConfirmed && providerConfirmed;
+    /* A guarded switch (large context, cost, data policy) does not apply until the modal is
+       answered: say so and hand the modal back with the result, so the switch does not read as a
+       silent failure — the card for it is what answers it. */
+    if (!confirmed) {
+      const pending = await readPaneQuestion(paneId);
+      if (pending.prompt && pending.prompt.kind === 'hermes_confirm') {
+        return ok(res, {
+          pane_id: paneId, model: model, provider: provider || null,
+          current: stored.model || null, current_provider: stored.provider || null,
+          confirmed: false, needs_confirmation: true, prompt: pending.prompt, result: { type: 'ok' },
+        });
+      }
+    }
     return ok(res, {
       pane_id: paneId, model: model, provider: provider || null,
       current: stored.model || null, current_provider: stored.provider || null,
-      confirmed: modelConfirmed && providerConfirmed, result: { type: 'ok' },
+      confirmed: confirmed, result: { type: 'ok' },
     });
   }
 

@@ -116,6 +116,7 @@
     if (kind === 'claude_ask') return 'ask';
     if (kind === 'claude_model') return 'model';
     if (kind === 'hermes_clarify') return 'clarify';
+    if (kind === 'hermes_confirm') return 'confirm';
     if (kind === 'pi_picker') return 'picker';
     if (kind === 'yn') return 'yes/no';
     return 'question';
@@ -124,6 +125,7 @@
     if (kind === 'claude_ask') return 'claude';
     if (kind === 'claude_model') return 'claude';
     if (kind === 'hermes_clarify') return 'hermes';
+    if (kind === 'hermes_confirm') return 'hermes';
     if (kind === 'pi_picker') return 'pi';
     if (kind === 'yn') return 'yn';
     return null;
@@ -309,14 +311,14 @@
            waits (one clarify call can carry several questions), and the detector — not the
            status — decides when the question is gone */
         var isAsked = detections.has(p.pane_id);
-        /* hermes draws its clarify panel and keeps waiting while herdr still reports 'working':
-           for that family the row-level interrupt rule wins over the clarification rule, so the
-           status cannot be used to decide whether a question is on screen. Poll hermes panes in
-           'working' as well — the detector decides, and a pane whose read finds no prompt drops
-           out on the next pass. pi/claude working panes stay out: they never hold a panel in that
-           state, and reading them mid-run would only cost a pane.read. */
-        var isHermesWorking = p.agent === 'hermes' && p.agent_status === 'working';
-        if (isBlocked || isWatched || isAsked || isHermesWorking) { target.push(p.pane_id); targetIds[p.pane_id] = true; }
+        /* hermes holds a panel outside 'blocked' too: its clarify panel waits while herdr still
+           says 'working', and its own confirm modals (/model's large-context guard, /reset) wait
+           while the pane reads 'idle'. For that family the status cannot decide whether a question
+           is on screen, so every hermes pane is polled and the detector decides — a pane whose
+           read finds no prompt drops out on the next pass. pi/claude stay on the status rule: they
+           never hold a panel outside 'blocked', and reading them mid-run only costs a pane.read. */
+        var isHermes = p.agent === 'hermes';
+        if (isBlocked || isWatched || isAsked || isHermes) { target.push(p.pane_id); targetIds[p.pane_id] = true; }
       }
       /* expire stale watches */
       for (var w in watched) { if (Object.prototype.hasOwnProperty.call(watched, w) && watched[w] <= now) delete watched[w]; }
@@ -402,6 +404,9 @@
          already moved past is refused instead of answering the next question by mistake.
          `question` is the card's own question — the staleness check, not the mechanism. */
       if (d.kind === 'hermes_clarify') { post(d.pane_id, { answer: String(opt.n), question: d.question }); return; }
+      /* hermes' own confirm modal submits on the digit itself — the server re-reads the modal and
+         sends that one keystroke, so a modal that already timed out is refused instead of typed */
+      if (d.kind === 'hermes_confirm') { post(d.pane_id, { answer: String(opt.n), question: d.question }); return; }
       /* claude's /model picker ignores typed digits and opens with the highlight on the CURRENT
          model, so the answer is a relative arrow walk from that highlight to the target row,
          then enter (one enter both picks and confirms — verified live) */
