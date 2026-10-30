@@ -3559,6 +3559,15 @@ async function paneTexts(paneId) {
   }
 }
 
+/** The conversation title hermes prints at the end of its status line (`─ <title>`). */
+function hermesStatusTitle(text) {
+  if (!text) return null;
+  try {
+    const view = statusView.interpret({ agent: 'hermes', agent_known: true, text, text_error: null });
+    return (view && view.status && view.status.title) || null;
+  } catch (e) { return null; }
+}
+
 /** hermes `sessions` rows, cached. Failure is an empty list: a store this server
  *  cannot read cannot be a signal, and it must not take /api/chat down. */
 async function storeSessions() {
@@ -3712,6 +3721,9 @@ async function resolveLiveSession(paneId, entry, agent, herdrSessionId, agents, 
   }
   inp.pane_text_visible = texts.visible;
   inp.pane_text_recent = texts.recent;
+  /* hermes prints the conversation title at the end of its ☤ status line; it is the one
+     per-pane fact that survives a stale herdr record (see resolvePaneSession step 1.5). */
+  if (agent === 'hermes') inp.pane_title = hermesStatusTitle(texts.visible) || hermesStatusTitle(texts.recent);
 
   if (agent === 'hermes') {
     const rows = await storeSessions();

@@ -73,6 +73,7 @@ const SIGNALS = {
   SINK_SESSION: 'sink_session',
   CONTROL_SESSION: 'control_session',
   PANE_BANNER: 'pane_banner',
+  PANE_TITLE: 'pane_title',
   STORE_SESSION: 'store_session',
   CWD_NEWEST: 'cwd_newest',
   CWD_ASSIGN: 'cwd_assign',
@@ -100,6 +101,16 @@ const isHermesSessionId = (v) => typeof v === 'string' && HERMES_ID_RE.test(v);
 /** Same rule as chat/claude.js `sameCwd`, kept local so the resolver depends on
  *  no reader: Windows paths are case-insensitive and may arrive with either
  *  separator or a trailing slash. */
+/** A session title as both sides print it: case-folded, whitespace collapsed, and without
+ *  the trailing ellipsis a narrow footer adds (`复刻..`, `复刻…`). */
+function normalizeTitle(t) {
+  return String(t == null ? '' : t)
+    .replace(/[.\u2026\s]+$/, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
 function sameCwd(a, b) {
   const norm = (p) => {
     const s = String(p == null ? '' : p).trim().replace(/[\\/]+$/, '');
@@ -390,6 +401,39 @@ function resolvePaneSession(input) {
   } else if (agent === 'hermes' && !banner && ambiguousIds.length > 1) {
     // The pane names several sessions (banners in the scrollback) — §9.5.
     if (herdr) note(`the pane's text names ${ambiguousIds.length} sessions (${ambiguousIds.join(', ')}) — kept herdr's ${herdr}`);
+  }
+
+  // ── 1.5 hermes prints the session's own title in its status line ────────────
+  // herdr can keep naming the session a pane STARTED with after the pane has resumed or
+  // started another one (live, 2026-10-30: wE:p1's record still said
+  // 20261019_172425_55dc4b — whose last message was a day old — while the pane's screen
+  // showed the session started 20261029_161649_913f7d). The pane names no id, but its
+  // status line prints the title hermes stored with the session (`─ 检查 NIDA Wind 复刻..`,
+  // cut at the footer's width), and the store keeps that same string. Adoption stays
+  // narrow: exactly ONE unclaimed row of this cwd may match, and it must be newer than
+  // herdr's id, so a shared or generic title can never move a pane.
+  if (agent === 'hermes' && !banner && inp.pane_title && storeRows.length) {
+    const norm = normalizeTitle(inp.pane_title);
+    const hits = storeRows.filter((r) => {
+      if (String(r.id) === herdr) return false;
+      const t = normalizeTitle(r.title);
+      return !!t && !!norm && (t === norm || t.startsWith(norm) || norm.startsWith(t));
+    });
+    const free = hits.filter((r) => !claimOf(String(r.id)));
+    if (norm && free.length === 1 && (herdr ? newer(String(free[0].id), herdr) === true : true)) {
+      const hit = free[0];
+      push(String(hit.id), SIGNALS.PANE_TITLE, `title "${inp.pane_title}"`);
+      return Object.assign(out, {
+        resolved: true,
+        session_id: String(hit.id),
+        detected_by: SIGNALS.PANE_TITLE,
+        corroborated: true,
+        note: herdr && String(hit.id) !== herdr
+          ? `the pane's status line names "${inp.pane_title}", which is session ${hit.id} — herdr still records ${herdr}`
+          : null,
+      });
+    }
+    if (norm && free.length > 1) note(`the pane's status line names "${inp.pane_title}", which matches ${free.length} sessions — not picking one`);
   }
 
   // ── 2. the hermes store's newest session for this cwd ──────────────────────

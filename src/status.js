@@ -264,6 +264,13 @@ function parseHermesStatus(text, textError) {
       confidence: complete ? 'parsed' : 'partial',
       approx,
       model,
+      /* the tail after `─` is the conversation title, cut to the footer's width (the trailing
+         `..` is hermes' own ellipsis). The store keeps the same string, so it identifies the
+         session a pane is on even when herdr's own record of it went stale. */
+      title: (() => {
+        const tail = String(line).split(new RegExp('\s*' + TITLE_SEP + '\s*')).slice(1).join(' ').trim();
+        return tail ? (tail.replace(/[.…\s]+$/, '').trim() || null) : null;
+      })(),
       used_tokens: usedTokens,
       limit_tokens: limitTokens,
       used_pct: pctValue,

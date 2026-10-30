@@ -118,7 +118,7 @@ function recentSessions(file, limit) {
     db = openReadOnly(file);
     try {
       return db.prepare(
-        `SELECT id, cwd, started_at, last_activity_at, ended_at, message_count
+        `SELECT id, cwd, started_at, last_activity_at, ended_at, message_count, title
            FROM sessions
           ORDER BY COALESCE(last_activity_at, started_at) DESC
           LIMIT ?`,
@@ -129,6 +129,7 @@ function recentSessions(file, limit) {
         last_activity_at: r.last_activity_at == null ? null : Number(r.last_activity_at),
         ended_at: r.ended_at == null ? null : Number(r.ended_at),
         message_count: r.message_count == null ? null : Number(r.message_count),
+        title: r.title == null ? null : String(r.title),
       })).filter((r) => r.id);
     } catch (e) {
       return [];                       // no `sessions` table: nothing to say
