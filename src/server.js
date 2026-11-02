@@ -2303,6 +2303,40 @@ function lastMatch(re, text) {
   return hit;
 }
 
+/* `Reasoning effort:  high` (the answer to a bare /reasoning) and `Reasoning effort set to
+   'high'` (the confirmation of a switch) are the two shapes hermes prints. */
+const HERMES_EFFORT_RE = /Reasoning effort(?:\s+set to)?\s*:?\s*'?([a-z]+)'?/gi;
+
+/* Ask the pane what it is set to. A bare `/reasoning` prints the level and changes nothing; the
+   answer lands at the bottom of the viewport, so it is read straight back. Never sent while the
+   pane is working or showing a selector — a command there would join the turn or answer a card. */
+async function askHermesEffort(paneId) {
+  const status = await paneAgentStatus(paneId);
+  if (status !== 'idle' && status !== 'done') return null;
+  /* a clarify card or a confirm modal is WAITING for a keystroke, and it can appear while hermes
+     still reports `idle` — a command typed now would answer it instead of asking anything. */
+  try {
+    if (promptdetect.detect(await readVisible(paneId))) return null;
+  } catch (e) { /* no detector answer: the status check above still holds */ }
+  try {
+    await hdr.request('agent.prompt', { target: paneId, text: '/reasoning', timeoutMs: DEFAULT_TIMEOUT_MS });
+  } catch (e) { return null; }
+  /* read the scrollback, not the viewport: a reader scrolled up into history would otherwise
+     hide the answer they just caused. The answer is the newest output in the pane, so it has to
+     sit at the very bottom — an older answer line further up is not confused for it. */
+  for (let i = 0; i < 10; i++) {
+    await sleep(250);
+    const lines = String(await readRecent(paneId, 60) || '').split('\n');
+    const from = Math.max(0, lines.length - 10);
+    for (let j = lines.length - 1; j >= from; j--) {
+      HERMES_EFFORT_RE.lastIndex = 0;
+      const m = HERMES_EFFORT_RE.exec(lines[j]);
+      if (m) return String(m[1]).toLowerCase();
+    }
+  }
+  return null;
+}
+
 /* Read the current effort level from the agent. This is the slow part: hermes and claude have to
    be asked with a command, so the caller must cache/coalesce it. */
 async function loadEffortLevel(paneId) {
@@ -2333,16 +2367,27 @@ async function loadEffortLevel(paneId) {
   }
 
   if (family === 'hermes') {
-    /* The TUI's own last answer is the live value; state.db can lag until the next turn
-       freezes the session policy. Reading pane text is non-invasive and exact. */
-    const text = await readVisible(paneId);
-    const m = lastMatch(/Reasoning effort(?:\s+set to)?\s*:?\s*'?([a-z]+)'?/gi, text);
+    /* The pane's own answer is the live value. The session store only learns it when a turn
+       rebuilds the agent, so a level read from state.db lags behind a switch made here or in the
+       TUI. Order: the newest answer in the scrollback (free, and it outlives the viewport), then
+       ask the pane, then the store — last and labelled, never passed off as current. */
+    let m = lastMatch(HERMES_EFFORT_RE, await readRecent(paneId, 120));
+    let source = m ? 'pane text' : null;
+    if (!m) {
+      const asked = await askHermesEffort(paneId);
+      if (asked) { m = [null, asked]; source = 'pane answer'; }
+    }
     const info = await paneSessionInfo(paneId);
     const stored = chatHermes.sessionSettings(chatHermes.dbPath(), info.sessionId);
+    const current = (m ? String(m[1]).toLowerCase() : null) || stored.reasoning || null;
     return {
-      pane_id: paneId, agent: 'hermes', current: (m ? m[1].toLowerCase() : null) || stored.reasoning || null,
-      levels: EFFORT_LEVELS.hermes, source: m ? 'pane text' : 'state.db',
-      note: (m || stored.reasoning) ? undefined : 'no reasoning setting recorded for this session yet',
+      pane_id: paneId, agent: 'hermes', current: current,
+      levels: EFFORT_LEVELS.hermes, source: source || 'state.db',
+      note: m
+        ? undefined
+        : (stored.reasoning
+          ? 'the pane could not be asked just now, so this is the level its session store last committed — it can lag a turn behind'
+          : 'no reasoning setting recorded for this session yet'),
     };
   }
 
