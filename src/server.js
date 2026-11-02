@@ -2344,25 +2344,27 @@ async function loadEffortLevel(paneId) {
 
   if (family === 'pi') {
     const settings = await chatPi.sinkSettingsForPane(paneId);
-    /* The bridge record is the cheap, authoritative source once the extension has
-       reported. The footer is only a fallback for a pane whose extension is not
-       streaming yet; reading the scrollback of a 2 MB turn on every GET is not. */
-    const line = (!settings.model || !settings.thinking_level)
-      ? piStatusLine(await readRecent(paneId, 40))
-      : null;
-    const model = settings.model || (line && line.model) || null;
-    const current = settings.thinking_level || (line && line.level) || null;
+    /* The pane's own status bar is what pi is actually on, and it sits at the bottom of the
+       viewport, so reading it costs one small read. The control record is not the truth: pi
+       writes a model switch as a model-only line, and a resumed or restarted session can leave
+       an older level behind — reading the record first is what made the droplist fall back to an
+       older level. The record is the fallback for a pane whose status bar is not on screen. */
+    const line = piStatusLine(await readVisible(paneId)) || piStatusLine(await readRecent(paneId, 40));
+    const model = (line && line.model) || settings.model || null;
+    const current = (line && line.level) || settings.thinking_level || null;
     const thinking = await piThinkingLevels(model);
     const levels = thinking.levels;
     return {
       pane_id: paneId, agent: 'pi',
       current: levels.length ? current : null,
       levels: levels,
-      source: settings.model ? 'bridge control' : (line ? 'status line' : null),
+      source: line ? 'status line' : (settings.model ? 'bridge control' : null),
       levels_source: thinking.source,
-      note: levels.length
-        ? undefined
-        : (thinking.note || 'the current model is not in pi models.json, so its thinking levels are unknown'),
+      note: (line && settings.thinking_level && line.level !== settings.thinking_level)
+        ? ('the pane is on "' + line.level + '"; its control record still says "' + settings.thinking_level + '"')
+        : levels.length
+          ? undefined
+          : (thinking.note || 'the current model is not in pi models.json, so its thinking levels are unknown'),
     };
   }
 
