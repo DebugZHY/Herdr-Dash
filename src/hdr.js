@@ -98,7 +98,7 @@ function screenStatus(agent, text) {
     return 'idle';
   }
   if (agent === 'claude') {
-    if (/\u23f5\u23f5|esc to interrupt/.test(tail)) return 'working';
+    if (/\u23f5\u23f5|esc to interrupt/.test(chrome)) return 'working';
     return 'idle';
   }
   return null;
