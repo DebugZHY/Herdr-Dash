@@ -70,12 +70,17 @@ function controlFileName(sessionId) {
 /**
  * §2 "no sink unless HERDR_ENV=1 and a pane id is present". The bridge asks this once
  * at construction; when it says no, nothing is ever created on disk.
+ *
+ * herdr-core (`hc`) has no HERDR_ENV/HERDR_PANE_ID: it exports HC_TERMINAL_ID to every
+ * terminal it starts. That is the same signal — a pane under a multiplexer — so accept
+ * it as the pane id and as the enable flag, and keep the herdr variables authoritative.
  */
 function sinkTarget(env) {
   const e = env || process.env;
   const flag = String(e.HERDR_ENV === undefined || e.HERDR_ENV === null ? '' : e.HERDR_ENV);
-  if (flag !== '1') return { enabled: false, paneId: '', reason: 'HERDR_ENV is not "1"' };
-  const pane = typeof e.HERDR_PANE_ID === 'string' ? e.HERDR_PANE_ID.trim() : '';
+  const corePane = typeof e.HC_TERMINAL_ID === 'string' ? e.HC_TERMINAL_ID.trim() : '';
+  if (flag !== '1' && !corePane) return { enabled: false, paneId: '', reason: 'HERDR_ENV is not "1"' };
+  const pane = typeof e.HERDR_PANE_ID === 'string' && e.HERDR_PANE_ID.trim() ? e.HERDR_PANE_ID.trim() : corePane;
   if (!pane) return { enabled: false, paneId: '', reason: 'HERDR_PANE_ID is empty' };
   return { enabled: true, paneId: pane, reason: '' };
 }

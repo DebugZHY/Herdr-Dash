@@ -93,7 +93,8 @@ export default function herdrStreamExtension(pi: ExtensionAPI) {
 
 /** pi receives the text after the command name, so a Windows path with spaces survives. */
 function inHerdrPane(): boolean {
-	return process.env.HERDR_ENV === "1" && !!process.env.HERDR_PANE_ID;
+	// herdr-core sets HC_TERMINAL_ID instead of HERDR_ENV/HERDR_PANE_ID.
+	return (process.env.HERDR_ENV === "1" && !!process.env.HERDR_PANE_ID) || !!process.env.HC_TERMINAL_ID;
 }
 
 /** Case-insensitive on Windows; anything not strictly inside `dir` is refused. */
