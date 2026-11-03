@@ -1931,6 +1931,39 @@ async function readModelPicker(paneId) {
   return prompt && MODEL_KINDS[prompt.kind] ? prompt : null;
 }
 
+const HERMES_PROVIDER_CACHE = 'provider_models_cache.json';
+
+/** Hermes' own live model lists, read from the cache it keeps beside config.yaml.
+ *  Returns rows for the providers that carry `currentModel` (all providers when it is unknown). */
+async function hermesCachedModels(dir, currentModel) {
+  const out = { rows: [], providers: [] };
+  if (!dir) return out;
+  let doc;
+  try {
+    doc = JSON.parse(await fsp.readFile(path.join(dir, HERMES_PROVIDER_CACHE), 'utf8'));
+  } catch (e) { return out; }
+  if (!doc || typeof doc !== 'object') return out;
+  const entries = Object.keys(doc).filter((p) => doc[p] && Array.isArray(doc[p].models));
+  const wanted = currentModel ? entries.filter((p) => doc[p].models.indexOf(String(currentModel)) >= 0) : entries;
+  const use = wanted.length ? wanted : entries;
+  const seen = new Set();
+  for (const p of use) {
+    for (const m of doc[p].models) {
+      if (typeof m !== 'string' || !m) continue;
+      const key = p + '\u0000' + m;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.rows.push({ provider: p, model: m, label: p + ' \u00b7 ' + m });
+      if (out.providers.indexOf(p) < 0) out.providers.push(p);
+    }
+  }
+  return out;
+}
+
+function cachedProvidersLabel(list) {
+  return list.join(', ');
+}
+
 /* GET /api/model?pane_id=.. -> { ok, agent, models:[{n,label,current,model}], highlight_n }
    claude: opens its /model picker, parses it, escs it closed.
    hermes: reads the switchable names from its configured providers (no pane I/O). */
@@ -1965,15 +1998,32 @@ async function handleModelGet(req, res, url) {
         providerSource = 'state.db';
       }
     }
-    const providerListed = !curProvider || cat.providers.indexOf(curProvider) >= 0;
+    const providerListed = !curProvider || (cat.providers.indexOf(curProvider) >= 0
+      || (cat.models.length === 0 && curProvider !== null));
+    /* config.yaml on this machine has no `custom_providers` list — just one `model:` block — so
+       the catalogue is empty and the droplist would show nothing. Hermes keeps its own live
+       provider model lists in provider_models_cache.json beside config.yaml; list the providers
+       that carry the pane's CURRENT model, which is the set a switch can meaningfully pick from. */
+    let baseModels = cat.models;
+    let baseProviders = cat.providers;
+    let cacheNote = null;
+    if (!baseModels.length) {
+      const cached = await hermesCachedModels(path.dirname(cat.source || ''), cur);
+      if (cached.rows.length) {
+        baseModels = cached.rows;
+        baseProviders = cached.providers;
+        cacheNote = 'model list read from hermes provider_models_cache.json (' + cachedProvidersLabel(cached.providers) + ')';
+      }
+    }
     let marked = false;
-    const rows = cat.models.map((m) => {
+    const rows = baseModels.map((m) => {
       const isCurrent = !marked && !!cur && m.model === cur && (!curProvider || m.provider === curProvider);
       if (isCurrent) marked = true;
       return Object.assign({}, m, { current: isCurrent });
     });
     const notes = [];
-    if (cat.note) notes.push(cat.note);
+    if (cat.note && baseModels.length === cat.models.length) notes.push(cat.note);
+    if (cacheNote) notes.push(cacheNote);
     if (policy.model && footer && policy.model !== footer) {
       notes.push('state.db records "' + policy.model + '" but the pane reports "' + footer + '" — showing the value from the pane status line');
     }
@@ -1987,7 +2037,7 @@ async function handleModelGet(req, res, url) {
       pane_id: paneId, agent: 'hermes', current: cur, provider: curProvider,
       policy_model: policy.model || null,
       source: cat.source, current_source: currentSource, provider_source: providerSource,
-      providers: cat.providers, provider_listed: providerListed,
+      providers: baseProviders, provider_listed: providerListed,
       models: rows,
       note: notes.length ? notes.join('; ') : undefined,
     });
@@ -3611,8 +3661,39 @@ function hermesStatusTitle(text) {
   if (!text) return null;
   try {
     const view = statusView.interpret({ agent: 'hermes', agent_known: true, text, text_error: null });
-    return (view && view.status && view.status.title) || null;
-  } catch (e) { return null; }
+    const t = view && view.status && view.status.title;
+    if (t) return t;
+  } catch (e) { /* fall through to the activity line */ }
+  /* The activity / separator line prints the session title at its right edge:
+     `── ⠏ 🐍 Preparing … ───────── Fix pi-web install /bin/sh.exe error on Windows ─`.
+     It is the same string state.db keeps in sessions.title, so it names the pane's session
+     exactly — the one per-pane fact that survives two live sessions in one cwd. */
+  const lines = String(text).split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = /\u2500{4,}\s*([^\u2500]{2,}?)\s*\u2500+\s*$/.exec(lines[i]);
+    if (!m) continue;
+    const title = m[1].trim();
+    if (!title) continue;
+    if (/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(title)) continue;              // spinner, no title yet
+    if (/^(?:Preparing|Thinking|Working|Reading|Running)\b/.test(title)) continue;
+    return title;
+  }
+  return null;
+}
+
+/** The `435K/1M` figure from the pane's ☤ status line, in tokens (decimal K, as printed).
+ *  state.db's `sessions.input_tokens` carries the same number; it is the one per-pane fact
+ *  that tells two live hermes sessions in one cwd apart. */
+function hermesContextTokens(text) {
+  if (!text) return null;
+  const lines = String(text).split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (line.indexOf('\u2624') < 0) continue;
+    const m = /(\d+(?:\.\d+)?)K\s*\/\s*(\d+(?:\.\d+)?)M/.exec(line);
+    if (m) return Math.round(Number(m[1]) * 1000);
+  }
+  return null;
 }
 
 /** hermes `sessions` rows, cached. Failure is an empty list: a store this server
@@ -3771,10 +3852,24 @@ async function resolveLiveSession(paneId, entry, agent, herdrSessionId, agents, 
   /* hermes prints the conversation title at the end of its ☤ status line; it is the one
      per-pane fact that survives a stale herdr record (see resolvePaneSession step 1.5). */
   if (agent === 'hermes') inp.pane_title = hermesStatusTitle(texts.visible) || hermesStatusTitle(texts.recent);
+  /* The ☤ line's context figure names this pane's session when several hermes sessions share
+     one cwd (it is the same number state.db keeps in sessions.input_tokens). */
+  if (agent === 'hermes') inp.pane_context_tokens = hermesContextTokens(texts.visible) || hermesContextTokens(texts.recent);
 
   if (agent === 'hermes') {
     const rows = await storeSessions();
-    inp.store_sessions = rows.filter((r) => chatSession.sameCwd(r.cwd, cwd));
+    const cwdRows = rows.filter((r) => chatSession.sameCwd(r.cwd, cwd));
+    /* The pane's status line names its session's TITLE. A session can be running in another
+       directory than the pane's cwd (a hermes pane keeps the cwd it was started in while its
+       session works elsewhere), so a title match is looked up across the whole store; only an
+       exact title match is allowed in, and the resolver still has to find it unique. */
+    let extra = [];
+    if (inp.pane_title) {
+      const key = chatSession.normalizeTitle(inp.pane_title);
+      extra = rows.filter((r) => !chatSession.sameCwd(r.cwd, cwd)
+        && key && chatSession.normalizeTitle(r.title) === key && !cwdRows.some((c) => String(c.id) === String(r.id)));
+    }
+    inp.store_sessions = cwdRows.concat(extra);
     // §9.1's corroboration: is the id the pane names known to the store at all?
     // Only asked when the pane names exactly one, which is when it can matter.
     const seen = new Set();

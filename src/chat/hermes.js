@@ -118,7 +118,7 @@ function recentSessions(file, limit) {
     db = openReadOnly(file);
     try {
       return db.prepare(
-        `SELECT id, cwd, started_at, last_activity_at, ended_at, message_count, title
+        `SELECT id, cwd, started_at, last_activity_at, ended_at, message_count, title, input_tokens
            FROM sessions
           ORDER BY COALESCE(last_activity_at, started_at) DESC
           LIMIT ?`,
@@ -129,6 +129,9 @@ function recentSessions(file, limit) {
         last_activity_at: r.last_activity_at == null ? null : Number(r.last_activity_at),
         ended_at: r.ended_at == null ? null : Number(r.ended_at),
         message_count: r.message_count == null ? null : Number(r.message_count),
+        /* the pane's ☤ status line prints this same figure (435K/1M); it is what lets
+           two live hermes sessions in one cwd be told apart without guessing. */
+        input_tokens: r.input_tokens == null ? null : Number(r.input_tokens),
         title: r.title == null ? null : String(r.title),
       })).filter((r) => r.id);
     } catch (e) {

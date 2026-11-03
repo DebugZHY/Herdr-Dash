@@ -74,6 +74,7 @@ const SIGNALS = {
   CONTROL_SESSION: 'control_session',
   PANE_BANNER: 'pane_banner',
   PANE_TITLE: 'pane_title',
+  PANE_CONTEXT: 'pane_context',
   STORE_SESSION: 'store_session',
   CWD_NEWEST: 'cwd_newest',
   CWD_ASSIGN: 'cwd_assign',
@@ -436,6 +437,34 @@ function resolvePaneSession(input) {
     if (norm && free.length > 1) note(`the pane's status line names "${inp.pane_title}", which matches ${free.length} sessions — not picking one`);
   }
 
+  // ── 1.6 the pane's own context figure (hermes) ─────────────────────────────
+  // The ☤ status line prints the session's context usage (`435K/1M`), and state.db keeps the
+  // same number in `sessions.input_tokens`. When two live hermes sessions share one cwd — the
+  // case where "newest activity" flips every few turns — that figure names the pane's own
+  // session exactly. Adoption stays narrow: a UNIQUE row within 2% of the displayed figure,
+  // unclaimed by another pane. Anything else falls through to the store heuristics.
+  if (agent === 'hermes' && Number.isFinite(inp.pane_context_tokens) && inp.pane_context_tokens > 0 && storeRows.length) {
+    const shown = Number(inp.pane_context_tokens);
+    const tol = Math.max(5000, Math.round(shown * 0.05));
+    const hits = storeRows.filter((r) => {
+      const n = Number(r.input_tokens);
+      return Number.isFinite(n) && Math.abs(n - shown) <= tol;
+    });
+    const free = hits.filter((r) => !claimOf(String(r.id)));
+    if (free.length === 1) {
+      const hit = free[0];
+      push(String(hit.id), SIGNALS.PANE_CONTEXT, `${shown} tokens`);
+      return Object.assign(out, {
+        resolved: true,
+        session_id: String(hit.id),
+        detected_by: SIGNALS.PANE_CONTEXT,
+        corroborated: true,
+        note: `the pane's status line reports ${Math.round(shown / 1000)}K tokens, which only session ${hit.id} matches`,
+      });
+    }
+    if (free.length > 1) note(`the pane's context figure ${Math.round(shown / 1000)}K matches ${free.length} sessions — not picking one`);
+  }
+
   // ── 2. the hermes store's newest session for this cwd ──────────────────────
   if (agent === 'hermes' && storeRows.length) {
     for (const r of storeRows) {
@@ -699,6 +728,7 @@ module.exports = {
   HERMES_ID_RE,
   isHermesSessionId,
   sameCwd,
+  normalizeTitle,
   paneSessionFields,
   foldPaneLine,
   foldPaneLines,
