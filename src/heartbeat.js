@@ -423,16 +423,10 @@ function hermesTargetReached(ctx, after) {
  */
 const HERMES_ARM_STATUSES = new Set(['idle', 'done']);
 
-async function hermesPaneStatus(paneId) {
-  try {
-    const list = await hdr.request('agent.list', {}, { timeoutMs: DEFAULT_TIMEOUT_MS });
-    const agents = (list && (list.agents || (list.result && list.result.agents))) || [];
-    const entry = agents.find((a) => a && a.pane_id === paneId);
-    return entry ? String(entry.agent_status || '') : '';
-  } catch (e) {
-    return '';
-  }
-}
+/* The same reading server.js uses to guard its own writes. An unreadable run state is NOT idle:
+   the previous version returned '' here, so a pane whose state could not be read still got a
+   keystroke, while /api/effort refused the identical pane. */
+const hermesPaneStatus = (paneId) => hdr.paneStatus(paneId);
 
 async function applyHermes(ctx) {
   const before = readHermesState(ctx.sessionId);
@@ -447,15 +441,17 @@ async function applyHermes(ctx) {
   }
 
   const status = await hermesPaneStatus(ctx.paneId);
-  if (status && !HERMES_ARM_STATUSES.has(status)) {
+  if (!status || !HERMES_ARM_STATUSES.has(status)) {
     return {
       ok: false, action: ctx.action, applied_via: null,
       heartbeat: before.state ? withNextFire(before.state) : null,
       pending: false,
       command: ctx.command,
       error: {
-        code: 'pane_busy',
-        message: 'this pane is ' + status + ' — a slash command sent now is steered into the running turn (or answers the open panel) and is never executed as a command. Nothing was typed; retry when the pane is idle.',
+        code: status ? 'pane_busy' : 'pane_state_unknown',
+        message: status
+          ? ('this pane is ' + status + ' — a slash command sent now is steered into the running turn (or answers the open panel) and is never executed as a command. Nothing was typed; retry when the pane is idle.')
+          : 'the run state of this pane could not be read, so a slash command might land inside a running turn. Nothing was typed; retry once its state is readable.',
       },
     };
   }

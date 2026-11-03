@@ -577,9 +577,10 @@ async function handlePrompt(req, res, body) {
   if (useWait) {
     const waitMs = Number.isFinite(Number(body.timeout_ms)) ? Number(body.timeout_ms) : WAIT_DEFAULT_MS;
     params.wait = { until: ['idle'], timeout_ms: waitMs };
-    // At least the §4 hardening floor of 30 s, but never shorter than the
-    // herdr-side wait the caller asked for.
-    socketTimeout = Math.max(WAIT_TIMEOUT_MS, waitMs + 5000);
+    /* At least the §4 hardening floor of 30 s, and never shorter than the wait the caller asked
+       for — plus room for the paste itself (measured: herdr-core's terminal.send takes ~5 s
+       before the wait can even begin) and one poll past the budget. */
+    socketTimeout = Math.max(WAIT_TIMEOUT_MS, waitMs + 15000);
   }
 
   const result = await hdr.request('agent.prompt', params, { timeoutMs: socketTimeout });
@@ -2233,12 +2234,10 @@ function invalidateEffortCache(paneId) {
    cancels one with esc — can interrupt the turn it is in the middle of, so every write below is
    held back until the pane is idle. */
 async function paneAgentStatus(paneId) {
-  try {
-    const list = await hdr.request('agent.list', {}, { timeoutMs: DEFAULT_TIMEOUT_MS });
-    const agents = (list && (list.agents || (list.result && list.result.agents))) || [];
-    const entry = agents.find((a) => a && a.pane_id === paneId);
-    return (entry && entry.agent_status) ? String(entry.agent_status) : null;
-  } catch (e) { return null; }
+  /* One reading of "is this pane busy" for every caller: the state the pane reports, else the
+     state drawn on its screen. heartbeat.js asks the same function, so an unreadable pane can no
+     longer be "idle enough to type into" for one caller and refused by the other. */
+  return hdr.paneStatus(paneId);
 }
 
 async function paneIsBusy(paneId) {
@@ -2465,8 +2464,10 @@ async function loadEffortLevel(paneId) {
 }
 
 /* GET /api/effort?pane_id=.. -> { ok, agent, current, levels:[..] }
-   The current level is read where that agent keeps it: pi's footer/bridge record, hermes'
-   state.db session policy, or claude's footer/slider. Reading hermes or pi never types. */
+   The current level is read where that agent keeps it: pi's status bar, hermes' own answer or
+   its state.db session policy, or claude's footer/slider. Asking hermes (`?fresh=1`, or when no
+   answer sits in the scrollback) types a bare `/reasoning` into the pane — it prints the level
+   and changes nothing — and is refused unless the pane reads idle with no question card. */
 async function handleEffortGet(req, res, url) {
   const paneId = url.searchParams.get('pane_id');
   if (!paneId) throw { code: 'bad_request', message: '"pane_id" query parameter is required' };
@@ -3969,6 +3970,14 @@ async function healHerdr(paneId, agent, herdrSessionId, res, entry) {
     out.heal_reason = 'herdr already records this session';
     return out;
   }
+  /* hdr.js synthesises `agent_session: null` for every pane because herdr-core publishes no such
+     field. Reporting would therefore fail on every poll and never change anything; say why once
+     and let the resolver keep working from the pane's own title/context. */
+  if (entry && entry.agent_session == null) {
+    out.heal_reason = 'not reported: herdr-core keeps no agent session record for a pane';
+    healedPanes.set(paneId, { id, herdr_healed: false, heal_reason: out.heal_reason });
+    return out;
+  }
   const done = healedPanes.get(paneId);
   if (done && done.id === id) {
     out.herdr_healed = done.herdr_healed;
@@ -4761,11 +4770,13 @@ async function handleStatus(req, res, url) {
 // One long-lived herdr subscription, shared by every connected browser. The
 // hub runs whether or not any client is attached, so the pipe state is warm.
 const sseClients = new Set();
+/* What herdr-core can actually deliver: its stream carries created / finished / status, which
+   hdr.js maps onto these names. The legacy structural topics (tab.*, workspace.*, pane.focused,
+   pane.moved, layout.updated) have no counterpart in herdr-core — asking for them would only
+   pretend a subscription exists that never fires. Structure stays current through
+   schedulePaneRefresh and the 30 s sweep instead. */
 const TOPIC_SUBS = [
-  'pane.created', 'pane.closed', 'pane.updated', 'pane.focused', 'pane.moved',
-  'tab.created', 'tab.closed', 'tab.moved',
-  'workspace.created', 'workspace.closed',
-  'layout.updated',
+  'pane.created', 'pane.closed', 'pane.updated', 'pane.agent_status_changed',
 ];
 
 const hub = {
