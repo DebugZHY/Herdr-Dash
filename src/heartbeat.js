@@ -414,7 +414,26 @@ function hermesTargetReached(ctx, after) {
 /**
  * hermes: send the official slash command through the repo's pane-send path, wait, and
  * re-read. Dry-run skips the send and the wait and reports the would-be state instead.
+ *
+ * The send is gated on the pane being IDLE. `agent.prompt` types into the TUI and submits:
+ * while the agent is mid-turn that text is steered into the running turn (the CLI then sees
+ * `/heartbeat …` as ordinary user text and no row is written — reported live, the text even
+ * merged with whatever sat in the input box), and while a panel is open it would answer the
+ * panel. A refused arm is reported; nothing is typed.
  */
+const HERMES_ARM_STATUSES = new Set(['idle', 'done']);
+
+async function hermesPaneStatus(paneId) {
+  try {
+    const list = await hdr.request('agent.list', {}, { timeoutMs: DEFAULT_TIMEOUT_MS });
+    const agents = (list && (list.agents || (list.result && list.result.agents))) || [];
+    const entry = agents.find((a) => a && a.pane_id === paneId);
+    return entry ? String(entry.agent_status || '') : '';
+  } catch (e) {
+    return '';
+  }
+}
+
 async function applyHermes(ctx) {
   const before = readHermesState(ctx.sessionId);
   if (dryRun()) {
@@ -424,6 +443,20 @@ async function applyHermes(ctx) {
       heartbeat: would ? withNextFire(would) : null,
       pending: false,
       command: ctx.command,
+    };
+  }
+
+  const status = await hermesPaneStatus(ctx.paneId);
+  if (status && !HERMES_ARM_STATUSES.has(status)) {
+    return {
+      ok: false, action: ctx.action, applied_via: null,
+      heartbeat: before.state ? withNextFire(before.state) : null,
+      pending: false,
+      command: ctx.command,
+      error: {
+        code: 'pane_busy',
+        message: 'this pane is ' + status + ' — a slash command sent now is steered into the running turn (or answers the open panel) and is never executed as a command. Nothing was typed; retry when the pane is idle.',
+      },
     };
   }
 
@@ -438,6 +471,7 @@ async function applyHermes(ctx) {
     pending: !applied,
   };
   if (!applied) {
+    reply.note = 'the command was sent but the session row has not changed yet — the CLI executes /heartbeat at its next idle tick; re-check in a moment.';
     const excerpt = await readPaneExcerpt(ctx.paneId);
     if (excerpt) reply.pane_excerpt = excerpt;
   }
