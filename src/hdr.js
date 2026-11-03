@@ -50,7 +50,14 @@ function wrap(err, method) {
     return e;
   }
   if (err && err.code === 'timeout') return new HerdrError('timeout', err.message);
-  const e = new HerdrError('herdr_error', (err && err.message) || `herdr-core call failed: ${method}`);
+  /* herdr-core answers in JSON-RPC codes (numbers), while the HTTP layer matches the legacy
+     string vocabulary (`not_found`, `timeout`). Map the codes that carry meaning here and keep
+     the raw value on `upstream`, so nothing loses what herdr-core actually said. */
+  let code = 'herdr_error';
+  if (err && typeof err.code === 'string') code = err.code;
+  else if (String(err && err.code) === '-32601') code = 'method_not_found';
+  else if (/no (?:such )?terminal|unknown terminal/i.test(String((err && err.message) || ''))) code = 'not_found';
+  const e = new HerdrError(code, (err && err.message) || `herdr-core call failed: ${method}`);
   e.upstream = err && err.code;
   return e;
 }
@@ -207,7 +214,9 @@ async function agentList() {
       return {
         pane_id: t.address,
         agent: (ov && ov.agent) || core.agentOf(t),
-        agent_status: core.statusOf(t) || (ov && ov.status) || null,
+        // A pane we had to read the screen for draws its own run state; that reading is newer
+        // than anything herdr-core can offer (it reports no status for such a pane at all).
+        agent_status: (ov && ov.status) || core.statusOf(t) || null,
         cwd: t.cwd || '',
         // herdr-core keeps no agent-session id; the chat resolver falls back to
         // the agent's own store, which is what it does for panes without one.
@@ -222,8 +231,11 @@ async function readPane(params) {
   const source = (params && params.source) || 'recent_unwrapped';
   const format = (params && params.format) === 'ansi' ? 'ansi' : 'text';
   const want = Number(params && params.lines);
-  const lines = !Number.isFinite(want) || want <= 0 ? (source === 'visible' ? 0 : 200)
-    : (source === 'visible' ? 0 : Math.min(5000, want));
+  /* herdr-core's `lines` is a real budget for both sources: 0 returns the short window the
+     agent is drawing now, N returns up to N lines of the pane's own buffer (measured: 0 vs 60
+     differ on a full screen). A caller that names a count — readVisible(pane, 60) — has to get
+     it, or the status parsers silently read less than they asked for. */
+  const lines = !Number.isFinite(want) || want <= 0 ? 0 : Math.min(5000, want);
   const res = await core.rpc('terminal.read', { terminal: paneId, lines });
   let text = typeof res.text === 'string' ? res.text : '';
   if (format !== 'ansi') text = stripAnsi(text);
@@ -246,6 +258,43 @@ async function sendText(paneId, text) {
 async function sendKeys(paneId, keys) {
   await core.rpc('terminal.keys', { terminal: paneId, keys: Array.isArray(keys) ? keys : [keys] });
   return { ok: true };
+}
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+/** The run state of a pane, or null when no state can be read at all. This is the one reading
+ *  every caller gates a pane write on: panes that draw their state on screen (hermes) have no
+ *  herdr-core status, so the screen reading agent.list already carries is what answers. */
+async function paneStatus(paneId) {
+  try {
+    const list = await agentList();
+    const entry = (list.agents || []).find((a) => a && a.pane_id === paneId);
+    return entry ? (String(entry.agent_status || '') || null) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/** Poll a pane until it reports one of `until`, or the budget runs out. A pane that reports no
+ *  state at all returns at once: waiting on a figure that never appears would only spend the
+ *  caller's timeout (herdr-core has no server-side wait to hand this to). */
+async function waitPaneStatus(paneId, until, timeoutMs) {
+  const started = Date.now();
+  const budget = Math.max(1000, Number(timeoutMs) || 30000);
+  let last = await paneStatus(paneId);
+  if (last === null) {
+    return { ok: true, waited: false, status: null, waited_ms: 0, note: 'this pane publishes no run state; nothing to wait for' };
+  }
+  while (Date.now() - started < budget) {
+    if (until.indexOf(last) >= 0) return { ok: true, waited: true, status: last, waited_ms: Date.now() - started };
+    await sleep(250);
+    last = await paneStatus(paneId);
+    if (last === null) break;
+  }
+  return {
+    ok: true, waited: false, status: last, waited_ms: Date.now() - started,
+    note: 'the pane did not report ' + until.join('/') + ' within ' + budget + ' ms',
+  };
 }
 
 // ── request ─────────────────────────────────────────────────────────────────
@@ -274,8 +323,21 @@ async function request(method, params, opts) {
         return await sendKeys(p.pane_id, p.keys);
       case 'agent.list':
         return await agentList();
-      case 'agent.prompt':
-        return await sendText(p.target || p.pane_id, p.text);
+      case 'agent.prompt': {
+        const target = p.target || p.pane_id;
+        await sendText(target, p.text);
+        /* herdr-core has no wait parameter: `terminal.send` returns as soon as the text is
+           typed. A caller that asked to wait until the pane is idle gets the pane's own state
+           polled here instead, bounded by the request's own timeout. */
+        const until = Array.isArray(p.wait && p.wait.until) ? p.wait.until.map(String) : null;
+        if (!until || !until.length) return { ok: true };
+        return await waitPaneStatus(target, until, Math.min(Number(p.wait.timeout_ms) || 30000, o.timeoutMs));
+      }
+      case 'pane.report_agent_session':
+        /* Legacy herdr stored the session an agent reported against a pane; herdr-core keeps no
+           such record, so this call has no target. Said plainly instead of looking like a
+           transport failure. */
+        throw new HerdrError('not_supported', 'herdr-core keeps no per-pane agent session record: there is nothing to report to');
       default:
         // Anything else is passed through so new herdr-core calls stay usable.
         return await core.rpc(method, p, o);
@@ -286,6 +348,11 @@ async function request(method, params, opts) {
 }
 
 // ── subscriptions ───────────────────────────────────────────────────────────
+/* herdr-core emits three event types — created, finished, status — and takes no topic filter, so
+   every subscriber receives them. `pane.updated` is the honest fallback for a type we do not
+   know. The legacy structural topics (tab.*, workspace.*, pane.focused, pane.moved,
+   layout.updated) have no counterpart in the core: they reach the dash through its pane-set
+   refresh, not through this stream. */
 const EVENT_MAP = {
   created: 'pane.created',
   finished: 'pane.closed',
@@ -317,6 +384,8 @@ function subscribe(subscriptions, onEvent, onStatus) {
 
   socket.setNoDelay(true);
   socket.on('connect', () => {
+    /* herdr-core's events.subscribe carries no topic list: it streams every event type it has,
+       so the caller's subscription list only names what it is prepared to receive. */
     socket.write(JSON.stringify({
       jsonrpc: '2.0',
       id: 'sub',
@@ -407,4 +476,5 @@ module.exports = {
   legacyEvent,
   readPane,
   screenStatus,
+  paneStatus,
 };
