@@ -74,6 +74,9 @@ function controlFileName(sessionId) {
  * herdr-core (`hc`) has no HERDR_ENV/HERDR_PANE_ID: it exports HC_TERMINAL_ID to every
  * terminal it starts. That is the same signal — a pane under a multiplexer — so accept
  * it as the pane id and as the enable flag, and keep the herdr variables authoritative.
+ * The value IS the terminal address the dashboard names the pane by (t1g, t1p, …), and
+ * every control/sink lookup keys on that exact string: use it verbatim, never prefix,
+ * case-fold or otherwise normalise it.
  */
 function sinkTarget(env) {
   const e = env || process.env;
